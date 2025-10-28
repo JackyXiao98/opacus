@@ -58,7 +58,7 @@ def collate(
         return collate_fn(batch)
     else:
         return [
-            torch.zeros(shape, dtype=dtype)
+            torch.zeros(shape, dtype=dtype if isinstance(dtype, torch.dtype) else torch.float32)
             for shape, dtype in zip(sample_empty_shapes, dtypes)
         ]
 
@@ -112,9 +112,16 @@ def dtype_safe(x: Any) -> Union[torch.dtype, Type]:
         x: any object
 
     Returns:
-        ``x.dtype`` if attribute exists, type of x otherwise
+        ``x.dtype`` if attribute exists, appropriate torch.dtype for basic types otherwise
     """
-    return getattr(x, "dtype", type(x))
+    if hasattr(x, "dtype"):
+        return x.dtype
+    elif isinstance(x, int):
+        return torch.long
+    elif isinstance(x, float):
+        return torch.float32
+    else:
+        return type(x)
 
 
 class DPDataLoader(DataLoader):

@@ -118,9 +118,9 @@ def model_parallel(rank, world_size):
         }
         # Adjust attention module to use the local number of heads, or else there will be a dimension mismatch error
         attn_layer = transformer_block.self_attn
-        attn_layer.num_heads = attn_layer.num_heads // tp_mesh.size()
-        attn_layer.num_key_value_heads = (
-            attn_layer.num_key_value_heads // tp_mesh.size()
+        attn_layer.config.num_attention_heads = attn_layer.config.num_attention_heads // tp_mesh.size()
+        attn_layer.config.num_key_value_heads = (
+            attn_layer.config.num_key_value_heads // tp_mesh.size()
         )
 
         # Freeze layernorm layers
@@ -196,6 +196,10 @@ def model_parallel(rank, world_size):
 
     print("zero gradient, memory usage")
     profile_mem(optimizer_gc.zero_grad, True)
+
+    # Clean up distributed process group
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def main():

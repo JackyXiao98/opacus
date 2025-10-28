@@ -1,11 +1,6 @@
-numpy>=1.16
 torch>=2.0.0
 transformers>=4.30.0
 opacus>=1.4.0
 numpy
 matplotlib>=3.5.0
 psutil
-torchvision>=0.9.1
-tqdm>=4.40
-scikit-learn
-datasets

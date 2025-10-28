@@ -1,0 +1,42 @@
+#!/bin/bash
+
+# 单GPU LLaMA内存分析运行脚本
+
+echo "=== 单GPU LLaMA内存分析工具 ==="
+echo ""
+
+# 检查CUDA是否可用
+if command -v nvidia-smi &> /dev/null; then
+    echo "检测到NVIDIA GPU:"
+    nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader,nounits
+    echo ""
+else
+    echo "未检测到NVIDIA GPU，将使用CPU模式"
+    echo ""
+fi
+
+# 设置默认参数
+MODEL_SIZE=${1:-"small"}
+BATCH_SIZE=${2:-1}
+SEQ_LENGTH=${3:-128}
+NUM_STEPS=${4:-3}
+
+echo "运行参数:"
+echo "  模型大小: $MODEL_SIZE"
+echo "  批次大小: $BATCH_SIZE"
+echo "  序列长度: $SEQ_LENGTH"
+echo "  训练步数: $NUM_STEPS"
+echo ""
+
+# 运行内存分析
+python single_gpu_memory_profiler.py \
+    --model_size $MODEL_SIZE \
+    --batch_size $BATCH_SIZE \
+    --seq_length $SEQ_LENGTH \
+    --num_steps $NUM_STEPS \
+    --learning_rate 1e-4 \
+    --noise_multiplier 1.0 \
+    --max_grad_norm 1.0
+
+echo ""
+echo "分析完成！"
