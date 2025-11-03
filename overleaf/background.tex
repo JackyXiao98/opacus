@@ -1,0 +1,65 @@
+\section{Background: DP-SGD Ghost Norm Clipping for Linear Layers}
+
+\subsection{Differential Privacy in Deep Learning}
+
+Differential Privacy (DP) provides a rigorous mathematical framework for quantifying privacy guarantees in machine learning. In the context of deep learning, DP-SGD (Differentially Private Stochastic Gradient Descent) is the most widely adopted approach for training neural networks with formal privacy guarantees.
+
+The key challenge in DP-SGD is computing per-sample gradient norms efficiently. Traditional approaches require materializing individual gradients for each sample in the batch, which can be prohibitively expensive in terms of memory and computation.
+
+\subsection{The Ghost Norm Clipping Trick}
+
+The "ghost norm clipping trick" is a memory-efficient technique that computes per-sample gradient norms without explicitly materializing individual gradients. Instead, it leverages the mathematical structure of neural network layers to compute norms directly from activations and backpropagated gradients.
+
+For a linear layer $f(x) = Wx + b$ where $W \in \mathbb{R}^{p \times d}$ and $b \in \mathbb{R}^p$, the gradient with respect to the weight matrix for a single sample is:
+\begin{equation}
+\nabla_W \ell = g \otimes a = g a^T
+\end{equation}
+where $g \in \mathbb{R}^p$ is the backpropagated gradient and $a \in \mathbb{R}^d$ is the input activation.
+
+\subsection{Why Norm Computation Can Be Decomposed}
+
+The key insight is that the Frobenius norm of the outer product can be computed without materializing the full matrix:
+
+\begin{equation}
+\|\nabla_W \ell\|_F^2 = \|g a^T\|_F^2 = \|g\|_2^2 \cdot \|a\|_2^2
+\end{equation}
+
+This decomposition follows from the properties of the Frobenius norm and outer products:
+\begin{align}
+\|g a^T\|_F^2 &= \text{tr}((g a^T)^T (g a^T)) \\
+&= \text{tr}(a g^T g a^T) \\
+&= \text{tr}(g^T g) \cdot \text{tr}(a^T a) \\
+&= \|g\|_2^2 \cdot \|a\|_2^2
+\end{align}
+
+This mathematical property allows us to compute the gradient norm using only the norms of the activation and backpropagation vectors, avoiding the need to store the full $p \times d$ gradient matrix.
+
+\subsection{Extension to Sequential Data}
+
+For sequential data with batch size $B$ and sequence length $T$, we have:
+\begin{itemize}
+\item Activations: $A \in \mathbb{R}^{B \times T \times d}$
+\item Backpropagated gradients: $G \in \mathbb{R}^{B \times T \times p}$
+\end{itemize}
+
+The per-sample gradient for the weight matrix becomes:
+\begin{equation}
+\nabla_W \ell^{(n)} = \sum_{t=1}^T g_t^{(n)} (a_t^{(n)})^T
+\end{equation}
+
+The squared Frobenius norm is:
+\begin{equation}
+\left\|\nabla_W \ell^{(n)}\right\|_F^2 = \left\|\sum_{t=1}^T g_t^{(n)} (a_t^{(n)})^T\right\|_F^2
+\end{equation}
+
+This cannot be simply decomposed as a product of individual norms due to cross-terms between different time steps. The computation requires considering all pairwise interactions:
+\begin{equation}
+\left\|\sum_{t=1}^T g_t^{(n)} (a_t^{(n)})^T\right\|_F^2 = \sum_{i=1}^T \sum_{j=1}^T \langle g_i^{(n)} (a_i^{(n)})^T, g_j^{(n)} (a_j^{(n)})^T \rangle_F
+\end{equation}
+
+Using the property $\langle uv^T, xy^T \rangle_F = (u \cdot x)(v \cdot y)$:
+\begin{equation}
+= \sum_{i=1}^T \sum_{j=1}^T (g_i^{(n)} \cdot g_j^{(n)})(a_i^{(n)} \cdot a_j^{(n)})
+\end{equation}
+
+This formulation reveals that we need to compute Gram matrices for both activations and gradients, leading to the algorithms discussed in subsequent sections.

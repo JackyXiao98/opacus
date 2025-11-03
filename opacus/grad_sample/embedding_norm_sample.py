@@ -16,7 +16,7 @@
 """Utility for computing gradient norm for the embedding layer.
 
 Based on the algorithm from the paper:
-https://proceedings.neurips.cc/paper_files/paper/2023/file/a45d344b28179c8da7646bc38ff50ad8-Paper-Conference.pdf.
+https://proceedings.neurips.cc/paper_files/paper/2023/file/a45d344b28179c8da7646bc38ff50ad8-Paper-Conference.pdf
 """
 from typing import Dict, List
 
@@ -120,7 +120,8 @@ def compute_embedding_norm_sample(
     )
 
     # Pair the input IDs with the row indices
-    flattened_indices = input_ids.view(-1, 1)
+    # Use reshape instead of view to handle non-contiguous tensors
+    flattened_indices = input_ids.reshape(-1, 1)
     paired_indices = torch.cat([row_indices, flattened_indices], dim=1).to(device)
 
     # Get unique paired indices and new index positions for aggregation

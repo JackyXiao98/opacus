@@ -1,0 +1,73 @@
+
+% ========================
+% main.tex (drop into Overleaf and compile)
+% ========================
+
+% ---- Packages ----
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{amsmath,amssymb,mathtools,bm,amsthm}
+\usepackage{booktabs,multirow}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
+\usepackage{hyperref}
+\usepackage{siunitx}
+\sisetup{round-mode=places,round-precision=2}
+\usepackage{xcolor}
+\usepackage{array}
+\usepackage{listings}
+
+% Define theorem environments
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+
+% Configure listings for code
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny,
+    showstringspaces=false
+}
+
+\title{Ghost Norm Clipping in DP-SGD: From Explicit Gram Matrices to Flash-Style Tiled Computation}
+\author{Technical Analysis}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document provides a comprehensive analysis of ghost norm clipping techniques for differentially private stochastic gradient descent (DP-SGD) in neural networks. We examine two approaches for computing per-sample gradient norms in linear layers: the original algorithm that explicitly constructs Gram matrices, and an optimized flash-style tiled algorithm that achieves the same result with significantly reduced memory usage. We provide detailed algorithmic descriptions, correctness proofs, and complexity analyses for both methods, demonstrating how the flash approach reduces memory complexity from $O(BT^2)$ to $O(BT(d+p))$ while maintaining computational correctness.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% Include modular sections
+\input{background}
+\input{ghost_clip}  
+\input{flash_clip}
+\input{complexity}
+
+\section{Conclusion}
+
+This analysis demonstrates the significant advantages of the flash-style tiled approach for computing ghost norm clipping in DP-SGD. While both algorithms achieve the same mathematical result, the flash approach provides substantial memory savings that become increasingly important as sequence lengths grow.
+
+The key contributions of this work include:
+\begin{itemize}
+\item Detailed algorithmic descriptions and correctness proofs for both approaches
+\item Comprehensive complexity analysis showing the transition from $O(BT^2)$ to $O(BT(d+p))$ memory usage
+\item Practical examples demonstrating memory reduction factors of 5-40× for realistic sequence lengths
+\item Implementation insights for efficient tiled computation
+\end{itemize}
+
+These improvements enable differentially private training of large language models with long sequences that would otherwise be memory-prohibitive using traditional ghost clipping approaches.
+
+\end{document}

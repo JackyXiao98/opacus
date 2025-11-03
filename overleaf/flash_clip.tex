@@ -1,0 +1,182 @@
+\section{Flash-Style Tiled Norm Clipping}
+
+\subsection{Motivation}
+
+The original ghost clipping algorithm requires $O(BT^2)$ memory to store Gram matrices, which becomes prohibitive for long sequences. The flash-style approach eliminates this bottleneck by computing the same result without materializing the full Gram matrices.
+
+\subsection{Key Insight}
+
+Instead of computing full Gram matrices, we can tile the computation and process smaller blocks at a time. The key observation is that we only need the final scalar result, not the intermediate $T \times T$ matrices.
+
+\subsection{Algorithm Description}
+
+\begin{algorithm}[H]
+\caption{Flash-Style Tiled Norm Clipping}
+\label{alg:flash_clip}
+\begin{algorithmic}[1]
+\Require Activations $A \in \mathbb{R}^{B \times T \times d}$, Gradients $G \in \mathbb{R}^{B \times T \times p}$, Tile size $\tau$
+\Ensure Per-sample norms $\text{norms} \in \mathbb{R}^B$
+
+\State $\text{norms} \leftarrow \mathbf{0} \in \mathbb{R}^B$ \Comment{Initialize accumulator}
+\State $n_{\text{tiles}} \leftarrow \lceil T / \tau \rceil$ \Comment{Number of tiles}
+
+\For{$i = 0$ to $n_{\text{tiles}} - 1$} \Comment{Iterate over tile rows}
+    \State $s_i \leftarrow i \cdot \tau$, $e_i \leftarrow \min((i+1) \cdot \tau, T)$
+    \State $A_i \leftarrow A[:, s_i:e_i, :] \in \mathbb{R}^{B \times \tau_i \times d}$ \Comment{Load activation tile}
+    \State $G_i \leftarrow G[:, s_i:e_i, :] \in \mathbb{R}^{B \times \tau_i \times p}$ \Comment{Load gradient tile}
+    
+    \State \Comment{Diagonal block $(i,i)$}
+    \State $K_G^{(i,i)} \leftarrow G_i G_i^T \in \mathbb{R}^{B \times \tau_i \times \tau_i}$ \Comment{Gradient Gram tile}
+    \State $K_A^{(i,i)} \leftarrow A_i A_i^T \in \mathbb{R}^{B \times \tau_i \times \tau_i}$ \Comment{Activation Gram tile}
+    \State $\text{norms} \mathrel{+}= \sum_{u,v} K_G^{(i,i)}[:, u, v] \odot K_A^{(i,i)}[:, u, v]$ \Comment{Accumulate diagonal}
+    
+    \For{$j = 0$ to $i-1$} \Comment{Off-diagonal blocks $(i,j)$ and $(j,i)$}
+        \State $s_j \leftarrow j \cdot \tau$, $e_j \leftarrow \min((j+1) \cdot \tau, T)$
+        \State $A_j \leftarrow A[:, s_j:e_j, :] \in \mathbb{R}^{B \times \tau_j \times d}$ \Comment{Load activation tile}
+        \State $G_j \leftarrow G[:, s_j:e_j, :] \in \mathbb{R}^{B \times \tau_j \times p}$ \Comment{Load gradient tile}
+        
+        \State $K_G^{(i,j)} \leftarrow G_i G_j^T \in \mathbb{R}^{B \times \tau_i \times \tau_j}$ \Comment{Cross Gram tile}
+        \State $K_A^{(i,j)} \leftarrow A_i A_j^T \in \mathbb{R}^{B \times \tau_i \times \tau_j}$ \Comment{Cross Gram tile}
+        \State $\text{contrib} \leftarrow \sum_{u,v} K_G^{(i,j)}[:, u, v] \odot K_A^{(i,j)}[:, u, v]$ \Comment{Tile contribution}
+        \State $\text{norms} \mathrel{+}= 2 \cdot \text{contrib}$ \Comment{Factor of 2 for symmetry}
+    \EndFor
+\EndFor
+
+\State $\text{norms} \leftarrow \sqrt{\max(\mathbf{0}, \text{norms})}$ \Comment{Clamp and square root}
+\State \Return $\text{norms}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Implementation Analysis}
+
+The PyTorch implementation uses efficient tensor operations:
+
+\begin{lstlisting}[language=Python, caption=Flash Implementation Core]
+def _flash_frobenius_inner_over_T(A, G, tile_size=256, dtype_acc=torch.float32):
+    B, T, d_a = A.shape
+    ga = torch.zeros(B, dtype=dtype_acc, device=A.device)
+    num_tiles = (T + tile_size - 1) // tile_size
+
+    for p in range(num_tiles):
+        ps, pe = p * tile_size, min((p + 1) * tile_size, T)
+        A_p, G_p = A[:, ps:pe, :].to(dtype_acc), G[:, ps:pe, :].to(dtype_acc)
+
+        # Diagonal block (p, p)
+        Sg_pp = contract('bid,bjd->bij', G_p, G_p)  # [B, tau_p, tau_p]
+        Sa_pp = contract('bid,bjd->bij', A_p, A_p)
+        ga += contract('bij,bij->b', Sg_pp, Sa_pp)
+
+        # Off-diagonal blocks (q < p)
+        for q in range(p):
+            qs, qe = q * tile_size, min((q + 1) * tile_size, T)
+            A_q, G_q = A[:, qs:qe, :].to(dtype_acc), G[:, qs:qe, :].to(dtype_acc)
+
+            Sg_pq = contract('bid,bjd->bij', G_p, G_q)  # [B, tau_p, tau_q]
+            Sa_pq = contract('bid,bjd->bij', A_p, A_q)
+            ga += 2.0 * contract('bij,bij->b', Sg_pq, Sa_pq)
+
+    return ga
+\end{lstlisting}
+
+\subsection{Correctness Proof}
+
+\begin{theorem}
+The flash-style tiled algorithm computes the same result as the original ghost clipping algorithm.
+\end{theorem}
+
+\begin{proof}
+The original algorithm computes:
+\begin{equation}
+\text{norm}_n = \sum_{i=1}^T \sum_{j=1}^T (K_G)_{ij} (K_A)_{ij}
+\end{equation}
+
+We can partition this double sum by tiles. Let $\mathcal{T}_k = \{(k-1)\tau + 1, \ldots, \min(k\tau, T)\}$ be the $k$-th tile of indices. Then:
+
+\begin{align}
+\text{norm}_n &= \sum_{i=1}^T \sum_{j=1}^T (K_G)_{ij} (K_A)_{ij} \\
+&= \sum_{k=1}^{n_{\text{tiles}}} \sum_{l=1}^{n_{\text{tiles}}} \sum_{i \in \mathcal{T}_k} \sum_{j \in \mathcal{T}_l} (K_G)_{ij} (K_A)_{ij} \\
+&= \sum_{k=1}^{n_{\text{tiles}}} \sum_{i \in \mathcal{T}_k} \sum_{j \in \mathcal{T}_k} (K_G)_{ij} (K_A)_{ij} + 2\sum_{k=1}^{n_{\text{tiles}}} \sum_{l=1}^{k-1} \sum_{i \in \mathcal{T}_k} \sum_{j \in \mathcal{T}_l} (K_G)_{ij} (K_A)_{ij}
+\end{align}
+
+The first term corresponds to diagonal tiles, and the second term (with factor 2) corresponds to off-diagonal tiles, accounting for symmetry.
+
+Each tile computation in the flash algorithm computes exactly these partial sums:
+\begin{itemize}
+\item Diagonal tiles: $\sum_{i \in \mathcal{T}_k} \sum_{j \in \mathcal{T}_k} (K_G^{(k,k)})_{ij} (K_A^{(k,k)})_{ij}$
+\item Off-diagonal tiles: $\sum_{i \in \mathcal{T}_k} \sum_{j \in \mathcal{T}_l} (K_G^{(k,l)})_{ij} (K_A^{(k,l)})_{ij}$
+\end{itemize}
+
+Since the algorithm accumulates all these contributions correctly, it produces the same result as the original algorithm.
+\end{proof}
+
+\subsection{Detailed Tiling Example}
+
+Consider a concrete example with $T = 6$ and tile size $\tau = 2$. We have 3 tiles:
+\begin{itemize}
+\item Tile 0: indices $\{0, 1\}$
+\item Tile 1: indices $\{2, 3\}$ 
+\item Tile 2: indices $\{4, 5\}$
+\end{itemize}
+
+The full $6 \times 6$ Gram matrix computation is partitioned as:
+\begin{equation}
+\begin{bmatrix}
+K_{0,0} & K_{0,1} & K_{0,2} \\
+K_{1,0} & K_{1,1} & K_{1,2} \\
+K_{2,0} & K_{2,1} & K_{2,2}
+\end{bmatrix}
+\end{equation}
+
+where each $K_{i,j}$ is a $2 \times 2$ block (except possibly the last block).
+
+\paragraph{Processing Order:}
+\begin{enumerate}
+\item \textbf{Iteration 0}: Process tile $(0,0)$ - diagonal block
+   \begin{itemize}
+   \item Load $A_0, G_0$ (indices 0-1)
+   \item Compute $K_G^{(0,0)} = G_0 G_0^T$, $K_A^{(0,0)} = A_0 A_0^T$
+   \item Accumulate: $\text{norm} \mathrel{+}= \langle K_G^{(0,0)}, K_A^{(0,0)} \rangle_F$
+   \end{itemize}
+
+\item \textbf{Iteration 1}: Process tiles $(1,1)$ and $(1,0)$
+   \begin{itemize}
+   \item Load $A_1, G_1$ (indices 2-3)
+   \item Diagonal: Compute and accumulate $\langle K_G^{(1,1)}, K_A^{(1,1)} \rangle_F$
+   \item Off-diagonal: Load $A_0, G_0$, compute $K_G^{(1,0)}, K_A^{(1,0)}$
+   \item Accumulate: $\text{norm} \mathrel{+}= 2 \langle K_G^{(1,0)}, K_A^{(1,0)} \rangle_F$
+   \end{itemize}
+
+\item \textbf{Iteration 2}: Process tiles $(2,2)$, $(2,1)$, and $(2,0)$
+   \begin{itemize}
+   \item Similar process for the final tile and its interactions
+   \end{itemize}
+\end{enumerate}
+
+\paragraph{Memory Usage During Processing:}
+At any point, we only store:
+\begin{itemize}
+\item Current tile data: $O(\tau \cdot (d + p))$ per batch element
+\item Small Gram blocks: $O(\tau^2)$ per batch element  
+\item Total working memory: $O(B(\tau(d + p) + \tau^2))$
+\end{itemize}
+
+This is independent of the full sequence length $T$, achieving the desired memory efficiency.
+
+\subsection{Memory Optimization Benefits}
+
+The flash algorithm achieves significant memory savings:
+
+\paragraph{Peak Memory Comparison:}
+\begin{itemize}
+\item \textbf{Original}: $O(BT^2 + BT(d + p))$ 
+\item \textbf{Flash}: $O(B\tau^2 + BT(d + p))$ where $\tau \ll T$
+\end{itemize}
+
+For typical values like $T = 8192$, $\tau = 256$, $d = p = 768$:
+\begin{itemize}
+\item Original: $\sim 67M + 12.6M = 79.6M$ parameters per batch element
+\item Flash: $\sim 65K + 12.6M = 12.7M$ parameters per batch element
+\item \textbf{Reduction factor}: $\sim 6.3\times$
+\end{itemize}
+
+The savings become more dramatic as sequence length increases, since the original algorithm scales as $O(T^2)$ while the flash algorithm scales as $O(T)$ in memory.

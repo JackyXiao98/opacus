@@ -1,0 +1,71 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Background: DP-SGD Ghost Norm Clipping for Linear Layers}{3}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.1}Differential Privacy in Deep Learning}{3}{subsection.1.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.2}The Ghost Norm Clipping Trick}{3}{subsection.1.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.3}Why Norm Computation Can Be Decomposed}{3}{subsection.1.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {1.4}Extension to Sequential Data}{3}{subsection.1.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Ghost Norm Clipping Algorithm}{4}{section.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Problem Formulation}{4}{subsection.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Algorithm Description}{5}{subsection.2.2}\protected@file@percent }
+\@writefile{loa}{\contentsline {algorithm}{\numberline {1}{\ignorespaces Ghost Norm Clipping (Original Algorithm)}}{5}{algorithm.1}\protected@file@percent }
+\newlabel{alg:ghost_original}{{1}{5}{Algorithm Description}{algorithm.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.3}Implementation Analysis}{5}{subsection.2.3}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {1}Original Implementation}{5}{lstlisting.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.4}Correctness Proof}{5}{subsection.2.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.5}Memory and Computational Characteristics}{6}{subsection.2.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Memory Usage:}{6}{section*.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Computational Complexity:}{6}{section*.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Flash-Style Tiled Norm Clipping}{7}{section.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Motivation}{7}{subsection.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Key Insight}{7}{subsection.3.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Algorithm Description}{7}{subsection.3.3}\protected@file@percent }
+\@writefile{loa}{\contentsline {algorithm}{\numberline {2}{\ignorespaces Flash-Style Tiled Norm Clipping}}{7}{algorithm.2}\protected@file@percent }
+\newlabel{alg:flash_clip}{{2}{7}{Algorithm Description}{algorithm.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.4}Implementation Analysis}{7}{subsection.3.4}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {2}Flash Implementation Core}{7}{lstlisting.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.5}Correctness Proof}{8}{subsection.3.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.6}Detailed Tiling Example}{9}{subsection.3.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Processing Order:}{9}{section*.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Memory Usage During Processing:}{9}{section*.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.7}Memory Optimization Benefits}{10}{subsection.3.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Peak Memory Comparison:}{10}{section*.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Complexity Analysis}{10}{section.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Problem Parameters}{10}{subsection.4.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Original Ghost Clipping Algorithm}{10}{subsection.4.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {4.2.1}Computational Complexity}{10}{subsubsection.4.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Gram Matrix Computation:}{10}{section*.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Hadamard Inner Product:}{10}{section*.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Overall Computational Complexity:}{11}{section*.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {4.2.2}Memory Complexity}{11}{subsubsection.4.2.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Input Storage:}{11}{section*.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Intermediate Storage:}{11}{section*.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Overall Memory Complexity:}{11}{section*.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Flash-Style Tiled Algorithm}{11}{subsection.4.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {4.3.1}Computational Complexity}{11}{subsubsection.4.3.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Tile Processing:}{11}{section*.13}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Total Tile Pairs:}{11}{section*.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Asymptotic Analysis:}{12}{section*.15}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Overall Computational Complexity:}{12}{section*.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {4.3.2}Memory Complexity}{12}{subsubsection.4.3.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Input Storage:}{12}{section*.17}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Working Memory:}{12}{section*.18}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Overall Memory Complexity:}{12}{section*.19}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.4}Complexity Comparison}{12}{subsection.4.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.5}Practical Memory Savings}{12}{subsection.4.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {4.5.1}Memory Reduction Factor}{12}{subsubsection.4.5.1}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Asymptotic complexity comparison}}{13}{table.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{\numberline {4.5.2}Concrete Examples}{13}{subsubsection.4.5.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Example 1: Moderate Sequence}{13}{section*.20}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Example 2: Long Sequence}{13}{section*.21}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Example 3: Very Long Sequence}{13}{section*.22}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.6}Scaling Analysis}{13}{subsection.4.6}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Memory scaling with sequence length (assuming $d = p = 1024$)}}{13}{figure.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Key Observations:}{14}{section*.23}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.7}Implementation Considerations}{14}{subsection.4.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Tile Size Selection:}{14}{section*.24}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Numerical Precision:}{14}{section*.25}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Conclusion}{14}{section.5}\protected@file@percent }
+\gdef \@abspage@last{14}

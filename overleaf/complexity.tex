@@ -1,0 +1,237 @@
+\section{Complexity Analysis}
+
+\subsection{Problem Parameters}
+
+We analyze the computational and memory complexity of both algorithms using the following parameters:
+\begin{itemize}
+\item $B$: Batch size
+\item $T$: Sequence length  
+\item $d$: Activation dimension (input features)
+\item $p$: Gradient dimension (output features)
+\item $\tau$: Tile size (for flash algorithm)
+\end{itemize}
+
+\subsection{Original Ghost Clipping Algorithm}
+
+\subsubsection{Computational Complexity}
+
+\paragraph{Gram Matrix Computation:}
+For each batch element, we compute:
+\begin{itemize}
+\item $K_G = G G^T \in \mathbb{R}^{T \times T}$: $O(T^2 p)$ FLOPs
+\item $K_A = A A^T \in \mathbb{R}^{T \times T}$: $O(T^2 d)$ FLOPs
+\end{itemize}
+
+Total for Gram matrices: $O(BT^2(d + p))$ FLOPs
+
+\paragraph{Hadamard Inner Product:}
+Computing $\langle K_G, K_A \rangle_F$ requires $O(T^2)$ FLOPs per batch element.
+
+Total for inner products: $O(BT^2)$ FLOPs
+
+\paragraph{Overall Computational Complexity:}
+\begin{equation}
+\boxed{O(BT^2(d + p))}
+\end{equation}
+
+\subsubsection{Memory Complexity}
+
+\paragraph{Input Storage:}
+\begin{itemize}
+\item Activations $A$: $O(BTd)$ elements
+\item Gradients $G$: $O(BTp)$ elements
+\end{itemize}
+
+\paragraph{Intermediate Storage:}
+\begin{itemize}
+\item Gram matrix $K_G$: $O(BT^2)$ elements
+\item Gram matrix $K_A$: $O(BT^2)$ elements
+\end{itemize}
+
+\paragraph{Overall Memory Complexity:}
+\begin{equation}
+\boxed{O(BT(d + p) + BT^2)}
+\end{equation}
+
+For large $T$, this is dominated by $O(BT^2)$.
+
+\subsection{Flash-Style Tiled Algorithm}
+
+\subsubsection{Computational Complexity}
+
+\paragraph{Tile Processing:}
+Number of tiles: $n_{\text{tiles}} = \lceil T/\tau \rceil$
+
+For each diagonal tile $(i,i)$:
+\begin{itemize}
+\item Tile size: $\tau_i \leq \tau$
+\item Gram computation: $O(\tau_i^2(d + p))$ FLOPs
+\item Inner product: $O(\tau_i^2)$ FLOPs
+\end{itemize}
+
+For each off-diagonal tile $(i,j)$ with $i \neq j$:
+\begin{itemize}
+\item Cross-Gram computation: $O(\tau_i \tau_j (d + p))$ FLOPs  
+\item Inner product: $O(\tau_i \tau_j)$ FLOPs
+\end{itemize}
+
+\paragraph{Total Tile Pairs:}
+\begin{itemize}
+\item Diagonal tiles: $n_{\text{tiles}}$
+\item Off-diagonal tiles: $\binom{n_{\text{tiles}}}{2} = \frac{n_{\text{tiles}}(n_{\text{tiles}}-1)}{2}$
+\item Total pairs: $\frac{n_{\text{tiles}}(n_{\text{tiles}}+1)}{2} \approx \frac{T^2}{2\tau^2}$
+\end{itemize}
+
+\paragraph{Asymptotic Analysis:}
+The total computation across all tiles is:
+\begin{align}
+\text{FLOPs} &= \sum_{\text{all tile pairs}} O(\tau^2(d + p)) \\
+&= O\left(\frac{T^2}{2\tau^2} \cdot \tau^2(d + p)\right) \\
+&= O(T^2(d + p))
+\end{align}
+
+Per batch element: $O(T^2(d + p))$ FLOPs
+
+\paragraph{Overall Computational Complexity:}
+\begin{equation}
+\boxed{O(BT^2(d + p))}
+\end{equation}
+
+\textbf{Note:} The asymptotic complexity is the same as the original algorithm, but with better constants due to:
+\begin{itemize}
+\item No large matrix materialization overhead
+\item Better cache locality from tiled access patterns
+\item Potential for memory bandwidth optimization
+\end{itemize}
+
+\subsubsection{Memory Complexity}
+
+\paragraph{Input Storage:}
+Same as original: $O(BT(d + p))$ elements
+
+\paragraph{Working Memory:}
+At any point during computation:
+\begin{itemize}
+\item Current tiles: $O(B\tau(d + p))$ elements for activations and gradients
+\item Tile Gram matrices: $O(B\tau^2)$ elements for $K_G^{(i,j)}$ and $K_A^{(i,j)}$
+\item Accumulator: $O(B)$ elements
+\end{itemize}
+
+\paragraph{Overall Memory Complexity:}
+\begin{equation}
+\boxed{O(BT(d + p) + B\tau(d + p) + B\tau^2)}
+\end{equation}
+
+Since $\tau \ll T$ in practice, this simplifies to:
+\begin{equation}
+\boxed{O(BT(d + p))}
+\end{equation}
+
+\subsection{Complexity Comparison}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{|l|c|c|}
+\hline
+\textbf{Metric} & \textbf{Original Algorithm} & \textbf{Flash Algorithm} \\
+\hline
+\hline
+\textbf{Time Complexity} & $O(BT^2(d + p))$ & $O(BT^2(d + p))$ \\
+\hline
+\textbf{Memory Complexity} & $O(BT^2 + BT(d + p))$ & $O(BT(d + p))$ \\
+\hline
+\textbf{Dominant Term (Memory)} & $O(BT^2)$ & $O(BT(d + p))$ \\
+\hline
+\textbf{Memory Scaling} & Quadratic in $T$ & Linear in $T$ \\
+\hline
+\end{tabular}
+\caption{Asymptotic complexity comparison}
+\end{table}
+
+\subsection{Practical Memory Savings}
+
+\subsubsection{Memory Reduction Factor}
+
+The memory reduction factor is:
+\begin{equation}
+\text{Reduction} = \frac{O(BT^2 + BT(d + p))}{O(BT(d + p))} = \frac{T^2 + T(d + p)}{T(d + p)} = \frac{T}{d + p} + 1
+\end{equation}
+
+For large $T$ relative to $d + p$:
+\begin{equation}
+\text{Reduction} \approx \frac{T}{d + p}
+\end{equation}
+
+\subsubsection{Concrete Examples}
+
+\paragraph{Example 1: Moderate Sequence}
+$B = 32$, $T = 2048$, $d = 768$, $p = 768$ (typical transformer settings)
+
+\begin{itemize}
+\item Original memory: $32 \times (2048^2 + 2048 \times 1536) \approx 32 \times (4.2M + 3.1M) = 234M$ elements
+\item Flash memory: $32 \times 2048 \times 1536 = 100M$ elements  
+\item \textbf{Reduction}: $234M / 100M = 2.34\times$
+\end{itemize}
+
+\paragraph{Example 2: Long Sequence}
+$B = 16$, $T = 8192$, $d = 1024$, $p = 1024$
+
+\begin{itemize}
+\item Original memory: $16 \times (8192^2 + 8192 \times 2048) \approx 16 \times (67M + 16.8M) = 1.34B$ elements
+\item Flash memory: $16 \times 8192 \times 2048 = 268M$ elements
+\item \textbf{Reduction}: $1.34B / 268M = 5.0\times$
+\end{itemize}
+
+\paragraph{Example 3: Very Long Sequence}
+$B = 8$, $T = 32768$, $d = 2048$, $p = 2048$
+
+\begin{itemize}
+\item Original memory: $8 \times (32768^2 + 32768 \times 4096) \approx 8 \times (1.07B + 134M) = 9.6B$ elements
+\item Flash memory: $8 \times 32768 \times 4096 = 1.07B$ elements
+\item \textbf{Reduction}: $9.6B / 1.07B = 9.0\times$
+\end{itemize}
+
+\subsection{Scaling Analysis}
+
+\begin{figure}[h]
+\centering
+\begin{tabular}{|c|c|c|c|}
+\hline
+$T$ & Original Memory & Flash Memory & Reduction Factor \\
+\hline
+1024 & $BT^2 + BT(d+p)$ & $BT(d+p)$ & $\frac{T}{d+p} + 1$ \\
+\hline
+1024 & $1.05M \cdot B$ & $2.1M \cdot B$ & $0.5\times$ \\
+2048 & $4.2M \cdot B$ & $4.2M \cdot B$ & $1.0\times$ \\
+4096 & $16.8M \cdot B$ & $8.4M \cdot B$ & $2.0\times$ \\
+8192 & $67.1M \cdot B$ & $16.8M \cdot B$ & $4.0\times$ \\
+16384 & $268M \cdot B$ & $33.6M \cdot B$ & $8.0\times$ \\
+32768 & $1.07B \cdot B$ & $67.1M \cdot B$ & $16.0\times$ \\
+\hline
+\end{tabular}
+\caption{Memory scaling with sequence length (assuming $d = p = 1024$)}
+\end{figure}
+
+\paragraph{Key Observations:}
+\begin{enumerate}
+\item \textbf{Break-even point}: Flash algorithm becomes beneficial when $T > d + p$
+\item \textbf{Linear scaling}: Flash memory grows as $O(T)$ vs. $O(T^2)$ for original
+\item \textbf{Increasing advantage}: Reduction factor grows linearly with $T$
+\item \textbf{Modern relevance}: For current LLM sequence lengths ($T \geq 8K$), flash provides substantial savings
+\end{enumerate}
+
+\subsection{Implementation Considerations}
+
+\paragraph{Tile Size Selection:}
+The tile size $\tau$ affects:
+\begin{itemize}
+\item \textbf{Memory usage}: Larger $\tau$ increases working memory $O(B\tau^2)$
+\item \textbf{Cache efficiency}: Moderate $\tau$ (128-512) often optimal for GPU shared memory
+\item \textbf{Load balancing}: $\tau$ should divide $T$ reasonably evenly
+\end{itemize}
+
+\paragraph{Numerical Precision:}
+\begin{itemize}
+\item Flash algorithm can use higher precision accumulators (e.g., \texttt{float32}) while keeping inputs in lower precision (e.g., \texttt{bfloat16})
+\item This helps maintain numerical stability without significantly increasing memory usage
+\end{itemize}

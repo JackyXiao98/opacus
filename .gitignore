@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+*.zip
+*.json
+*.log
+
 # Downloaded data
 data/
 

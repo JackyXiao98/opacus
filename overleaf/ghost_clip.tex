@@ -1,0 +1,118 @@
+\section{Ghost Norm Clipping Algorithm}
+
+\subsection{Problem Formulation}
+
+Consider a batch of sequential data with dimensions:
+\begin{itemize}
+\item Batch size: $B$
+\item Sequence length: $T$ 
+\item Activation dimension: $d$
+\item Gradient dimension: $p$
+\end{itemize}
+
+We have:
+\begin{itemize}
+\item Activations: $A \in \mathbb{R}^{B \times T \times d}$
+\item Backpropagated gradients: $G \in \mathbb{R}^{B \times T \times p}$
+\end{itemize}
+
+For each sample $n \in \{1, \ldots, B\}$, we want to compute:
+\begin{equation}
+\left\|\sum_{t=1}^T G_{n,t,:} A_{n,t,:}^T\right\|_F^2
+\end{equation}
+
+\subsection{Algorithm Description}
+
+The original ghost clipping algorithm computes this norm by explicitly constructing Gram matrices for each sample in the batch.
+
+\begin{algorithm}[H]
+\caption{Ghost Norm Clipping (Original Algorithm)}
+\label{alg:ghost_original}
+\begin{algorithmic}[1]
+\Require Activations $A \in \mathbb{R}^{B \times T \times d}$, Gradients $G \in \mathbb{R}^{B \times T \times p}$
+\Ensure Per-sample norms $\text{norms} \in \mathbb{R}^B$
+
+\For{$n = 1$ to $B$} \Comment{For each sample in batch}
+    \State $G_n \leftarrow G[n, :, :] \in \mathbb{R}^{T \times p}$ \Comment{Extract sample gradients}
+    \State $A_n \leftarrow A[n, :, :] \in \mathbb{R}^{T \times d}$ \Comment{Extract sample activations}
+    
+    \State $K_G \leftarrow G_n G_n^T \in \mathbb{R}^{T \times T}$ \Comment{Gradient Gram matrix}
+    \State $K_A \leftarrow A_n A_n^T \in \mathbb{R}^{T \times T}$ \Comment{Activation Gram matrix}
+    
+    \State $\text{norm}_n \leftarrow \sum_{i=1}^T \sum_{j=1}^T (K_G)_{ij} (K_A)_{ij}$ \Comment{Hadamard inner product}
+    \State $\text{norms}[n] \leftarrow \sqrt{\max(0, \text{norm}_n)}$ \Comment{Clamp and take square root}
+\EndFor
+
+\State \Return $\text{norms}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Implementation Analysis}
+
+The PyTorch implementation uses Einstein summation notation for efficiency:
+
+\begin{lstlisting}[language=Python, caption=Original Implementation]
+# Compute batchwise Gram matrices
+ggT = torch.einsum("nik,njk->nij", backprops, backprops)  # [B,T,T]
+aaT = torch.einsum("nik,njk->nij", activations, activations)  # [B,T,T]
+
+# Compute Hadamard inner product and sum
+ga = torch.einsum("n...i,n...i->n", ggT, aaT).clamp(min=0)
+
+# Take square root for final norm
+ret[layer.weight] = torch.sqrt(ga)
+\end{lstlisting}
+
+The einsum operations correspond to:
+\begin{itemize}
+\item \texttt{"nik,njk->nij"}: For each batch element $n$, compute outer products between all pairs of time steps
+\item \texttt{"n...i,n...i->n"}: Element-wise multiplication and summation over all dimensions except batch
+\end{itemize}
+
+\subsection{Correctness Proof}
+
+\begin{theorem}
+The ghost clipping algorithm correctly computes the squared Frobenius norm of the per-sample gradient matrix.
+\end{theorem}
+
+\begin{proof}
+For a single sample $n$, the gradient matrix is:
+\begin{equation}
+\nabla W^{(n)} = \sum_{t=1}^T G_{n,t,:} A_{n,t,:}^T
+\end{equation}
+
+The squared Frobenius norm is:
+\begin{align}
+\left\|\nabla W^{(n)}\right\|_F^2 &= \text{tr}\left(\left(\nabla W^{(n)}\right)^T \nabla W^{(n)}\right) \\
+&= \text{tr}\left(\left(\sum_{t=1}^T A_{n,t,:} G_{n,t,:}^T\right) \left(\sum_{s=1}^T G_{n,s,:} A_{n,s,:}^T\right)\right) \\
+&= \text{tr}\left(\sum_{t=1}^T \sum_{s=1}^T A_{n,t,:} G_{n,t,:}^T G_{n,s,:} A_{n,s,:}^T\right) \\
+&= \sum_{t=1}^T \sum_{s=1}^T \text{tr}\left(A_{n,t,:} G_{n,t,:}^T G_{n,s,:} A_{n,s,:}^T\right) \\
+&= \sum_{t=1}^T \sum_{s=1}^T \text{tr}\left(G_{n,t,:}^T G_{n,s,:} A_{n,s,:}^T A_{n,t,:}\right) \\
+&= \sum_{t=1}^T \sum_{s=1}^T (G_{n,t,:} \cdot G_{n,s,:})(A_{n,t,:} \cdot A_{n,s,:}) \\
+&= \sum_{t=1}^T \sum_{s=1}^T (K_G)_{ts} (K_A)_{ts}
+\end{align}
+
+where we used the cyclic property of trace and the fact that $\text{tr}(uv^T) = u \cdot v$ for vectors $u, v$.
+
+This shows that the algorithm correctly computes the desired norm by computing the Hadamard inner product of the Gram matrices.
+\end{proof}
+
+\subsection{Memory and Computational Characteristics}
+
+The original algorithm has the following characteristics:
+
+\paragraph{Memory Usage:}
+\begin{itemize}
+\item Input storage: $O(BT(d + p))$ for activations and gradients
+\item Gram matrices: $O(BT^2)$ for both $K_G$ and $K_A$
+\item Total: $O(BT(d + p) + BT^2)$, dominated by $O(BT^2)$ when $T$ is large
+\end{itemize}
+
+\paragraph{Computational Complexity:}
+\begin{itemize}
+\item Gram matrix computation: $O(BT^2(d + p))$ 
+\item Hadamard inner product: $O(BT^2)$
+\item Total: $O(BT^2(d + p))$
+\end{itemize}
+
+The quadratic dependence on sequence length $T$ becomes problematic for long sequences, motivating the development of more memory-efficient approaches.

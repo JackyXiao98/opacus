@@ -334,6 +334,7 @@ class GradSampleModule(AbstractGradSampleModule):
             loss_reduction=loss_reduction,
             batch_first=batch_first,
         )
+        
         if (
             not self.force_functorch
             and self._get_module_type(module) in self.GRAD_SAMPLERS
