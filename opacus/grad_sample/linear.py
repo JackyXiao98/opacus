@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 
 from .utils import register_grad_sampler, register_norm_sampler
+from .triton_kernels import compute_linear_norm_sample_triton, is_triton_available
 
 
 logger = logging.getLogger(__name__)
@@ -65,7 +66,7 @@ def compute_linear_norm_sample(
     """
     activations = activations[0]
     activations = activations.to(backprops.dtype)
-
+    # print(layer, "\n", "activation shape: ", activations.shape, "backprop shape: ", backprops.shape)
     ret = {}
 
     if backprops.dim() == 2:
@@ -85,9 +86,38 @@ def compute_linear_norm_sample(
                 "nik,njk->nij", activations, activations
             )  # batchwise a a^T
             ga = torch.einsum("n...i,n...i->n", ggT, aaT).clamp(min=0)
+            # print("linear shapes: ", ggT.shape, aaT.shape, ga.shape)
 
             ret[layer.weight] = torch.sqrt(ga)
         if layer.bias is not None and layer.bias.requires_grad:
             ggT = torch.einsum("nik,njk->nij", backprops, backprops)  # batchwise g g^T
             ret[layer.bias] = torch.sqrt(torch.einsum("n...i->n", ggT).clamp(min=0))
     return ret
+
+
+@register_norm_sampler(nn.Linear, "triton")
+def compute_linear_norm_sample_triton_wrapper(
+    layer: nn.Linear, activations: List[torch.Tensor], backprops: torch.Tensor
+) -> Dict[nn.Parameter, torch.Tensor]:
+    """
+    Triton-accelerated version of per sample gradient norms for ``nn.Linear`` layer.
+    This function provides significant speedup for sequence models (3D tensors) by using
+    optimized Triton kernels for gradient norm computations.
+
+    Args:
+        layer: Linear layer
+        activations: Activations from forward pass
+        backprops: Backpropagated gradients
+
+    Returns:
+        Dictionary mapping parameters to their gradient norms
+    """
+
+    if not is_triton_available():
+        logger.warning(
+            "Triton is not available. Falling back to standard norm computation. "
+            "Install triton for better performance: pip install triton"
+        )
+        return compute_linear_norm_sample(layer, activations, backprops)
+    
+    return compute_linear_norm_sample_triton(layer, activations, backprops)

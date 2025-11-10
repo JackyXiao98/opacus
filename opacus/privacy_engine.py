@@ -197,7 +197,7 @@ class PrivacyEngine:
 
             return module
         else:
-            if grad_sample_mode in ["ghost", "ghost_fsdp"]:
+            if grad_sample_mode in ["ghost", "ghost_fsdp", "flash"]:
                 return wrap_model(
                     module,
                     grad_sample_mode=grad_sample_mode,
@@ -429,7 +429,7 @@ class PrivacyEngine:
         optimizer.attach_step_hook(
             self.accountant.get_optimizer_hook_fn(sample_rate=sample_rate)
         )
-        if "ghost" in grad_sample_mode:
+        if "ghost" in grad_sample_mode or grad_sample_mode == "flash":
             criterion = self._prepare_criterion(
                 module=module,
                 optimizer=optimizer,

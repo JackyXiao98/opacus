@@ -77,6 +77,7 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
     """
 
     NORM_SAMPLERS = {}
+    TRITON_NORM_SAMPLERS = {}
 
     def __init__(
         self,
@@ -88,6 +89,7 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
         force_functorch=False,
         max_grad_norm=1,
         use_ghost_clipping=True,
+        use_triton=False,
     ):
         """
 
@@ -108,6 +110,9 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
             use_ghost_clipping: If set to ``True``, Ghost Clipping
                 will be used for clipping gradients of supported layers. If ``False``, Fast
                 Gradient Clipping will be used for all layers.
+            use_triton: If set to ``True``, Triton-accelerated kernels will be used
+                for supported layers when available, providing significant speedup for
+                sequence models. Requires triton to be installed.
 
         Raises:
             NotImplementedError
@@ -131,6 +136,7 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
         self.trainable_parameters = [p for _, p in trainable_parameters(self._module)]
         self.max_grad_norm = max_grad_norm
         self.use_ghost_clipping = use_ghost_clipping
+        self.use_triton = use_triton
         self._per_sample_gradient_norms = None
 
     def get_clipping_coef(self) -> torch.Tensor:
@@ -213,8 +219,16 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
             for temp in activations
         ]
 
-        if self.use_ghost_clipping and type(module) in self.NORM_SAMPLERS:
-            norm_sampler_fn = self.NORM_SAMPLERS[type(module)]
+        if self.use_ghost_clipping and (
+            type(module) in self.NORM_SAMPLERS or 
+            (self.use_triton and type(module) in self.TRITON_NORM_SAMPLERS)
+        ):
+            # Use Triton sampler if available and enabled, otherwise use standard sampler
+            if self.use_triton and type(module) in self.TRITON_NORM_SAMPLERS:
+                norm_sampler_fn = self.TRITON_NORM_SAMPLERS[type(module)]
+            else:
+                norm_sampler_fn = self.NORM_SAMPLERS[type(module)]
+            
             norm_samples = norm_sampler_fn(module, activations, backprops)
 
             for param, ns in norm_samples.items():
@@ -272,10 +286,18 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
                     f"Module name: {m_name}, module type: {type(m)}. No hook or functorch is added."
                 )
 
-            elif use_ghost_clipping and type(m) in self.NORM_SAMPLERS:
-                logger.info(
-                    f"Module name: {m_name}, module type: {type(m)}, under Ghost Clipping."
-                )
+            elif use_ghost_clipping and (
+                type(m) in self.NORM_SAMPLERS or 
+                (self.use_triton and type(m) in self.TRITON_NORM_SAMPLERS)
+            ):
+                if self.use_triton and type(m) in self.TRITON_NORM_SAMPLERS:
+                    logger.info(
+                        f"Module name: {m_name}, module type: {type(m)}, under Ghost Clipping with Triton acceleration."
+                    )
+                else:
+                    logger.info(
+                        f"Module name: {m_name}, module type: {type(m)}, under Ghost Clipping."
+                    )
 
             else:
                 if not force_functorch and type(m) in self.GRAD_SAMPLERS:

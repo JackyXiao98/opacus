@@ -68,9 +68,9 @@ def matmul_kernel(
     # The stride variables represent how much to increase the ptr by when moving by 1
     # element in a particular dimension. E.g. `stride_am` is how much to increase `a_ptr`
     # by to get the element one row down (A has M rows).
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
+    stride_batch_a, stride_am, stride_ak,
+    stride_batch_b, stride_bk, stride_bn,
+    stride_batch_c, stride_cm, stride_cn,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
@@ -78,6 +78,7 @@ def matmul_kernel(
     """Kernel for matrix multiplication C = A @ B"""
     # Map program ids `pid` to the block of C it should compute.
     pid = tl.program_id(axis=0)
+    batch_id = tl.program_id(axis=1)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
@@ -91,8 +92,8 @@ def matmul_kernel(
     offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    a_ptrs = a_ptr + batch_id * stride_batch_a + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + batch_id * stride_batch_b + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
     # Iterate to compute a block of the C matrix.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -110,7 +111,7 @@ def matmul_kernel(
     # Write back the block of the output matrix C with masks.
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
+    c_ptrs = c_ptr + batch_id * stride_batch_c + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
     c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 
@@ -118,7 +119,12 @@ def matmul_kernel(
 def triton_matmul(a, b):
     """Triton matrix multiplication wrapper"""
     # Check constraints.
-    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+    if a.dim() == 2:
+        a = a.unsqueeze(0)
+    if b.dim() == 2:
+        b = b.unsqueeze(0)
+
+    assert a.shape[0] == b.shape[0] and a.shape[2] == b.shape[1], "Incompatible dimensions"
     
     # Ensure tensors are contiguous
     if not a.is_contiguous():
@@ -126,18 +132,18 @@ def triton_matmul(a, b):
     if not b.is_contiguous():
         b = b.contiguous()
     
-    M, K = a.shape
-    K, N = b.shape
+    B, M, K = a.shape
+    B, K, N = b.shape
     # Allocate output.
-    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
+    c = torch.empty((B, M, N), device=a.device, dtype=a.dtype)
     # 1D launch kernel where each block gets its own program.
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), B)
     matmul_kernel[grid](
         a, b, c,
         M, N, K,
-        a.stride(0), a.stride(1),
-        b.stride(0), b.stride(1),
-        c.stride(0), c.stride(1),
+        a.stride(0), a.stride(1), a.stride(2),
+        b.stride(0), b.stride(1), b.stride(2),
+        c.stride(0), c.stride(1), c.stride(2),
         BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=32, GROUP_SIZE_M=8,
     )
     return c
@@ -170,24 +176,24 @@ def _triton_frobenius_inner_over_T(
     for p in range(num_tiles):
         ps = p * tile_size
         pe = min((p + 1) * tile_size, T)
-        A_p = A[:, ps:pe, :]
-        G_p = G[:, ps:pe, :]
+        A_p = A[:, ps:pe, :].contiguous()
+        G_p = G[:, ps:pe, :].contiguous()
 
         # Diagonal block (p, p): sum(G_p @ G_p^T * A_p @ A_p^T)
         # Use efficient batched operations
-        Sg_pp = torch.bmm(G_p, G_p.transpose(-2, -1))  # [B, tau_p, tau_p]
-        Sa_pp = torch.bmm(A_p, A_p.transpose(-2, -1))  # [B, tau_p, tau_p]
+        Sg_pp = triton_matmul(G_p, G_p.transpose(-2, -1))  # [B, tau_p, tau_p]
+        Sa_pp = triton_matmul(A_p, A_p.transpose(-2, -1))  # [B, tau_p, tau_p]
         ga += torch.sum(Sg_pp * Sa_pp, dim=(1, 2))
 
         # Off-diagonal blocks (q < p): 2 * sum(G_p @ G_q^T * A_p @ A_q^T)
         for q in range(p):
             qs = q * tile_size
             qe = min((q + 1) * tile_size, T)
-            A_q = A[:, qs:qe, :]
-            G_q = G[:, qs:qe, :]
+            A_q = A[:, qs:qe, :].contiguous()
+            G_q = G[:, qs:qe, :].contiguous()
 
-            Sg_pq = torch.bmm(G_p, G_q.transpose(-2, -1))  # [B, tau_p, tau_q]
-            Sa_pq = torch.bmm(A_p, A_q.transpose(-2, -1))  # [B, tau_p, tau_q]
+            Sg_pq = triton_matmul(G_p, G_q.transpose(-2, -1))  # [B, tau_p, tau_q]
+            Sa_pq = triton_matmul(A_p, A_q.transpose(-2, -1))  # [B, tau_p, tau_q]
             ga += 2.0 * torch.sum(Sg_pq * Sa_pq, dim=(1, 2))
 
     return ga
@@ -211,8 +217,8 @@ def _triton_sum_over_time_norm_squared(
     partial_results = torch.zeros(B, d_g, dtype=dtype_acc, device=G.device)
     
     # Launch kernel
-    BLOCK_SIZE_T = min(64, T)
-    BLOCK_SIZE_D = min(64, d_g)
+    BLOCK_SIZE_T = triton.next_power_of_2(min(T, 64))
+    BLOCK_SIZE_D = triton.next_power_of_2(min(d_g, 64))
     grid = (B, triton.cdiv(d_g, BLOCK_SIZE_D))
     
     sum_over_time_norm_squared_kernel[grid](
@@ -232,7 +238,7 @@ def compute_linear_norm_sample_triton(
     layer: nn.Linear,
     activations: List[torch.Tensor],
     backprops: torch.Tensor,
-    tile_size: int = 256,
+    tile_size: int = 512,
     dtype_acc = torch.float32,
 ) -> Dict[nn.Parameter, torch.Tensor]:
     """

@@ -60,6 +60,7 @@ def register_grad_sampler(
 
 def register_norm_sampler(
     target_class_or_classes: Union[Type[nn.Module], Sequence[Type[nn.Module]]],
+    mode: str = "default",
 ):
     """
     Registers the decorated function as the ``norm_sampler`` of ``target_class_or_classes``, which is
@@ -69,6 +70,10 @@ def register_norm_sampler(
     >>> @register_norm_sampler(MyCustomModel)
     ... def compute_grad_norm_sample(module, activations, backprops):
     ...    pass
+    
+    Args:
+        target_class_or_classes: The target class(es) to register the sampler for
+        mode: The mode for the sampler ("default" or "triton")
     """
 
     def decorator(f):
@@ -78,7 +83,13 @@ def register_norm_sampler(
             else [target_class_or_classes]
         )
         for target_class in target_classes:
-            GradSampleModuleFastGradientClipping.NORM_SAMPLERS[target_class] = f
+            if mode == "triton":
+                # Store triton samplers separately
+                if not hasattr(GradSampleModuleFastGradientClipping, "TRITON_NORM_SAMPLERS"):
+                    GradSampleModuleFastGradientClipping.TRITON_NORM_SAMPLERS = {}
+                GradSampleModuleFastGradientClipping.TRITON_NORM_SAMPLERS[target_class] = f
+            else:
+                GradSampleModuleFastGradientClipping.NORM_SAMPLERS[target_class] = f
         return f
 
     return decorator
@@ -88,6 +99,9 @@ def wrap_model(model: nn.Module, grad_sample_mode: str, *args, **kwargs):
     cls = get_gsm_class(grad_sample_mode)
     if grad_sample_mode == "functorch":
         kwargs["force_functorch"] = True
+    elif grad_sample_mode == "flash":
+        kwargs["use_triton"] = True
+        kwargs["use_ghost_clipping"] = True
     return cls(model, *args, **kwargs)
 
 
@@ -105,6 +119,8 @@ def get_gsm_class(grad_sample_mode: str) -> Type[AbstractGradSampleModule]:
         return GradSampleModuleExpandedWeights
     elif grad_sample_mode == "ghost":
         return GradSampleModuleFastGradientClipping
+    elif grad_sample_mode == "flash":
+        return GradSampleModuleFastGradientClipping
     elif grad_sample_mode == "ghost_fsdp":
         return GradSampleModuleFastGradientClippingFSDP
     elif grad_sample_mode == "no_op":
@@ -112,5 +128,5 @@ def get_gsm_class(grad_sample_mode: str) -> Type[AbstractGradSampleModule]:
     else:
         raise ValueError(
             f"Unexpected grad_sample_mode: {grad_sample_mode}. "
-            f"Allowed values: hooks, ew"
+            f"Allowed values: hooks, ew, ghost, flash, ghost_fsdp, no_op"
         )

@@ -1,0 +1,36 @@
+# .cursorignore
+
+# 依赖和构建产物
+node_modules/
+dist/
+build/
+out/
+bin/
+pkg/
+
+# 虚拟环境 (Python)
+.venv/
+venv/
+env/
+__pycache__/
+
+# 锁文件和大型数据文件
+package-lock.json
+yarn.lock
+*.log
+*.sqlite
+*.db
+*.csv
+*.jsonl
+
+# Git 和系统文件
+.git/
+.DS_Store
+
+# 文档和图片 (除非你需要 AI 读取它们)
+docs/
+assets/
+images/
+*.png
+*.jpg
+*.svg

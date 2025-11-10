@@ -171,7 +171,7 @@ def run_benchmark_suite():
     # ]
 
     test_configs = [
-        (8, 8192, 128, 128),    
+        (1, 8192*2, 128, 128),    
     ]
     
     results = []
