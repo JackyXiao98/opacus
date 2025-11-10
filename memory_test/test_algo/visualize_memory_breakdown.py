@@ -36,9 +36,9 @@ def plot_memory_breakdown_comparison(results, output_dir):
     breakdowns = {}
     
     name_mapping = {
-        "vanilla": "Vanilla\n(No DP-SGD)",
-        "ghost": "Ghost Clipping\n(DP-SGD)",
-        "flash_clip": "Flash Clipping\n(DP-SGD)"
+        "vanilla": "Classical Training / No DP",
+        "ghost": "SOTA DP Training",
+        "flash_clip": "Proposed Solution"
     }
     
     for exp_key in ["vanilla", "ghost", "flash_clip"]:
@@ -174,9 +174,9 @@ def plot_memory_timeline(results, output_dir):
     fig, axes = plt.subplots(3, 1, figsize=(16, 12))
     
     name_mapping = {
-        "vanilla": "Vanilla (No DP-SGD)",
-        "ghost": "Ghost Clipping (DP-SGD)",
-        "flash_clip": "Flash Clipping (DP-SGD)"
+        "vanilla": "Classical Training / No DP",
+        "ghost": "SOTA DP Training",
+        "flash_clip": "Proposed Solution"
     }
     
     for idx, (exp_key, ax) in enumerate(zip(["vanilla", "ghost", "flash_clip"], axes)):
@@ -237,47 +237,63 @@ def plot_performance_comparison(results, output_dir):
     fig, ax = plt.subplots(figsize=(12, 8))
     
     name_mapping = {
-        "vanilla": "Vanilla (No DP-SGD)",
-        "ghost": "Ghost Clipping",
-        "flash_clip": "Flash Clipping"
+        "vanilla": "Classical Training / No DP",
+        "ghost": "SOTA DP Training",
+        "flash_clip": "Proposed Solution"
     }
     
     colors = {
-        "vanilla": "#3498db",
-        "ghost": "#e74c3c",
-        "flash_clip": "#2ecc71"
+        "vanilla": "lightblue",
+        "ghost": "lightcoral",
+        "flash_clip": "lightgreen"
     }
     
+    all_peak_mems = []
+    all_avg_times = []
+
     for exp_key in ["vanilla", "ghost", "flash_clip"]:
         if exp_key not in results:
             continue
         
         peak_mem = results[exp_key]["peak_memory_mb"]
         avg_time = results[exp_key]["avg_time_ms"]
+        all_peak_mems.append(peak_mem)
+        all_avg_times.append(avg_time)
         
         ax.scatter(peak_mem, avg_time, s=500, alpha=0.7, 
-                  color=colors[exp_key], edgecolors='black', linewidth=2,
+                  color=colors[exp_key].replace("light", ""), edgecolors='black', linewidth=2,
                   label=name_mapping[exp_key])
         
         # Add labels
         ax.annotate(name_mapping[exp_key], 
                    xy=(peak_mem, avg_time), 
-                   xytext=(10, 10), textcoords='offset points',
-                   fontsize=11, fontweight='bold',
-                   bbox=dict(boxstyle='round,pad=0.5', facecolor=colors[exp_key], alpha=0.3))
+                   xytext=(0, 25), textcoords='offset points',
+                   ha='center', va='bottom',
+                   fontsize=14, fontweight='bold',
+                   bbox=dict(boxstyle='round,pad=0.5', facecolor=colors[exp_key], alpha=0.8))
         
         # Add data labels
-        ax.text(peak_mem, avg_time - 500, 
+        ax.text(peak_mem, avg_time - 600, 
                f'{peak_mem:.0f} MB\n{avg_time:.0f} ms',
-               ha='center', va='top', fontsize=10, fontweight='bold')
+               ha='center', va='top', fontsize=12, fontweight='bold')
     
-    ax.set_xlabel('Peak Memory (MB)', fontsize=14, fontweight='bold')
-    ax.set_ylabel('Average Time per Step (ms)', fontsize=14, fontweight='bold')
-    ax.set_title('Memory vs Time Trade-off', fontsize=16, fontweight='bold')
-    ax.legend(loc='best', fontsize=12)
-    ax.grid(True, alpha=0.3, linestyle='--')
+    if all_peak_mems:
+        min_mem, max_mem = min(all_peak_mems), max(all_peak_mems)
+        mem_range = max_mem - min_mem if max_mem > min_mem else max_mem * 0.1
+        ax.set_xlim(min_mem - mem_range * 0.2, max_mem + mem_range * 0.2)
+
+    if all_avg_times:
+        min_time, max_time = min(all_avg_times), max(all_avg_times)
+        time_range = max_time - min_time if max_time > min_time else max_time * 0.1
+        ax.set_ylim(min_time - time_range * 0.2, max_time + time_range * 0.2)
+
+    ax.set_xlabel('Peak Memory (MB)', fontsize=16, fontweight='bold')
+    ax.set_ylabel('Training Time per Step (ms)', fontsize=16, fontweight='bold')
+    ax.set_title('Memory vs Training Time', fontsize=18, fontweight='bold')
+    ax.legend(loc='upper left', fontsize=14)
+    ax.grid(True, alpha=0.5, linestyle='--')
     
-    plt.tight_layout()
+    plt.tight_layout(pad=1.5)
     output_path = Path(output_dir) / "performance_tradeoff.png"
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
@@ -295,9 +311,9 @@ def generate_summary_table(results, output_dir):
     summary_lines.append("")
     
     name_mapping = {
-        "vanilla": "Vanilla (No DP-SGD)",
-        "ghost": "Ghost Clipping (DP-SGD)",
-        "flash_clip": "Flash Clipping (DP-SGD)"
+        "vanilla": "Classical Training / No DP",
+        "ghost": "SOTA DP Training",
+        "flash_clip": "Proposed Solution"
     }
     
     # Header

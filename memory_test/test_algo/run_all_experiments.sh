@@ -15,10 +15,10 @@ VOCAB_SIZE=32000
 HIDDEN_DIM=2048
 NUM_LAYERS=20
 NUM_HEADS=16
-SEQ_LEN=16384  # 8192 * 2
-BATCH_SIZE=1
+SEQ_LEN=8192  # 8192 * 2
+BATCH_SIZE=2
 NUM_ITER=3
-WARMUP_ITER=2
+WARMUP_ITER=0
 
 # Output directory
 OUTPUT_DIR="memory_profiling_results"
@@ -48,7 +48,7 @@ run_experiment() {
     fi
     
     # Run experiment in isolated process
-    python memory_test/test_algo/single_experiment.py \
+    python single_experiment.py \
         --experiment "$exp_name" \
         --output "$output_file" \
         --vocab-size $VOCAB_SIZE \
@@ -88,7 +88,7 @@ echo ""
 
 # Generate visualization
 echo "Generating visualizations..."
-python memory_test/test_algo/visualize_memory_breakdown.py \
+python visualize_memory_breakdown.py \
     --input-dir "$RUN_DIR" \
     --output-dir "$RUN_DIR/visualizations"
 

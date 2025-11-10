@@ -1,0 +1,132 @@
+\section{FC-pathB: Input-Length-Linear Algorithm}
+
+This section describes the \texttt{FC-pathB} algorithm, which is designed to compute the squared Frobenius norm of the gradient for a linear layer. We present two versions of the algorithm: a straightforward implementation and a memory-optimized version. We then prove their equivalence and analyze their complexity.
+
+\subsection{Algorithm Description}
+
+The goal is to compute $\| \nabla_W L \|_F^2$ for a linear layer, where the gradient can be expressed as $\nabla_W L = A^T G$. Here, $A \in \mathbb{R}^{B \times T \times d_a}$ is the input activation tensor and $G \in \mathbb{R}^{B \times T \times d_g}$ is the output gradient tensor. The squared Frobenius norm is given by:
+$$ \| \nabla_W L \|_F^2 = \| A^T G \|_F^2 = \sum_{i,j} ( (A^T G)_{ij} )^2 $$
+
+\subsubsection{Original Algorithm (FC-pathB-orig)}
+
+The original algorithm, as commented in the source code, follows a tiled approach. The time dimension $T$ is split into $n$ blocks of size $\tau$. For each block $j$, we compute $M_j = a_j^T g_j$, where $a_j$ and $g_j$ are the corresponding slices of $A$ and $G$. The total squared norm is then computed as:
+
+$$ \| A^T G \|_F^2 = \left\| \sum_{j=1}^n M_j \right\|_F^2 = \sum_{j=1}^n \|M_j\|_F^2 + 2 \sum_{j=1}^n \sum_{k=j+1}^n \langle M_j, M_k \rangle_F $$
+
+This is implemented by first pre-computing and storing all $M_j$ matrices, and then computing the sum of Frobenius inner products.
+
+\begin{verbatim}
+# Original Algorithm
+total_norm_squared = 0
+M_list = []
+for j in 1..num_tiles:
+    M_j = a_j.T @ g_j
+    M_list.append(M_j)
+
+for j in 1..num_tiles:
+    for k in j..num_tiles:
+        block_sum = frobenius_inner_product(M_list[j], M_list[k])
+        if j == k:
+            total_norm_squared += block_sum
+        else:
+            total_norm_squared += 2 * block_sum
+\end{verbatim}
+
+\subsubsection{Memory-Optimized Algorithm (FC-pathB-opt)}
+
+The memory-optimized algorithm avoids storing the list of $M_j$ matrices. Instead, it computes a running sum $S = \sum_{j=1}^n M_j$. The final squared Frobenius norm is then simply $\|S\|_F^2$.
+
+\begin{verbatim}
+# Memory-Optimized Algorithm
+S = 0
+for j in 1..num_tiles:
+    M_j = a_j.T @ g_j
+    S += M_j
+total_norm_squared = frobenius_norm_sq(S)
+\end{verbatim}
+
+\subsection{Equivalence Proof}
+
+The equivalence of the two algorithms stems from the properties of the Frobenius norm. Let $S = \sum_{j=1}^n M_j$. Then:
+\begin{align*}
+\|S\|_F^2 &= \left\| \sum_{j=1}^n M_j \right\|_F^2 \\
+&= \left\langle \sum_{j=1}^n M_j, \sum_{k=1}^n M_k \right\rangle_F \\
+&= \sum_{j=1}^n \sum_{k=1}^n \langle M_j, M_k \rangle_F \\
+&= \sum_{j=1}^n \langle M_j, M_j \rangle_F + \sum_{j \neq k} \langle M_j, M_k \rangle_F \\
+&= \sum_{j=1}^n \|M_j\|_F^2 + 2 \sum_{j=1}^n \sum_{k=j+1}^n \langle M_j, M_k \rangle_F
+\end{align*}
+This is exactly the expression computed by the original algorithm. Thus, the two algorithms are mathematically equivalent.
+
+\subsection{Complexity Analysis}
+
+Let $B$ be the batch size, $T$ the sequence length, $d_a$ the input dimension, and $d_g$ the output dimension. Let the tile size be $\tau$. The number of tiles is $n = \lceil T/\tau \rceil$.
+
+\begin{itemize}
+    \item \textbf{FC-pathB-orig}:
+        \begin{itemize}
+            \item Pre-computation: For each of the $n$ tiles, we compute $M_j$ which takes $O(B \cdot \tau \cdot d_a \cdot d_g)$. Total pre-computation is $O(n \cdot B \cdot \tau \cdot d_a \cdot d_g) = O(B \cdot T \cdot d_a \cdot d_g)$.
+            \item Inner products: There are $O(n^2)$ pairs of $(M_j, M_k)$. Each inner product takes $O(B \cdot d_a \cdot d_g)$. Total for this step is $O(n^2 \cdot B \cdot d_a \cdot d_g) = O((T^2/\tau^2) \cdot B \cdot d_a \cdot d_g)$.
+            \item Memory: Storing the list of $M_j$ matrices requires $O(n \cdot B \cdot d_a \cdot d_g) = O((T/\tau) \cdot B \cdot d_a \cdot d_g)$ memory.
+        \end{itemize}
+    \item \textbf{FC-pathB-opt}:
+        \begin{itemize}
+            \item Computation: In each of the $n$ steps, we compute $M_j$ and add it to $S$. This takes $O(B \cdot \tau \cdot d_a \cdot d_g)$. Total is $O(n \cdot B \cdot \tau \cdot d_a \cdot d_g) = O(B \cdot T \cdot d_a \cdot d_g)$.
+            \item Final norm: Computing $\|S\|_F^2$ takes $O(B \cdot d_a \cdot d_g)$.
+            \item Total time complexity is dominated by the loop, so it is $O(B \cdot T \cdot d_a \cdot d_g)$.
+            \item Memory: We only need to store the running sum $S$, which takes $O(B \cdot d_a \cdot d_g)$ memory.
+        \end{itemize}
+\end{itemize}
+
+The optimized algorithm has a significantly lower time complexity and memory footprint compared to the original version.
+
+\section{Comparison with FC-pathA}
+
+The \texttt{FC-pathA} algorithm (\_width\_frobenius) computes the same quantity $\|A^T G\|_F^2$, but with a different grouping of operations.
+
+\subsection{Algorithm Description (FC-pathA)}
+
+\texttt{FC-pathA} also uses tiling on the time dimension. For each pair of blocks $(j, k)$, it computes:
+$$ \text{block\_sum}_{jk} = \sum_{b=1}^B \text{Tr}( (a_{b,j} a_{b,k}^T) (g_{b,j} g_{b,k}^T) ) $$
+where $a_{b,j}$ is the slice of activations for batch element $b$ and tile $j$. The total sum is accumulated similarly to \texttt{FC-pathB-orig}.
+
+\subsection{Equivalence Proof}
+
+The total squared norm is $\sum_{b=1}^B \|A_b^T G_b\|_F^2$. Let's focus on a single batch element (and drop the batch index $b$).
+\begin{align*}
+\|A^T G\|_F^2 &= \text{Tr}((A^T G)^T (A^T G)) = \text{Tr}(G^T A A^T G) \\
+&= \text{Tr}(A A^T G G^T) \\
+&= \sum_{i=1}^T (A A^T G G^T)_{ii} \\
+&= \sum_{i=1}^T \sum_{j=1}^T (A A^T)_{ij} (G G^T)_{ji} \\
+&= \sum_{i=1}^T \sum_{j=1}^T (a_i^T a_j) (g_j^T g_i)
+\end{align*}
+where $a_i, g_i$ are the vectors at time step $i$. This is exactly what \texttt{FC-pathA} computes, just grouped by tiles. The \texttt{FC-pathB} algorithm computes $(A^T G) = \sum_i a_i g_i^T$, and then the squared norm. The equivalence is clear.
+
+\subsection{Complexity and Performance Comparison}
+
+\begin{itemize}
+    \item \textbf{FC-pathA}:
+        \begin{itemize}
+            \item Time: For each pair of tiles $(j, k)$, it computes $a_j a_k^T$ and $g_j g_k^T$. These are $(\tau \times \tau)$ matrices. The matrix multiplications take $O(B \cdot \tau^2 \cdot d_a)$ and $O(B \cdot \tau^2 \cdot d_g)$. The final sum takes $O(B \cdot \tau^2)$. Total for a pair of tiles is $O(B \cdot \tau^2 (d_a+d_g))$. With $O(n^2)$ pairs, the total complexity is $O(n^2 \cdot B \cdot \tau^2 (d_a+d_g)) = O(T^2 \cdot B \cdot (d_a+d_g))$.
+            \item Memory: The intermediate matrices $a_j a_k^T$ and $g_j g_k^T$ take $O(B \cdot \tau^2)$ memory.
+        \end{itemize}
+    \item \textbf{FC-pathB-opt}:
+        \begin{itemize}
+            \item Time: $O(B \cdot T \cdot d_a \cdot d_g)$.
+            \item Memory: $O(B \cdot d_a \cdot d_g)$.
+        \end{itemize}
+\end{itemize}
+
+\subsection{When is FC-pathB better?}
+
+\texttt{FC-pathB-opt} is generally better when the product of dimensions $d_a \cdot d_g$ is smaller than the sequence length $T$.
+The complexity of \texttt{FC-pathA} is $O(T^2 \cdot B \cdot (d_a+d_g))$, while for \texttt{FC-pathB-opt} it is $O(T \cdot B \cdot d_a \cdot d_g)$.
+
+We can compare $T \cdot (d_a+d_g)$ with $d_a \cdot d_g$.
+\texttt{FC-pathB} is better if $T \cdot (d_a+d_g) > d_a \cdot d_g$.
+This inequality can be simplified to $T > \frac{d_a d_g}{d_a + d_g}$.
+
+Let $d_a = k \cdot d_g$. Then we need $T > \frac{k d_g^2}{(k+1)d_g} = \frac{k}{k+1} d_g$.
+If $d_a \approx d_g$, then $k \approx 1$, and we need $T > d_g/2$.
+If one dimension is much larger than the other, say $d_a \gg d_g$, then $k$ is large and $\frac{k}{k+1} \approx 1$, so we need $T > d_g$.
+
+In many practical scenarios, especially in NLP, the sequence length $T$ is often larger than the model dimensions, making \texttt{FC-pathB-opt} the preferred algorithm due to its linear scaling with $T$. It also has much better memory complexity.
