@@ -90,6 +90,7 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
         max_grad_norm=1,
         use_ghost_clipping=True,
         use_triton=False,
+        enable_fastdp_bookkeeping=False,
     ):
         """
 
@@ -113,12 +114,24 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
             use_triton: If set to ``True``, Triton-accelerated kernels will be used
                 for supported layers when available, providing significant speedup for
                 sequence models. Requires triton to be installed.
+            enable_fastdp_bookkeeping: If set to ``True``, enables FastDP Bookkeeping (BK)
+                optimization which caches activations and backprops to enable single-pass
+                gradient clipping instead of two backward passes. This reduces memory overhead
+                from gradient graph retention. Only compatible with use_ghost_clipping=True.
 
         Raises:
             NotImplementedError
                 If ``strict`` is set to ``True`` and module ``m`` (or any of its
                 submodules) includes a buffer.
+            ValueError
+                If ``enable_fastdp_bookkeeping`` is True but ``use_ghost_clipping`` is False.
         """
+        if enable_fastdp_bookkeeping and not use_ghost_clipping:
+            raise ValueError(
+                "enable_fastdp_bookkeeping=True requires use_ghost_clipping=True. "
+                "Bookkeeping optimization only works with Ghost Clipping."
+            )
+        
         if logger.isEnabledFor(logging.INFO):
             self.log_module_gradient_sample_mode(
                 module=m,
@@ -137,7 +150,11 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
         self.max_grad_norm = max_grad_norm
         self.use_ghost_clipping = use_ghost_clipping
         self.use_triton = use_triton
+        self.enable_fastdp_bookkeeping = enable_fastdp_bookkeeping
         self._per_sample_gradient_norms = None
+        
+        # Bookkeeping cache: stores (module, activations, backprops) tuples
+        self._bk_cache = [] if enable_fastdp_bookkeeping else None
 
     def get_clipping_coef(self) -> torch.Tensor:
         """Get per-example gradient scaling factor for clipping."""
@@ -235,6 +252,15 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
                 if param.requires_grad:
                     param._norm_sample = ns
                     param._forward_counter -= 1
+            
+            # FastDP Bookkeeping: Cache activations and backprops for later gradient computation
+            if self.enable_fastdp_bookkeeping:
+                # Store direct references (already detached, no clone needed to save memory)
+                self._bk_cache.append({
+                    'module': module,
+                    'activations': activations,
+                    'backprops': backprops,
+                })
 
         else:
             if not self.force_functorch and type(module) in self.GRAD_SAMPLERS:
@@ -323,3 +349,162 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
     @per_sample_gradient_norms.setter
     def per_sample_gradient_norms(self, value):
         self._per_sample_gradient_norms = value
+    
+    def populate_clipped_gradients(self, clipping_coef: torch.Tensor):
+        """
+        Manually compute clipped gradients using cached activations and backprops.
+        This implements the Bookkeeping (BK) algorithm from FastDP.
+        
+        This method should be called after computing clipping coefficients and only
+        when enable_fastdp_bookkeeping=True. It uses cached intermediate values
+        from the forward/backward pass to directly compute clipped gradients without
+        a second backward pass.
+        
+        Args:
+            clipping_coef: Per-sample clipping coefficients [batch_size], where
+                          clipping_coef[i] = min(1, max_grad_norm / ||grad_i||)
+        """
+        if not self.enable_fastdp_bookkeeping:
+            raise RuntimeError(
+                "populate_clipped_gradients() requires enable_fastdp_bookkeeping=True"
+            )
+        
+        if self._bk_cache is None or len(self._bk_cache) == 0:
+            raise RuntimeError(
+                "Bookkeeping cache is empty. Make sure to call forward and backward first."
+            )
+        
+        # Process each cached layer one-by-one with immediate cleanup to minimize peak memory
+        for i in range(len(self._bk_cache)):
+            cache_entry = self._bk_cache[i]
+            module = cache_entry['module']
+            activations = cache_entry['activations']
+            backprops = cache_entry['backprops']
+            
+            # Apply per-sample clipping coefficients to backprops
+            # backprops shape: [batch_size, ...], clipping_coef shape: [batch_size]
+            # We need to reshape clipping_coef to broadcast properly
+            if backprops.dim() == 2:
+                # [B, d] -> multiply by [B, 1]
+                clipped_backprops = backprops * clipping_coef.view(-1, 1).to(backprops.device)
+            elif backprops.dim() == 3:
+                # [B, T, d] -> multiply by [B, 1, 1]
+                clipped_backprops = backprops * clipping_coef.view(-1, 1, 1).to(backprops.device)
+            else:
+                raise ValueError(f"Unsupported backprops dimension: {backprops.dim()}")
+            
+            # Now compute gradients using the clipped backprops
+            # This is equivalent to the second backward pass but done manually
+            if type(module) == nn.Linear:
+                A = activations[0]
+                
+                if module.weight.requires_grad:
+                    # Gradient: sum over batch of outer products
+                    # clipped_backprops: [B, d_out] or [B, T, d_out]
+                    # A: [B, d_in] or [B, T, d_in]
+                    if clipped_backprops.dim() == 2:
+                        # Standard case: [B, d_out] x [B, d_in] -> sum over B
+                        grad_weight = torch.einsum("bi,bj->ij", clipped_backprops, A)
+                    else:
+                        # Sequence case: [B, T, d_out] x [B, T, d_in] -> sum over B and T
+                        grad_weight = torch.einsum("bti,btj->ij", clipped_backprops, A)
+                    
+                    # Accumulate into .grad (in case there are multiple batches)
+                    if module.weight.grad is None:
+                        module.weight.grad = grad_weight
+                    else:
+                        module.weight.grad += grad_weight
+                
+                if module.bias is not None and module.bias.requires_grad:
+                    # Bias gradient: sum over batch (and time if 3D)
+                    if clipped_backprops.dim() == 2:
+                        grad_bias = torch.einsum("bi->i", clipped_backprops)
+                    else:
+                        grad_bias = torch.einsum("bti->i", clipped_backprops)
+                    
+                    if module.bias.grad is None:
+                        module.bias.grad = grad_bias
+                    else:
+                        module.bias.grad += grad_bias
+            
+            elif type(module) == nn.LayerNorm:
+                # For LayerNorm, we need to use the grad_sampler function
+                # Get the grad sampler function
+                if not self.force_functorch and type(module) in self.GRAD_SAMPLERS:
+                    grad_sampler_fn = self.GRAD_SAMPLERS[type(module)]
+                else:
+                    from opacus.grad_sample.functorch import ft_compute_per_sample_gradient
+                    grad_sampler_fn = ft_compute_per_sample_gradient
+                
+                # Compute per-sample gradients
+                grad_samples = grad_sampler_fn(module, activations, backprops)
+                
+                # Apply clipping coefficients and sum
+                for param, gs in grad_samples.items():
+                    if param.requires_grad:
+                        # gs shape: [B, ...] for per-sample gradients
+                        # Apply clipping coefficient: [B] -> [B, 1, 1, ...]
+                        coef_shape = [gs.shape[0]] + [1] * (gs.dim() - 1)
+                        clipped_gs = gs * clipping_coef.view(*coef_shape).to(gs.device)
+                        
+                        # Sum over batch dimension
+                        grad = clipped_gs.sum(dim=0)
+                        
+                        if param.grad is None:
+                            param.grad = grad
+                        else:
+                            param.grad += grad
+            
+            elif type(module) == nn.Embedding:
+                # For Embedding, we need to handle sparse gradients
+                if not self.force_functorch and type(module) in self.GRAD_SAMPLERS:
+                    grad_sampler_fn = self.GRAD_SAMPLERS[type(module)]
+                else:
+                    from opacus.grad_sample.functorch import ft_compute_per_sample_gradient
+                    grad_sampler_fn = ft_compute_per_sample_gradient
+                
+                grad_samples = grad_sampler_fn(module, activations, backprops)
+                
+                for param, gs in grad_samples.items():
+                    if param.requires_grad:
+                        coef_shape = [gs.shape[0]] + [1] * (gs.dim() - 1)
+                        clipped_gs = gs * clipping_coef.view(*coef_shape).to(gs.device)
+                        grad = clipped_gs.sum(dim=0)
+                        
+                        if param.grad is None:
+                            param.grad = grad
+                        else:
+                            param.grad += grad
+            
+            else:
+                # For other layer types, use the registered grad_sampler
+                if not self.force_functorch and type(module) in self.GRAD_SAMPLERS:
+                    grad_sampler_fn = self.GRAD_SAMPLERS[type(module)]
+                else:
+                    from opacus.grad_sample.functorch import ft_compute_per_sample_gradient
+                    grad_sampler_fn = ft_compute_per_sample_gradient
+                
+                grad_samples = grad_sampler_fn(module, activations, backprops)
+                
+                for param, gs in grad_samples.items():
+                    if param.requires_grad:
+                        coef_shape = [gs.shape[0]] + [1] * (gs.dim() - 1)
+                        clipped_gs = gs * clipping_coef.view(*coef_shape).to(gs.device)
+                        grad = clipped_gs.sum(dim=0)
+                        
+                        if param.grad is None:
+                            param.grad = grad
+                        else:
+                            param.grad += grad
+            
+            # Immediately free memory for this cache entry to minimize peak memory
+            self._bk_cache[i] = None
+            del cache_entry, module, activations, backprops
+        
+        # Clear cache list after use to free memory
+        self._bk_cache.clear()
+    
+    def clear_bookkeeping_cache(self):
+        """Clear the bookkeeping cache to free memory."""
+        if self._bk_cache is not None:
+            self._bk_cache.clear()

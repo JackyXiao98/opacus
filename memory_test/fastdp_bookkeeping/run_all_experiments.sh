@@ -75,13 +75,16 @@ echo ""
 # 1. Vanilla (baseline)
 run_experiment "vanilla"
 
-# 2. Ghost Clipping
-run_experiment "ghost"
-
-# 3. Flash Clipping
+# 2. Flash Clipping (no bookkeeping)
 run_experiment "flash_clip"
 
-# 4. Bookkeeping
+# 3. Flash Clipping w/ Bookkeeping
+run_experiment "flash_clip_bookkeeping"
+
+# 4. Ghost
+run_experiment "ghost"
+
+# 5. Bookkeeping
 run_experiment "bookkeeping"
 
 echo "========================================================================"
@@ -105,7 +108,7 @@ echo ""
 echo "========================================================================"
 echo "SUMMARY"
 echo "========================================================================"
-for exp in vanilla ghost flash_clip bookkeeping; do
+for exp in vanilla ghost flash_clip flash_clip_bookkeeping bookkeeping; do
     result_file="$RUN_DIR/${exp}_result.json"
     if [ -f "$result_file" ]; then
         peak_mem=$(python -c "import json; data=json.load(open('$result_file')); print(f\"{data['peak_memory_mb']:.2f}\")")

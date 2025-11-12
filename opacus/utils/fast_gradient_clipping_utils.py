@@ -54,7 +54,13 @@ class DPTensorFastGradientClipping:
 
     def backward(self):
         """
-        Repurposes loss.backward() to perform two backward passes, as well as the loss rescaling and hook operations in between
+        Repurposes loss.backward() to perform gradient clipping.
+        
+        - If enable_fastdp_bookkeeping=False (default): Performs two backward passes
+          (standard Ghost Clipping approach)
+        - If enable_fastdp_bookkeeping=True: Performs ONE backward pass and then
+          manually computes clipped gradients using cached activations/backprops
+          (FastDP Bookkeeping optimization)
         """
 
         if self.loss_reduction == "mean":
@@ -65,16 +71,37 @@ class DPTensorFastGradientClipping:
             raise ValueError(
                 f"loss_reduction = {self.loss_reduction}. Only 'sum' and 'mean' losses are supported"
             )
-        reduced_loss.backward(retain_graph=True)
-        self.optimizer.zero_grad()
-        coeff = self.module.get_clipping_coef()
-        second_loss_per_sample = (
-            coeff.to(self.loss_per_sample.device) * self.loss_per_sample
-        )
-        second_loss = torch.sum(second_loss_per_sample)
-        self.module.disable_hooks()
-        second_loss.backward()
-        self.module.enable_hooks()
+        
+        # Check if bookkeeping mode is enabled
+        use_bookkeeping = hasattr(self.module, 'enable_fastdp_bookkeeping') and self.module.enable_fastdp_bookkeeping
+        
+        if use_bookkeeping:
+            # FastDP Bookkeeping (BK) mode: Single backward pass
+            # No need to retain graph since we cache intermediate values
+            reduced_loss.backward()
+            
+            # Compute clipping coefficients from per-sample gradient norms
+            coeff = self.module.get_clipping_coef()
+            
+            # Zero out any gradients from the first backward (these are non-private)
+            self.optimizer.zero_grad()
+            
+            # Manually populate clipped gradients using cached activations and backprops
+            # This replaces the second backward pass
+            self.module.populate_clipped_gradients(coeff)
+            
+        else:
+            # Standard Ghost Clipping mode: Two backward passes
+            reduced_loss.backward(retain_graph=True)
+            self.optimizer.zero_grad()
+            coeff = self.module.get_clipping_coef()
+            second_loss_per_sample = (
+                coeff.to(self.loss_per_sample.device) * self.loss_per_sample
+            )
+            second_loss = torch.sum(second_loss_per_sample)
+            self.module.disable_hooks()
+            second_loss.backward()
+            self.module.enable_hooks()
 
 
 class DPLossFastGradientClipping:

@@ -168,7 +168,7 @@ def _per_block_clip_grad(
         if hasattr(layer,'bias') and hasattr(layer.bias,'requires_grad') and layer.bias.requires_grad and hasattr(layer.bias,'grad_sample') and hasattr(layer.bias,'norm_sample'):
             grad_bias = torch.einsum("b...,b->...", layer.bias.grad_sample, C_bias)
             del layer.bias.grad_sample
-            _create_or_extend_private_grad(layer.bias, grad_bias, accumulate_private_grad = False)
+            _create_or_extend_private_grad(layer.bias, grad_bias, accumulate_ = False)
     else:
         raise ValueError(f"Unknown clipping style {clipping_style}. Expected one of 'layer-wise','param-wise'.")
 
