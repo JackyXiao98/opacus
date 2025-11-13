@@ -595,7 +595,53 @@ def _input_length_frobenius(
     total_norm_squared = torch.sum(S * S, dim=(1, 2))
     del S
     # 如需把缓存还给驱动，再适度调用：torch.cuda.empty_cache()
+    # ✅ 新增：强制清理缓存
+    # if torch.cuda.is_available():
+    #     torch.cuda.empty_cache()
     return total_norm_squared
+
+    # B, T, d_a = A.shape
+    # _, _, d_g = G.shape
+    # dim_tile_size = 1024
+    # # 初始化总范数平方和
+    # total_norm_squared = torch.zeros(B, dtype=dtype_acc, device=A.device)
+
+    # # === 外层循环：对特征维度 d_a 和 d_g 进行分块 ===
+    # # 这确保了我们任何时候只需要一个很小的 S_tile 缓冲区
+    # for i in range(0, d_a, dim_tile_size):
+    #     i_end = min(i + dim_tile_size, d_a)
+    #     current_d_a = i_end - i
+        
+    #     for k in range(0, d_g, dim_tile_size):
+    #         k_end = min(k + dim_tile_size, d_g)
+    #         current_d_g = k_end - k
+            
+    #         # 分配一个小型的临时累积缓冲区
+    #         # Memory: B * 512 * 512 * 4bytes ≈ 2MB (vs 原来的 32MB)
+    #         S_tile = torch.zeros(B, current_d_a, current_d_g, dtype=dtype_acc, device=A.device)
+            
+    #         # === 内层循环：遍历时间维度 T (保持原有的 Tiling) ===
+    #         for t in range(0, T, tile_size):
+    #             t_end = min(t + tile_size, T)
+                
+    #             # 仅读取当前所需的 A 和 G 的小块
+    #             # 建议：如果 A/G 原本是 BF16，在这里转 float32 可以节省显存带宽
+    #             a_sub = A[:, t:t_end, i:i_end].to(dtype_acc) # [B, T_tile, d_a_tile]
+    #             g_sub = G[:, t:t_end, k:k_end].to(dtype_acc) # [B, T_tile, d_g_tile]
+                
+    #             # 累积到当前的小 S_tile 中
+    #             # [B, d_a_tile, T_tile] @ [B, T_tile, d_g_tile] -> [B, d_a_tile, d_g_tile]
+    #             S_tile += torch.bmm(a_sub.transpose(1, 2), g_sub)
+            
+    #         # 当前 spatial tile 的时间维全部累积完毕，计算其对总范数的贡献
+    #         # total_norm += ||S_tile||_F^2
+    #         total_norm_squared += torch.sum(S_tile * S_tile, dim=(1, 2))
+            
+    #         # 显式删除以确保内存立即释放（虽然 Python 作用域也会处理，但显式更安全）
+    #         del S_tile
+    #         torch.cuda.empty_cache()
+
+    # return total_norm_squared
 
 
 @torch.no_grad()
@@ -859,7 +905,12 @@ def compute_linear_norm_sample_triton(
     A = activations[0]
     ret: Dict[nn.Parameter, torch.Tensor] = {}
     
-    # print(layer, "activation shape: ", A.shape, "backprop shape: ", backprops.shape)
+    print(layer, "activation shape: ", A.shape, "backprop shape: ", backprops.shape)
+    device = "cuda"
+    allocated = torch.cuda.memory_allocated(device) / 2**20
+    reserved = torch.cuda.memory_reserved(device) / 2**20
+    max_allocated = torch.cuda.max_memory_allocated(device) / 2**20
+    print(f"Memory allocated: {allocated:.2f} MB, reserved: {reserved:.2f} MB, max allocated: {max_allocated:.2f} MB")
 
     if backprops.dim() == 2:
         # 2D case: [B, d_out]

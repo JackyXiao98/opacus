@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Visualize detailed memory breakdown for DP-SGD experiments
+Visualize detailed memory breakdown for DiT DP-SGD experiments
 """
 
 import argparse
@@ -15,10 +15,10 @@ EXPERIMENT_ORDER = ["vanilla", "ghost", "flash_clip", "flash_clip_bookkeeping", 
 
 NAME_MAPPING = {
     "vanilla": "Non-DP",
-    "ghost": "SOTA DP (BK 1-Pass)",
-    "flash_clip": "Prop. (1-Pass)",
-    "flash_clip_bookkeeping": "Prop. (2-Pass)",
-    "bookkeeping": "SOTA (GhostClipping 2-Pass)",
+    "ghost": "Ghost Clipping",
+    "flash_clip": "Flash Clipping",
+    "flash_clip_bookkeeping": "Flash Clipping w/ Bookkeeping",
+    "bookkeeping": "Bookkeeping",
 }
 
 COLORS = {
@@ -110,7 +110,7 @@ def plot_memory_breakdown_comparison(results, output_dir):
     
     ax1.set_xlabel('Method', fontsize=14, fontweight='bold')
     ax1.set_ylabel('Memory (MB)', fontsize=14, fontweight='bold')
-    ax1.set_title('Detailed Memory Breakdown by Component', fontsize=16, fontweight='bold')
+    ax1.set_title('DiT-L: Detailed Memory Breakdown by Component', fontsize=16, fontweight='bold')
     ax1.set_xticks(x)
     ax1.set_xticklabels(experiments, fontsize=11)
     ax1.legend(loc='upper left', fontsize=10)
@@ -125,7 +125,9 @@ def plot_memory_breakdown_comparison(results, output_dir):
         dp_methods = []
         overhead_components = []
         
-        for exp_key, exp_name in [("ghost", "Ghost\nClipping"), ("flash_clip", "Flash\nClipping"), ("flash_clip_bookkeeping", "FlashClip w/\nBookkeeping"), ("bookkeeping", "Bookkeeping")]:
+        for exp_key, exp_name in [("ghost", "Ghost\nClipping"), ("flash_clip", "Flash\nClipping"), 
+                                   ("flash_clip_bookkeeping", "FlashClip w/\nBookkeeping"), 
+                                   ("bookkeeping", "Bookkeeping")]:
             if exp_key in results:
                 dp_methods.append(exp_name)
                 
@@ -167,7 +169,7 @@ def plot_memory_breakdown_comparison(results, output_dir):
             
             ax2.set_xlabel('DP-SGD Method', fontsize=14, fontweight='bold')
             ax2.set_ylabel('Additional Memory (MB) vs Vanilla', fontsize=14, fontweight='bold')
-            ax2.set_title('DP-SGD Memory Overhead Breakdown', fontsize=16, fontweight='bold')
+            ax2.set_title('DiT-L: DP-SGD Memory Overhead Breakdown', fontsize=16, fontweight='bold')
             ax2.set_xticks(x2)
             ax2.set_xticklabels(dp_methods, fontsize=11)
             ax2.legend(loc='upper left', fontsize=9)
@@ -214,7 +216,7 @@ def plot_memory_timeline(results, output_dir):
             elif 'step' in name:
                 ax.axvline(x=i, color='blue', linestyle=':', alpha=0.3)
         
-        ax.set_title(f"{NAME_MAPPING[exp_key]}", fontsize=14, fontweight='bold')
+        ax.set_title(f"DiT-L: {NAME_MAPPING[exp_key]}", fontsize=14, fontweight='bold')
         ax.set_ylabel('Memory (MB)', fontsize=12)
         ax.set_xticks(x[::max(1, len(x)//15)])  # Show every nth tick
         ax.set_xticklabels([names[i] for i in x[::max(1, len(x)//15)]], 
@@ -243,22 +245,6 @@ def plot_performance_comparison(results, output_dir):
     """Plot time vs memory trade-off"""
     
     fig, ax = plt.subplots(figsize=(12, 8))
-    
-    name_mapping = {
-        "vanilla": "Classical Training / No DP",
-        "ghost": "SOTA DP Training",
-        "flash_clip": "FlashClip",
-        "flash_clip_bookkeeping": "FlashClip w/ Bookkeeping",
-        "bookkeeping": "Bookkeeping",
-    }
-    
-    colors = {
-        "vanilla": "lightblue",
-        "ghost": "lightcoral",
-        "flash_clip": "lightgreen",
-        "flash_clip_bookkeeping": "lightyellow",
-        "bookkeeping": "lightpink",
-    }
     
     all_peak_mems = []
     all_avg_times = []
@@ -301,7 +287,7 @@ def plot_performance_comparison(results, output_dir):
 
     ax.set_xlabel('Peak Allocated Memory (MB)', fontsize=16, fontweight='bold')
     ax.set_ylabel('Training Time per Step (ms)', fontsize=16, fontweight='bold')
-    ax.set_title('Memory vs Training Time', fontsize=18, fontweight='bold')
+    ax.set_title('DiT-L: Memory vs Training Time', fontsize=18, fontweight='bold')
     ax.legend(loc='upper left', fontsize=14)
     ax.grid(True, alpha=0.5, linestyle='--')
     
@@ -318,8 +304,17 @@ def generate_summary_table(results, output_dir):
     # Create text summary
     summary_lines = []
     summary_lines.append("="*100)
-    summary_lines.append("DETAILED MEMORY PROFILING SUMMARY")
+    summary_lines.append("DiT-L: DETAILED MEMORY PROFILING SUMMARY")
     summary_lines.append("="*100)
+    summary_lines.append("")
+    summary_lines.append("Model Configuration:")
+    summary_lines.append("  - Architecture: DiT-L (Diffusion Transformer - Large)")
+    summary_lines.append("  - Hidden Dimension: 1024")
+    summary_lines.append("  - Number of Layers: 24")
+    summary_lines.append("  - Number of Heads: 16")
+    summary_lines.append("  - Image Size: 256x256")
+    summary_lines.append("  - Patch Size: 8x8")
+    summary_lines.append("  - Number of Tokens: 1024")
     summary_lines.append("")
     
     # Header
@@ -371,7 +366,7 @@ def generate_summary_table(results, output_dir):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Visualize memory breakdown")
+    parser = argparse.ArgumentParser(description="Visualize DiT memory breakdown")
     parser.add_argument("--input-dir", type=str, required=True,
                        help="Directory containing experiment JSON files")
     parser.add_argument("--output-dir", type=str, required=True,
@@ -384,7 +379,7 @@ def main():
     output_path.mkdir(parents=True, exist_ok=True)
     
     print(f"\n{'='*80}")
-    print("Loading results...")
+    print("Loading DiT-L experiment results...")
     print(f"{'='*80}\n")
     
     # Load results
