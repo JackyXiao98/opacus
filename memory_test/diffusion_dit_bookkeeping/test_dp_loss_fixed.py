@@ -41,7 +41,7 @@ def test_dp_loss_fixed():
     # Wrap with DP
     model = GradSampleModuleFastGradientClipping(
         model,
-        use_triton=True,
+        use_flash_clipping=True,
         use_ghost_clipping=True,
         enable_fastdp_bookkeeping=False,
         loss_reduction="mean",

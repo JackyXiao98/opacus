@@ -37,7 +37,7 @@ __all__ = [
 
 
 def get_optimizer_class(clipping: str, distributed: bool, grad_sample_mode: str = None):
-    if grad_sample_mode == "ghost":
+    if grad_sample_mode in ["ghost", "flash"]:
         if clipping == "flat" and distributed is False:
             return DPOptimizerFastGradientClipping
         elif clipping == "flat" and distributed is True:
@@ -46,7 +46,7 @@ def get_optimizer_class(clipping: str, distributed: bool, grad_sample_mode: str 
             raise ValueError(
                 f"Unsupported combination of parameters. Clipping: {clipping} and grad_sample_mode: {grad_sample_mode}"
             )
-    elif grad_sample_mode == "ghost_fsdp":
+    elif grad_sample_mode in ["ghost_fsdp", "flash_fsdp"]:
         if clipping == "flat" and distributed is True:
             return FSDPOptimizerFastGradientClipping
         else:

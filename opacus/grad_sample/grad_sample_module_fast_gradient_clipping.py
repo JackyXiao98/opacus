@@ -77,7 +77,7 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
     """
 
     NORM_SAMPLERS = {}
-    TRITON_NORM_SAMPLERS = {}
+    FLASH_NORM_SAMPLERS = {}
 
     def __init__(
         self,
@@ -89,7 +89,7 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
         force_functorch=False,
         max_grad_norm=1,
         use_ghost_clipping=True,
-        use_triton=False,
+        use_flash_clipping=False,
         enable_fastdp_bookkeeping=False,
     ):
         """
@@ -111,7 +111,7 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
             use_ghost_clipping: If set to ``True``, Ghost Clipping
                 will be used for clipping gradients of supported layers. If ``False``, Fast
                 Gradient Clipping will be used for all layers.
-            use_triton: If set to ``True``, Triton-accelerated kernels will be used
+            use_flash_clipping: If set to ``True``, Flash Clipping kernels will be used
                 for supported layers when available, providing significant speedup for
                 sequence models. Requires triton to be installed.
             enable_fastdp_bookkeeping: If set to ``True``, enables FastDP Bookkeeping (BK)
@@ -149,7 +149,7 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
         self.trainable_parameters = [p for _, p in trainable_parameters(self._module)]
         self.max_grad_norm = max_grad_norm
         self.use_ghost_clipping = use_ghost_clipping
-        self.use_triton = use_triton
+        self.use_flash_clipping = use_flash_clipping
         self.enable_fastdp_bookkeeping = enable_fastdp_bookkeeping
         self._per_sample_gradient_norms = None
         
@@ -238,11 +238,11 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
 
         if self.use_ghost_clipping and (
             type(module) in self.NORM_SAMPLERS or 
-            (self.use_triton and type(module) in self.TRITON_NORM_SAMPLERS)
+            (self.use_flash_clipping and type(module) in self.FLASH_NORM_SAMPLERS)
         ):
-            # Use Triton sampler if available and enabled, otherwise use standard sampler
-            if self.use_triton and type(module) in self.TRITON_NORM_SAMPLERS:
-                norm_sampler_fn = self.TRITON_NORM_SAMPLERS[type(module)]
+            # Use Flash sampler if available and enabled, otherwise use standard sampler
+            if self.use_flash_clipping and type(module) in self.FLASH_NORM_SAMPLERS:
+                norm_sampler_fn = self.FLASH_NORM_SAMPLERS[type(module)]
             else:
                 norm_sampler_fn = self.NORM_SAMPLERS[type(module)]
             
@@ -314,11 +314,11 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
 
             elif use_ghost_clipping and (
                 type(m) in self.NORM_SAMPLERS or 
-                (self.use_triton and type(m) in self.TRITON_NORM_SAMPLERS)
+                (self.use_flash_clipping and type(m) in self.FLASH_NORM_SAMPLERS)
             ):
-                if self.use_triton and type(m) in self.TRITON_NORM_SAMPLERS:
+                if self.use_flash_clipping and type(m) in self.FLASH_NORM_SAMPLERS:
                     logger.info(
-                        f"Module name: {m_name}, module type: {type(m)}, under Ghost Clipping with Triton acceleration."
+                        f"Module name: {m_name}, module type: {type(m)}, under Ghost Clipping with Flash Clipping acceleration."
                     )
                 else:
                     logger.info(

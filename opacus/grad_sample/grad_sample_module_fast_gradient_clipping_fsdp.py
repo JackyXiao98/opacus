@@ -37,6 +37,8 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
 
     Computes norms of gradients without gradient instantiation
     """
+    # Note: FLASH_NORM_SAMPLERS is inherited from parent class
+    # Do not redefine it here, otherwise it will create an empty dict that shadows the parent's registered samplers
 
     def __init__(
         self,
@@ -46,6 +48,8 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
         loss_reduction="mean",
         strict: bool = True,
         max_grad_norm=1,
+        use_flash_clipping=False,
+        use_ghost_clipping=True,
     ):
         """
 
@@ -74,7 +78,8 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
             strict=strict,
             force_functorch=False,
             max_grad_norm=max_grad_norm,
-            use_ghost_clipping=True,
+            use_ghost_clipping=use_ghost_clipping,
+            use_flash_clipping=use_flash_clipping,
         )
 
     def _get_module_type(self, module: nn.Module) -> str:
@@ -178,8 +183,15 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
 
         module_type = self._get_module_type(module)
         module._forward_counter -= 1
-        if self.use_ghost_clipping and module_type in self.NORM_SAMPLERS:
-            norm_sampler_fn = self.NORM_SAMPLERS[module_type]
+        if self.use_ghost_clipping and (
+            module_type in self.NORM_SAMPLERS or 
+            (self.use_flash_clipping and module_type in self.FLASH_NORM_SAMPLERS)
+        ):
+            # Use Flash sampler if available and enabled, otherwise use standard sampler
+            if self.use_flash_clipping and module_type in self.FLASH_NORM_SAMPLERS:
+                norm_sampler_fn = self.FLASH_NORM_SAMPLERS[module_type]
+            else:
+                norm_sampler_fn = self.NORM_SAMPLERS[module_type]
             norm_samples = norm_sampler_fn(module, activations, backprops)
 
             for idx, (_, ns) in enumerate(

@@ -42,7 +42,7 @@ def test_dit_with_dp():
     # Wrap with DP
     model = GradSampleModuleFastGradientClipping(
         model,
-        use_triton=False,  # Use ghost clipping for compatibility
+        use_flash_clipping=False,  # Use ghost clipping for compatibility
         use_ghost_clipping=True,
         enable_fastdp_bookkeeping=False,
         loss_reduction="mean",

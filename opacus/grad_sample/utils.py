@@ -73,7 +73,7 @@ def register_norm_sampler(
     
     Args:
         target_class_or_classes: The target class(es) to register the sampler for
-        mode: The mode for the sampler ("default" or "triton")
+        mode: The mode for the sampler ("default" or "flash")
     """
 
     def decorator(f):
@@ -83,11 +83,11 @@ def register_norm_sampler(
             else [target_class_or_classes]
         )
         for target_class in target_classes:
-            if mode == "triton":
-                # Store triton samplers separately
-                if not hasattr(GradSampleModuleFastGradientClipping, "TRITON_NORM_SAMPLERS"):
-                    GradSampleModuleFastGradientClipping.TRITON_NORM_SAMPLERS = {}
-                GradSampleModuleFastGradientClipping.TRITON_NORM_SAMPLERS[target_class] = f
+            if mode == "flash":
+                # Store flash samplers separately
+                if not hasattr(GradSampleModuleFastGradientClipping, "FLASH_NORM_SAMPLERS"):
+                    GradSampleModuleFastGradientClipping.FLASH_NORM_SAMPLERS = {}
+                GradSampleModuleFastGradientClipping.FLASH_NORM_SAMPLERS[target_class] = f
             else:
                 GradSampleModuleFastGradientClipping.NORM_SAMPLERS[target_class] = f
         return f
@@ -100,7 +100,10 @@ def wrap_model(model: nn.Module, grad_sample_mode: str, *args, **kwargs):
     if grad_sample_mode == "functorch":
         kwargs["force_functorch"] = True
     elif grad_sample_mode == "flash":
-        kwargs["use_triton"] = True
+        kwargs["use_flash_clipping"] = True
+        kwargs["use_ghost_clipping"] = True
+    elif grad_sample_mode == "flash_fsdp":
+        kwargs["use_flash_clipping"] = True
         kwargs["use_ghost_clipping"] = True
     return cls(model, *args, **kwargs)
 
@@ -123,10 +126,12 @@ def get_gsm_class(grad_sample_mode: str) -> Type[AbstractGradSampleModule]:
         return GradSampleModuleFastGradientClipping
     elif grad_sample_mode == "ghost_fsdp":
         return GradSampleModuleFastGradientClippingFSDP
+    elif grad_sample_mode == "flash_fsdp":
+        return GradSampleModuleFastGradientClippingFSDP
     elif grad_sample_mode == "no_op":
         return GradSampleModuleNoOp
     else:
         raise ValueError(
             f"Unexpected grad_sample_mode: {grad_sample_mode}. "
-            f"Allowed values: hooks, ew, ghost, flash, ghost_fsdp, no_op"
+            f"Allowed values: hooks, ew, ghost, flash, ghost_fsdp, flash_fsdp, no_op"
         )

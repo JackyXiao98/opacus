@@ -863,14 +863,14 @@ def _sum_over_time_norm_squared_triton(
 
 
 @torch.no_grad()
-def compute_linear_norm_sample_triton(
+def compute_linear_norm_sample_flash(
     layer: nn.Linear,
     activations: List[torch.Tensor],
     backprops: torch.Tensor,
     algorithm: str = "input_length",
     tile_size: int = 1024,
     dtype_acc = torch.float32,
-    use_triton: bool = False,
+    use_flash_clipping: bool = False,
 ) -> Dict[nn.Parameter, torch.Tensor]:
     """
     Compute per-sample gradient norms for a linear layer using flash clipping algorithms.
@@ -934,7 +934,7 @@ def compute_linear_norm_sample_triton(
         
         if layer.weight.requires_grad:
             # Select algorithm and acceleration method
-            if use_triton and is_triton_available():
+            if use_flash_clipping and is_triton_available():
                 if algorithm == "input_length":
                     ga = _input_length_frobenius_triton(A, backprops, tile_size=tile_size, dtype_acc=dtype_acc)
                 else:  # algorithm == "width"
@@ -950,7 +950,7 @@ def compute_linear_norm_sample_triton(
         
         if (layer.bias is not None) and layer.bias.requires_grad:
             # Bias gradient norm computation
-            if use_triton and is_triton_available():
+            if use_flash_clipping and is_triton_available():
                 gg = _sum_over_time_norm_squared_triton(backprops, dtype_acc=dtype_acc)
             else:
                 gg = _sum_over_time_norm_squared(backprops, dtype_acc=dtype_acc)

@@ -157,14 +157,14 @@ def run_vanilla_experiment(config, device, num_iter=3, warmup_iter=2):
     return results
 
 
-def run_dpsgd_experiment(config, device, use_triton=False, enable_bookkeeping=False, num_iter=3, warmup_iter=2):
+def run_dpsgd_experiment(config, device, use_flash_clipping=False, enable_bookkeeping=False, num_iter=3, warmup_iter=2):
     """Run DP-SGD experiment (Ghost, Flash Clipping, or Bookkeeping)"""
     if enable_bookkeeping:
         exp_name = "Bookkeeping"
     else:
-        exp_name = "Flash Clipping" if use_triton else "Ghost Clipping"
+        exp_name = "Flash Clipping" if use_flash_clipping else "Ghost Clipping"
 
-    if use_triton and enable_bookkeeping:
+    if use_flash_clipping and enable_bookkeeping:
         exp_name = "Flash Clipping w/ Bookkeeping"
 
     print(f"\n{'='*80}")
@@ -189,7 +189,7 @@ def run_dpsgd_experiment(config, device, use_triton=False, enable_bookkeeping=Fa
     # Wrap with DP-SGD
     model = GradSampleModuleFastGradientClipping(
         model,
-        use_triton=use_triton,
+        use_flash_clipping=use_flash_clipping,
         use_ghost_clipping=True,  # All fast gradient clipping methods use this
         enable_fastdp_bookkeeping=enable_bookkeeping,
     )
@@ -354,16 +354,16 @@ def main():
     if args.experiment == "vanilla":
         results = run_vanilla_experiment(config, device, args.num_iter, args.warmup_iter)
     elif args.experiment == "ghost":
-        results = run_dpsgd_experiment(config, device, use_triton=False, 
+        results = run_dpsgd_experiment(config, device, use_flash_clipping=False, 
                                       num_iter=args.num_iter, warmup_iter=args.warmup_iter)
     elif args.experiment == "flash_clip":
-        results = run_dpsgd_experiment(config, device, use_triton=True,
+        results = run_dpsgd_experiment(config, device, use_flash_clipping=True,
                                       num_iter=args.num_iter, warmup_iter=args.warmup_iter)
     elif args.experiment == "bookkeeping":
-        results = run_dpsgd_experiment(config, device, use_triton=False, enable_bookkeeping=True,
+        results = run_dpsgd_experiment(config, device, use_flash_clipping=False, enable_bookkeeping=True,
                                       num_iter=args.num_iter, warmup_iter=args.warmup_iter)
     elif args.experiment == "flash_clip_bookkeeping":
-        results = run_dpsgd_experiment(config, device, use_triton=True, enable_bookkeeping=True,
+        results = run_dpsgd_experiment(config, device, use_flash_clipping=True, enable_bookkeeping=True,
                                       num_iter=args.num_iter, warmup_iter=args.warmup_iter)
     
     # Save results

@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 
 from .utils import register_grad_sampler, register_norm_sampler
-from .triton_kernels import compute_linear_norm_sample_triton, is_triton_available
+from .triton_kernels import compute_linear_norm_sample_flash, is_triton_available
 
 
 logger = logging.getLogger(__name__)
@@ -95,12 +95,12 @@ def compute_linear_norm_sample(
     return ret
 
 
-@register_norm_sampler(nn.Linear, "triton")
-def compute_linear_norm_sample_triton_wrapper(
+@register_norm_sampler(nn.Linear, "flash")
+def compute_linear_norm_sample_flash_wrapper(
     layer: nn.Linear, activations: List[torch.Tensor], backprops: torch.Tensor
 ) -> Dict[nn.Parameter, torch.Tensor]:
     """
-    Triton-accelerated version of per sample gradient norms for ``nn.Linear`` layer.
+    Flash Clipping accelerated version of per sample gradient norms for ``nn.Linear`` layer.
     This function provides significant speedup for sequence models (3D tensors) by using
     optimized Triton kernels for gradient norm computations.
 
@@ -120,4 +120,4 @@ def compute_linear_norm_sample_triton_wrapper(
         )
         return compute_linear_norm_sample(layer, activations, backprops)
     
-    return compute_linear_norm_sample_triton(layer, activations, backprops)
+    return compute_linear_norm_sample_flash(layer, activations, backprops)
