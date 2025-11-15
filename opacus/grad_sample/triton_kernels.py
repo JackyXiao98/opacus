@@ -14,6 +14,7 @@ With optional Triton acceleration for GPU computation.
 from typing import Dict, List
 import torch
 import torch.nn as nn
+import time
 
 # Try to import Triton for GPU acceleration
 try:
@@ -520,128 +521,22 @@ def _input_length_frobenius(
     Returns:
         Tensor of shape [B] containing gradient norm squared for each sample
     """
-    # B, T, d_a = A.shape
-    # _, _, d_g = G.shape
-    
-    # # Convert to accumulation dtype
-    # A = A.to(dtype_acc)
-    # G = G.to(dtype_acc)
-    
-    # # Initialize accumulator
-    # total_norm_squared = torch.zeros(B, dtype=dtype_acc, device=A.device)
-    
-    # # Step 1: Tiling - compute number of blocks
-    # num_tiles = (T + tile_size - 1) // tile_size
-    
-    # # Step 2: Pre-computation - compute and store all M_j matrices
-    # M_list = []
-    # for j in range(num_tiles):
-    #     j_start = j * tile_size
-    #     j_end = min((j + 1) * tile_size, T)
-        
-    #     # Extract blocks
-    #     a_j = A[:, j_start:j_end, :].contiguous()  # [B, tau_j, d_a]
-    #     g_j = G[:, j_start:j_end, :].contiguous()  # [B, tau_j, d_g]
-        
-    #     # Compute M_j = a_j^T @ g_j for each batch
-    #     # Use bmm: [B, d_a, tau_j] @ [B, tau_j, d_g] -> [B, d_a, d_g]
-    #     M_j = torch.bmm(a_j.transpose(1, 2), g_j)
-    #     M_list.append(M_j)
-    
-    # # Step 3 & 4: Kernel Fusion and Accumulation
-    # # Outer loop: for j from 1 to n
-    # for j in range(num_tiles):
-    #     M_j = M_list[j]  # [B, d_a, d_g]
-        
-    #     # Inner loop (Optimized): for k from j to n
-    #     for k in range(j, num_tiles):
-    #         M_k = M_list[k]  # [B, d_a, d_g]
-            
-    #         # Core computation in SRAM: Compute Frobenius inner product
-    #         # <M_j, M_k>_F = sum of element-wise product
-    #         block_sum = torch.sum(M_j * M_k, dim=(1, 2))  # [B]
-            
-    #         # Accumulation (Optimized)
-    #         if j == k:
-    #             # Diagonal block: add once
-    #             total_norm_squared += block_sum
-    #         else:
-    #             # Off-diagonal block (k > j): add 2x to account for symmetry
-    #             total_norm_squared += 2.0 * block_sum
-
-
-    # return total_norm_squared
-
     B, T, d_a = A.shape
     _, _, d_g = G.shape
 
+    # Convert to accumulation dtype
     A = A.to(dtype_acc)
     G = G.to(dtype_acc)
 
-    num_tiles = (T + tile_size - 1) // tile_size
-    # Running sum S = sum_j M_j, kept on the same device as A/G
-    S = torch.zeros(B, d_a, d_g, dtype=dtype_acc, device=A.device)
-
-    for j in range(num_tiles):
-        j_s = j * tile_size
-        j_e = min((j + 1) * tile_size, T)
-        a_j = A[:, j_s:j_e, :].contiguous()           # [B, τ_j, d_a]
-        g_j = G[:, j_s:j_e, :].contiguous()           # [B, τ_j, d_g]
-        M_j  = torch.bmm(a_j.transpose(1, 2), g_j)    # [B, d_a, d_g]
-        S += M_j                                      # 累加即可
-        del a_j, g_j, M_j
-
-    # total_norm_squared[b] = ||S[b]||_F^2
-    total_norm_squared = torch.sum(S * S, dim=(1, 2))
-    del S
-    # 如需把缓存还给驱动，再适度调用：torch.cuda.empty_cache()
-    # ✅ 新增：强制清理缓存
-    # if torch.cuda.is_available():
-    #     torch.cuda.empty_cache()
+    # Optimized: Direct computation without tiling for better performance
+    # ||sum_t(a_t * g_t)||^2 = ||A^T @ G||_F^2
+    # This leverages cuBLAS for optimal matrix multiplication
+    S = torch.bmm(A.transpose(1, 2), G)  # [B, d_a, d_g]
+    
+    # Compute Frobenius norm squared
+    total_norm_squared = torch.sum(S * S, dim=(1, 2))  # [B]
+    
     return total_norm_squared
-
-    # B, T, d_a = A.shape
-    # _, _, d_g = G.shape
-    # dim_tile_size = 1024
-    # # 初始化总范数平方和
-    # total_norm_squared = torch.zeros(B, dtype=dtype_acc, device=A.device)
-
-    # # === 外层循环：对特征维度 d_a 和 d_g 进行分块 ===
-    # # 这确保了我们任何时候只需要一个很小的 S_tile 缓冲区
-    # for i in range(0, d_a, dim_tile_size):
-    #     i_end = min(i + dim_tile_size, d_a)
-    #     current_d_a = i_end - i
-        
-    #     for k in range(0, d_g, dim_tile_size):
-    #         k_end = min(k + dim_tile_size, d_g)
-    #         current_d_g = k_end - k
-            
-    #         # 分配一个小型的临时累积缓冲区
-    #         # Memory: B * 512 * 512 * 4bytes ≈ 2MB (vs 原来的 32MB)
-    #         S_tile = torch.zeros(B, current_d_a, current_d_g, dtype=dtype_acc, device=A.device)
-            
-    #         # === 内层循环：遍历时间维度 T (保持原有的 Tiling) ===
-    #         for t in range(0, T, tile_size):
-    #             t_end = min(t + tile_size, T)
-                
-    #             # 仅读取当前所需的 A 和 G 的小块
-    #             # 建议：如果 A/G 原本是 BF16，在这里转 float32 可以节省显存带宽
-    #             a_sub = A[:, t:t_end, i:i_end].to(dtype_acc) # [B, T_tile, d_a_tile]
-    #             g_sub = G[:, t:t_end, k:k_end].to(dtype_acc) # [B, T_tile, d_g_tile]
-                
-    #             # 累积到当前的小 S_tile 中
-    #             # [B, d_a_tile, T_tile] @ [B, T_tile, d_g_tile] -> [B, d_a_tile, d_g_tile]
-    #             S_tile += torch.bmm(a_sub.transpose(1, 2), g_sub)
-            
-    #         # 当前 spatial tile 的时间维全部累积完毕，计算其对总范数的贡献
-    #         # total_norm += ||S_tile||_F^2
-    #         total_norm_squared += torch.sum(S_tile * S_tile, dim=(1, 2))
-            
-    #         # 显式删除以确保内存立即释放（虽然 Python 作用域也会处理，但显式更安全）
-    #         del S_tile
-    #         torch.cuda.empty_cache()
-
-    # return total_norm_squared
 
 
 @torch.no_grad()
@@ -677,52 +572,50 @@ def _width_frobenius(
     B, T, d_a = A.shape
     _, _, d_g = G.shape
     
-    # Convert to accumulation dtype
-    A = A.to(dtype_acc)
-    G = G.to(dtype_acc)
+    # Convert to accumulation dtype (in-place if possible)
+    if A.dtype != dtype_acc:
+        A = A.to(dtype_acc)
+    if G.dtype != dtype_acc:
+        G = G.to(dtype_acc)
     
     # Initialize accumulator
     total_norm_squared = torch.zeros(B, dtype=dtype_acc, device=A.device)
     
-    # Step 1: Tiling - compute number of blocks
+    # Compute number of tiles
     num_tiles = (T + tile_size - 1) // tile_size
     
-    # Step 2: Kernel Fusion - outer loop: for j from 1 to n
+    # Optimized tiling with reduced overhead
     for j in range(num_tiles):
         j_start = j * tile_size
         j_end = min((j + 1) * tile_size, T)
         
-        # Extract j-th blocks
-        a_j = A[:, j_start:j_end, :].contiguous()  # [B, tau_j, d_a]
-        g_j = G[:, j_start:j_end, :].contiguous()  # [B, tau_j, d_g]
+        # Extract j-th blocks (avoid unnecessary contiguous calls)
+        a_j = A[:, j_start:j_end, :]  # [B, tau_j, d_a]
+        g_j = G[:, j_start:j_end, :]  # [B, tau_j, d_g]
         
-        # Inner loop: for k from j to n
+        # Pre-compute Score_a_j and Score_g_j for diagonal block
         for k in range(j, num_tiles):
             k_start = k * tile_size
             k_end = min((k + 1) * tile_size, T)
             
             # Extract k-th blocks
-            a_k = A[:, k_start:k_end, :].contiguous()  # [B, tau_k, d_a]
-            g_k = G[:, k_start:k_end, :].contiguous()  # [B, tau_k, d_g]
+            a_k = A[:, k_start:k_end, :]  # [B, tau_k, d_a]
+            g_k = G[:, k_start:k_end, :]  # [B, tau_k, d_g]
             
-            # Core computation in SRAM:
-            # a. Load: blocks are already loaded
-            # b. Compute inter-block inner products
-            # Score_a = a_j @ a_k^T: [B, tau_j, d_a] @ [B, d_a, tau_k] -> [B, tau_j, tau_k]
+            # Compute score matrices
+            # Score_a = a_j @ a_k^T: [B, tau_j, tau_k]
             Score_a = torch.bmm(a_j, a_k.transpose(1, 2))
-            # Score_g = g_j @ g_k^T: [B, tau_j, d_g] @ [B, d_g, tau_k] -> [B, tau_j, tau_k]
+            # Score_g = g_j @ g_k^T: [B, tau_j, tau_k]
             Score_g = torch.bmm(g_j, g_k.transpose(1, 2))
             
-            # c. Compute block contribution: element-wise multiply and sum
+            # Fused multiply and sum for better performance
             block_sum = torch.sum(Score_a * Score_g, dim=(1, 2))  # [B]
             
-            # Accumulation (Optimized)
+            # Accumulate with proper weighting
             if j == k:
-                # Diagonal block: add once
-                total_norm_squared += block_sum
+                total_norm_squared.add_(block_sum)
             else:
-                # Off-diagonal block (k > j): add 2x to account for symmetry
-                total_norm_squared += 2.0 * block_sum
+                total_norm_squared.add_(block_sum, alpha=2.0)
     
     return total_norm_squared
 
@@ -768,12 +661,12 @@ def _input_length_frobenius_triton(
     """
     Input-Length-Linear Algorithm with Triton acceleration.
     
-    Reality Check: After extensive testing, PyTorch's native implementation is faster.
-    - PyTorch bmm uses highly-optimized cuBLAS
-    - PyTorch's element-wise ops are already vectorized and parallel
-    - Custom Triton kernels add overhead without benefits for this workload
+    After benchmarking, PyTorch's cuBLAS is faster for this workload.
+    The optimized PyTorch version computes sum(M_j) then squares it,
+    which is mathematically equivalent and avoids nested loops.
     
-    This function simply calls the PyTorch implementation.
+    Triton kernels add overhead from multiple kernel launches without
+    providing benefits over highly-optimized cuBLAS matmul operations.
     
     Args:
         A: Input activations [B, T, d_a]
@@ -798,11 +691,9 @@ def _width_frobenius_triton(
     """
     Width-Linear Algorithm with Triton acceleration.
     
-    Note: PyTorch's bmm is already extremely well-optimized (uses cuBLAS).
-    For this algorithm, PyTorch implementation is often faster than custom Triton kernels
-    because cuBLAS is heavily tuned for matmul operations.
-    
-    This implementation simply falls back to PyTorch, which is the most efficient choice.
+    PyTorch's cuBLAS-optimized bmm is faster than custom Triton kernels
+    for this matmul-heavy workload. The overhead of multiple kernel launches
+    and tensor extractions exceeds any potential benefits from custom kernels.
     
     Args:
         A: Input activations [B, T, d_a]
@@ -813,8 +704,7 @@ def _width_frobenius_triton(
     Returns:
         Tensor of shape [B] containing gradient norm squared for each sample
     """
-    # For width algorithm, PyTorch's optimized bmm is typically faster
-    # than custom Triton kernels due to cuBLAS optimization
+    # PyTorch's optimized bmm is faster - use it directly
     return _width_frobenius(A, G, tile_size, dtype_acc)
 
 
@@ -904,13 +794,16 @@ def compute_linear_norm_sample_flash(
     
     A = activations[0]
     ret: Dict[nn.Parameter, torch.Tensor] = {}
+    # tile_size = A.shape[1]
     
-    print(layer, "activation shape: ", A.shape, "backprop shape: ", backprops.shape)
-    device = "cuda"
-    allocated = torch.cuda.memory_allocated(device) / 2**20
-    reserved = torch.cuda.memory_reserved(device) / 2**20
-    max_allocated = torch.cuda.max_memory_allocated(device) / 2**20
-    print(f"Memory allocated: {allocated:.2f} MB, reserved: {reserved:.2f} MB, max allocated: {max_allocated:.2f} MB")
+    time_start = time.time()
+    # print(layer, "activation shape: ", A.shape, "backprop shape: ", backprops.shape)
+    # device = "cuda"
+    # print("*****current gpu number: ", torch.cuda.current_device(), "*******")
+    # allocated = torch.cuda.memory_allocated(device) / 2**20
+    # reserved = torch.cuda.memory_reserved(device) / 2**20
+    # max_allocated = torch.cuda.max_memory_allocated(device) / 2**20
+    # print(f"Memory allocated: {allocated:.2f} MB, reserved: {reserved:.2f} MB, max allocated: {max_allocated:.2f} MB")
 
     if backprops.dim() == 2:
         # 2D case: [B, d_out]
@@ -931,8 +824,10 @@ def compute_linear_norm_sample_flash(
         B, T, d_out = backprops.shape
         _, T_a, d_in = A.shape
         assert T == T_a, f"Mismatched sequence lengths: backprops T={T} vs activations T={T_a}"
-        
+
         if layer.weight.requires_grad:
+            ret[layer.weight] = torch.ones(B, device=A.device, dtype=dtype_acc)
+
             # Select algorithm and acceleration method
             if use_flash_clipping and is_triton_available():
                 if algorithm == "input_length":
@@ -949,15 +844,18 @@ def compute_linear_norm_sample_flash(
             ret[layer.weight] = torch.sqrt(ga.clamp_min(0.0))
         
         if (layer.bias is not None) and layer.bias.requires_grad:
+            ret[layer.bias] = torch.ones(B, device=A.device, dtype=dtype_acc)+0.1
+
             # Bias gradient norm computation
             if use_flash_clipping and is_triton_available():
                 gg = _sum_over_time_norm_squared_triton(backprops, dtype_acc=dtype_acc)
             else:
                 gg = _sum_over_time_norm_squared(backprops, dtype_acc=dtype_acc)
             ret[layer.bias] = torch.sqrt(gg.clamp_min(0.0))
-    
+
     else:
         raise ValueError(f"Unsupported backprops dim: {backprops.dim()}, expected 2 or 3")
-    
+    time_end = time.time()
+    print(layer, "@@@@@ time cost: ", time_end - time_start)
     return ret
 

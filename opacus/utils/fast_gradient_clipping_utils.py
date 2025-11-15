@@ -14,15 +14,133 @@
 # limitations under the License.
 
 import torch
+import time
 from opacus.grad_sample.grad_sample_module_fast_gradient_clipping import (
     GradSampleModuleFastGradientClipping,
 )
 from opacus.optimizers import DPOptimizerFastGradientClipping
 
 
+def _is_fsdp_model(module) -> bool:
+    """
+    Check if model is wrapped with FSDP.
+    
+    Returns True if the module or any of its submodules is wrapped with FSDP,
+    or if it's an instance of GradSampleModuleFastGradientClippingFSDP.
+    """
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel
+        # Check if any submodule is FSDP-wrapped
+        for m in module.modules():
+            if isinstance(m, FullyShardedDataParallel):
+                return True
+        # Also check for FSDP2 via GradSampleModuleFastGradientClippingFSDP
+        from opacus.grad_sample.grad_sample_module_fast_gradient_clipping_fsdp import (
+            GradSampleModuleFastGradientClippingFSDP,
+        )
+        return isinstance(module, GradSampleModuleFastGradientClippingFSDP)
+    except ImportError:
+        return False
+
+
+def _get_fsdp_root_module(module):
+    """
+    Get the root FSDP module for disabling gradient synchronization.
+    
+    For FSDP2 (fully_shard), returns the module with set_requires_gradient_sync() method.
+    For FSDP1, returns the module with no_sync() context manager.
+    For GradSampleModuleFastGradientClippingFSDP, accesses the inner _module.
+    
+    Args:
+        module: The module (potentially a GradSampleModule wrapper)
+    
+    Returns:
+        Tuple of (fsdp_module, api_version) where:
+        - fsdp_module: The FSDP module, or None if not found
+        - api_version: 'fsdp2' if set_requires_gradient_sync available, 
+                      'fsdp1' if no_sync available, None otherwise
+    """
+    try:
+        from opacus.grad_sample.grad_sample_module_fast_gradient_clipping_fsdp import (
+            GradSampleModuleFastGradientClippingFSDP,
+        )
+        
+        # If it's a GradSampleModuleFastGradientClippingFSDP, get the inner module
+        if isinstance(module, GradSampleModuleFastGradientClippingFSDP):
+            inner_module = module._module
+            
+            # FSDP2: Check for set_requires_gradient_sync() method
+            if hasattr(inner_module, 'set_requires_gradient_sync'):
+                return inner_module, 'fsdp2'
+            
+            # FSDP1: Check for no_sync() context manager
+            if hasattr(inner_module, 'no_sync'):
+                return inner_module, 'fsdp1'
+        
+        # Check if the module itself has FSDP methods
+        if hasattr(module, 'set_requires_gradient_sync'):
+            return module, 'fsdp2'
+        if hasattr(module, 'no_sync'):
+            return module, 'fsdp1'
+            
+        return None, None
+    except Exception as e:
+        print(f"[DEBUG] Error in _get_fsdp_root_module: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None
+
+
+def _register_grad_blocking_hooks(module):
+    """
+    Register hooks that prevent gradient storage during FSDP norm pass.
+    
+    All parameters keep requires_grad=True so backward flows normally and
+    all norm computations happen correctly. The hooks intercept gradients
+    before they're stored in param.grad, preventing FSDP communication.
+    
+    Args:
+        module: The module whose parameters need gradient blocking hooks
+    
+    Returns:
+        List of hook handles that must be removed after norm pass
+    """
+    def _prevent_grad_storage_hook(grad):
+        """Hook that prevents gradient from being stored in param.grad"""
+        return None  # Returning None prevents storage
+    
+    handles = []
+    for p in module.parameters():
+        if p.requires_grad:
+            # Register post_accumulate hook that intercepts gradient
+            handle = p.register_post_accumulate_grad_hook(_prevent_grad_storage_hook)
+            handles.append(handle)
+    
+    return handles
+
+
+def _remove_grad_blocking_hooks(handles):
+    """
+    Remove all registered gradient blocking hooks.
+    
+    Args:
+        handles: List of hook handles to remove
+    """
+    for handle in handles:
+        handle.remove()
+
+
 class DPTensorFastGradientClipping:
     """
     Packages the training loop for Fast Gradient and Ghost Clipping into loss.backward().
+    
+    Automatically detects FSDP and optimizes the norm pass by disabling parameter gradients,
+    preventing expensive FSDP communication while preserving per-sample norm computation.
+    
+    FSDP Optimization:
+    - Uses no_sync() context to prevent gradient synchronization (reduce-scatter) during norm pass
+    - Uses gradient blocking hooks to prevent gradient storage and all-gather operations
+    - This eliminates unnecessary FSDP communication during the first backward pass
     """
 
     def __init__(
@@ -57,10 +175,9 @@ class DPTensorFastGradientClipping:
         Repurposes loss.backward() to perform gradient clipping.
         
         - If enable_fastdp_bookkeeping=False (default): Performs two backward passes
-          (standard Ghost Clipping approach)
-        - If enable_fastdp_bookkeeping=True: Performs ONE backward pass and then
-          manually computes clipped gradients using cached activations/backprops
-          (FastDP Bookkeeping optimization)
+          * With FSDP: First pass (norm pass) disables param grads to avoid FSDP comm
+          * Without FSDP: Standard two-pass ghost clipping
+        - If enable_fastdp_bookkeeping=True: Single pass with manual gradient computation
         """
 
         if self.loss_reduction == "mean":
@@ -78,30 +195,153 @@ class DPTensorFastGradientClipping:
         if use_bookkeeping:
             # FastDP Bookkeeping (BK) mode: Single backward pass
             # No need to retain graph since we cache intermediate values
+            sync = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
+            sync()
+            t0 = time.perf_counter()
             reduced_loss.backward()
+            sync()
+            t1 = time.perf_counter()
+            print(f"[BK] backward: {(t1 - t0) * 1000:.3f} ms")
             
             # Compute clipping coefficients from per-sample gradient norms
+            sync()
+            t2 = time.perf_counter()
             coeff = self.module.get_clipping_coef()
-            
+            sync()
+            t3 = time.perf_counter()
+            print(f"[BK] get_clipping_coef: {(t3 - t2) * 1000:.3f} ms")
+            print("######## current device: ", torch.cuda.current_device(), "#########")
+            print("coeff: ", coeff)            
             # Zero out any gradients from the first backward (these are non-private)
+            sync()
+            t4 = time.perf_counter()
             self.optimizer.zero_grad()
+            sync()
+            t5 = time.perf_counter()
+            print(f"[BK] zero_grad: {(t5 - t4) * 1000:.3f} ms")
             
             # Manually populate clipped gradients using cached activations and backprops
             # This replaces the second backward pass
+            sync()
+            t6 = time.perf_counter()
             self.module.populate_clipped_gradients(coeff)
+            sync()
+            t7 = time.perf_counter()
+            print(f"[BK] populate_clipped_gradients: {(t7 - t6) * 1000:.3f} ms")
             
         else:
-            # Standard Ghost Clipping mode: Two backward passes
-            reduced_loss.backward(retain_graph=True)
+            # Two-pass ghost clipping with optional FSDP optimization
+            is_fsdp = _is_fsdp_model(self.module)
+            hook_handles = []
+            fsdp_root = None
+            fsdp_api = None
+            sync = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
+            
+            if is_fsdp:
+                # FSDP-optimized norm pass: register hooks to prevent gradient storage
+                # All parameters keep requires_grad=True for full backward flow
+                sync()
+                t0 = time.perf_counter()
+                hook_handles = _register_grad_blocking_hooks(self.module)
+                sync()
+                t1 = time.perf_counter()
+                print(f"[Ghost] register_hooks: {(t1 - t0) * 1000:.3f} ms")
+                
+                # Get FSDP root module and API version
+                fsdp_root, fsdp_api = _get_fsdp_root_module(self.module)
+                if fsdp_root is not None:
+                    if fsdp_api == 'fsdp2':
+                        print(f"[Ghost] FSDP2 optimization enabled: disabling gradient sync for first backward")
+                        # Disable gradient synchronization for FSDP2
+                        # set_requires_gradient_sync(requires_sync: bool)
+                        fsdp_root.set_requires_gradient_sync(False)
+                    else:
+                        print(f"[Ghost] FSDP1 optimization enabled: using no_sync() for first backward")
+                else:
+                    print(f"[Ghost] Warning: FSDP detected but sync control not available")
+            
+            # First backward: compute per-sample norms via hooks
+            # For FSDP1: Use no_sync() context to prevent gradient synchronization
+            # For FSDP2: Already disabled sync with set_requires_gradient_sync(False, False)
+            # Hooks prevent param.grad creation, avoiding communication
+            sync()
+            t2 = time.perf_counter()
+            
+            if is_fsdp and fsdp_root is not None and fsdp_api == 'fsdp1':
+                # FSDP1: Use context manager
+                with fsdp_root.no_sync():
+                    reduced_loss.backward(retain_graph=True)
+            else:
+                # FSDP2 or no FSDP: Direct backward
+                # For FSDP2, sync is already disabled via set_requires_gradient_sync
+                reduced_loss.backward(retain_graph=True)
+            
+            sync()
+            t3 = time.perf_counter()
+            print(f"[Ghost] first_backward: {(t3 - t2) * 1000:.3f} ms")
+            
+            # Re-enable gradient synchronization for FSDP2 before second backward
+            if is_fsdp and fsdp_root is not None and fsdp_api == 'fsdp2':
+                sync()
+                t_resync_start = time.perf_counter()
+                fsdp_root.set_requires_gradient_sync(True)
+                sync()
+                t_resync_end = time.perf_counter()
+                print(f"[Ghost] re-enable_sync: {(t_resync_end - t_resync_start) * 1000:.3f} ms")
+            
+            if is_fsdp:
+                # Remove hooks after norm pass
+                sync()
+                t4 = time.perf_counter()
+                _remove_grad_blocking_hooks(hook_handles)
+                sync()
+                t5 = time.perf_counter()
+                print(f"[Ghost] remove_hooks: {(t5 - t4) * 1000:.3f} ms")
+            
+            # Zero out any gradients (should be none if FSDP, but safe to call)
+            sync()
+            t6 = time.perf_counter()
             self.optimizer.zero_grad()
+            sync()
+            t7 = time.perf_counter()
+            print(f"[Ghost] zero_grad: {(t7 - t6) * 1000:.3f} ms")
+            
+            # Compute clipping coefficients from per-sample norms
+            sync()
+            t8 = time.perf_counter()
             coeff = self.module.get_clipping_coef()
+            sync()
+            t9 = time.perf_counter()
+            print(f"[Ghost] get_clipping_coef: {(t9 - t8) * 1000:.3f} ms")
+            
+            # Second backward: compute actual parameter gradients with clipping
+            t10 = time.perf_counter()
             second_loss_per_sample = (
                 coeff.to(self.loss_per_sample.device) * self.loss_per_sample
             )
             second_loss = torch.sum(second_loss_per_sample)
+            t11 = time.perf_counter()
+            print(f"[Ghost] compose_second_loss: {(t11 - t10) * 1000:.3f} ms")
+            
+            # Disable hooks to avoid recomputing norms
+            sync()
+            t12 = time.perf_counter()
             self.module.disable_hooks()
+            sync()
+            t13 = time.perf_counter()
+            print(f"[Ghost] disable_hooks: {(t13 - t12) * 1000:.3f} ms")
+            sync()
+            t14 = time.perf_counter()
             second_loss.backward()
+            sync()
+            t15 = time.perf_counter()
+            print(f"[Ghost] second_backward: {(t15 - t14) * 1000:.3f} ms")
+            sync()
+            t16 = time.perf_counter()
             self.module.enable_hooks()
+            sync()
+            t17 = time.perf_counter()
+            print(f"[Ghost] enable_hooks: {(t17 - t16) * 1000:.3f} ms")
 
 
 class DPLossFastGradientClipping:

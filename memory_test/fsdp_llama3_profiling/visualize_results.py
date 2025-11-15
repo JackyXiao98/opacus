@@ -16,6 +16,8 @@ MODE_NAMES = {
     "no_dp": "Non-DP\nFSDP2",
     "ghost_fsdp": "Ghost\nClipping",
     "flash_fsdp": "Flash\nClipping",
+    "flash_fsdp_bk": "Flash\nClipping\n(BK)",
+    "ghost_bk": "Ghost\nClipping\n(BK)",
 }
 
 # Colors for modes
@@ -23,6 +25,8 @@ MODE_COLORS = {
     "no_dp": "#3498db",      # Blue
     "ghost_fsdp": "#e74c3c",  # Red
     "flash_fsdp": "#2ecc71",  # Green
+    "flash_fsdp_bk": "#f39c12",  # Orange
+    "ghost_bk": "#9b59b6",  # Purple
 }
 
 # Markers for sequence lengths
@@ -30,6 +34,9 @@ SEQ_MARKERS = {
     1024: "o",
     2048: "s",
     4096: "^",
+    8192: "D",
+    16384: "P",
+    32768: "H",
 }
 
 
@@ -59,7 +66,7 @@ def plot_memory_comparison(results, output_dir):
     seq_lengths = sorted(set(
         seq_len for mode_data in results.values() for seq_len in mode_data.keys()
     ))
-    modes = sorted(results.keys(), key=lambda x: ["no_dp", "ghost_fsdp", "flash_fsdp"].index(x))
+    modes = sorted(results.keys(), key=lambda x: ["no_dp", "ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_bk"].index(x))
     
     fig, axes = plt.subplots(1, len(seq_lengths), figsize=(6 * len(seq_lengths), 6))
     
@@ -110,7 +117,7 @@ def plot_time_comparison(results, output_dir):
     seq_lengths = sorted(set(
         seq_len for mode_data in results.values() for seq_len in mode_data.keys()
     ))
-    modes = sorted(results.keys(), key=lambda x: ["no_dp", "ghost_fsdp", "flash_fsdp"].index(x))
+    modes = sorted(results.keys(), key=lambda x: ["no_dp", "ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_bk"].index(x))
     
     fig, axes = plt.subplots(1, len(seq_lengths), figsize=(6 * len(seq_lengths), 6))
     
@@ -160,7 +167,7 @@ def plot_memory_vs_time_tradeoff(results, output_dir):
     """Plot memory vs time tradeoff"""
     fig, ax = plt.subplots(figsize=(12, 8))
     
-    modes = sorted(results.keys(), key=lambda x: ["no_dp", "ghost_fsdp", "flash_fsdp"].index(x))
+    modes = sorted(results.keys(), key=lambda x: ["no_dp", "ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_bk"].index(x))
     
     for mode in modes:
         for seq_len, data in results[mode].items():
@@ -311,7 +318,7 @@ def generate_summary_table(results, output_dir):
     summary_lines.append("")
     
     # Get all modes and sequence lengths
-    modes = sorted(results.keys(), key=lambda x: ["no_dp", "ghost_fsdp", "flash_fsdp"].index(x))
+    modes = sorted(results.keys(), key=lambda x: ["no_dp", "ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_bk"].index(x))
     seq_lengths = sorted(set(
         seq_len for mode_data in results.values() for seq_len in mode_data.keys()
     ))

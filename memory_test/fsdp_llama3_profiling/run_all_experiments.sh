@@ -2,7 +2,6 @@
 # Run all FSDP Llama3 memory profiling experiments in isolated Python processes
 # This prevents memory pool contamination between experiments
 
-
 echo "========================================================================"
 echo "FSDP Llama3 Memory Profiling Experiment Suite"
 echo "Each experiment runs in a fresh Python process to avoid contamination"
@@ -13,24 +12,26 @@ echo ""
 if [ -z "$HF_TOKEN" ]; then
     echo "❌ Error: HF_TOKEN environment variable is not set"
     echo "Please set it with: export HF_TOKEN=your_token_here"
-    exit 1
+    return 1
 fi
 
 # Configuration
-MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
-BATCH_SIZE=1
-NUM_ITER=3
-WARMUP_ITER=1
+# MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
+MODEL_NAME="meta-llama/Llama-3.2-1B"
+BATCH_SIZE=2
+NUM_ITER=1
+WARMUP_ITER=0
 VOCAB_SIZE=128256
 LEARNING_RATE=1e-5
 SIGMA=1.0
 MAX_GRAD_NORM=1.0
 
 # Sequence lengths to test
-SEQ_LENGTHS=(1024 2048 4096)
+SEQ_LENGTHS=(8192)
 
 # Modes to test
-MODES=("no_dp" "ghost_fsdp" "flash_fsdp")
+# MODES=("no_dp" "ghost_fsdp" "flash_fsdp")
+MODES=("flash_fsdp")
 
 # Output directory
 OUTPUT_DIR="results"

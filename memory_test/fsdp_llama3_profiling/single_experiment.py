@@ -114,7 +114,7 @@ def run_experiment_worker(
     criterion = torch.nn.CrossEntropyLoss()
     
     # Apply DP-SGD if needed
-    if mode in ["ghost_fsdp", "flash_fsdp"]:
+    if mode in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk"]:
         if master_process:
             print(f"Applying DP-SGD with mode: {mode}")
         
@@ -160,7 +160,7 @@ def run_experiment_worker(
         optimizer.zero_grad()
         
         # Model computes loss internally when labels are provided
-        if mode in ["ghost_fsdp", "flash_fsdp"]:
+        if mode in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk"]:
             # For DP modes, we need to use the criterion wrapper
             outputs = model(
                 input_ids=batch["input_ids"],
@@ -203,7 +203,7 @@ def run_experiment_worker(
         optimizer.zero_grad()
         
         # Model computes loss internally when labels are provided
-        if mode in ["ghost_fsdp", "flash_fsdp"]:
+        if mode in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk"]:
             # For DP modes, we need to use the criterion wrapper
             outputs = model(
                 input_ids=batch["input_ids"],
@@ -322,7 +322,7 @@ def run_experiment(config):
 def main():
     parser = argparse.ArgumentParser(description="Run single FSDP Llama3 profiling experiment")
     parser.add_argument("--mode", type=str, required=True,
-                       choices=["no_dp", "ghost_fsdp", "flash_fsdp"],
+                       choices=["no_dp", "ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_bk"],
                        help="Training mode")
     parser.add_argument("--seq-length", type=int, required=True,
                        help="Sequence length")

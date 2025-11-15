@@ -105,6 +105,13 @@ def wrap_model(model: nn.Module, grad_sample_mode: str, *args, **kwargs):
     elif grad_sample_mode == "flash_fsdp":
         kwargs["use_flash_clipping"] = True
         kwargs["use_ghost_clipping"] = True
+    elif grad_sample_mode == "ghost_bk":
+        kwargs["use_ghost_clipping"] = True
+        kwargs["enable_fastdp_bookkeeping"] = True
+    elif grad_sample_mode == "flash_fsdp_bk":
+        kwargs["use_flash_clipping"] = True
+        kwargs["use_ghost_clipping"] = True
+        kwargs["enable_fastdp_bookkeeping"] = True
     return cls(model, *args, **kwargs)
 
 
@@ -124,14 +131,18 @@ def get_gsm_class(grad_sample_mode: str) -> Type[AbstractGradSampleModule]:
         return GradSampleModuleFastGradientClipping
     elif grad_sample_mode == "flash":
         return GradSampleModuleFastGradientClipping
+    elif grad_sample_mode == "ghost_bk":
+        return GradSampleModuleFastGradientClipping
     elif grad_sample_mode == "ghost_fsdp":
         return GradSampleModuleFastGradientClippingFSDP
     elif grad_sample_mode == "flash_fsdp":
+        return GradSampleModuleFastGradientClippingFSDP
+    elif grad_sample_mode == "flash_fsdp_bk":
         return GradSampleModuleFastGradientClippingFSDP
     elif grad_sample_mode == "no_op":
         return GradSampleModuleNoOp
     else:
         raise ValueError(
             f"Unexpected grad_sample_mode: {grad_sample_mode}. "
-            f"Allowed values: hooks, ew, ghost, flash, ghost_fsdp, flash_fsdp, no_op"
+            f"Allowed values: hooks, ew, ghost, flash, ghost_bk, ghost_fsdp, flash_fsdp, flash_fsdp_bk, no_op"
         )

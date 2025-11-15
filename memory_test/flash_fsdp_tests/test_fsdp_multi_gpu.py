@@ -215,7 +215,7 @@ def run_training(rank, world_size, args):
         criterion=nn.CrossEntropyLoss(),
         noise_multiplier=args.noise_multiplier,
         max_grad_norm=args.max_grad_norm,
-        grad_sample_mode="flash_fsdp",  # Use flash_fsdp mode
+        grad_sample_mode="flash_fsdp_bk",  # Use flash_fsdp mode
         poisson_sampling=False,  # Disable for deterministic results
     )
     
