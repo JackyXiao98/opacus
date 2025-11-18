@@ -17,16 +17,21 @@ Date: 2025-11-11
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 import numpy as np
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import sys
 import os
+import argparse
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from opacus.grad_sample.grad_sample_module_fast_gradient_clipping import (
     GradSampleModuleFastGradientClipping,
+)
+from opacus.grad_sample.grad_sample_module_fast_gradient_clipping_fsdp import (
+    GradSampleModuleFastGradientClippingFSDP,
 )
 from opacus.optimizers import DPOptimizerFastGradientClipping
 from opacus.utils.fast_gradient_clipping_utils import DPLossFastGradientClipping
@@ -63,6 +68,31 @@ class SequenceModel(nn.Module):
         x = self.relu(self.fc1(x))
         x = self.fc2(x)
         return x
+
+
+def setup_distributed():
+    """Initialize distributed training if environment variables are set"""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        
+        # Initialize process group
+        if not dist.is_initialized():
+            dist.init_process_group(backend='nccl' if torch.cuda.is_available() else 'gloo')
+        
+        # Set device
+        if torch.cuda.is_available():
+            torch.cuda.set_device(rank)
+        
+        return True, rank, world_size
+    
+    return False, 0, 1
+
+
+def cleanup_distributed():
+    """Cleanup distributed training"""
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def get_model_gradients(model: nn.Module) -> Dict[str, torch.Tensor]:
@@ -128,19 +158,37 @@ def run_standard_ghost_clipping(
     max_grad_norm: float = 1.0,
     batch_size: int = 4,
     use_triton: bool = False,
+    use_fsdp: bool = False,
+    verbose: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Run standard Ghost Clipping (2-pass) and return gradients"""
     
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    
     # Wrap model with GradSampleModule (bookkeeping=False)
-    wrapped_model = GradSampleModuleFastGradientClipping(
-        model,
-        batch_first=True,
-        max_grad_norm=max_grad_norm,
-        use_ghost_clipping=True,
-        use_triton=use_triton,
-        loss_reduction="mean",
-        enable_fastdp_bookkeeping=False,  # Standard 2-pass mode
-    )
+    if use_fsdp:
+        wrapped_model = GradSampleModuleFastGradientClippingFSDP(
+            model,
+            batch_first=True,
+            max_grad_norm=max_grad_norm,
+            use_ghost_clipping=True,
+            use_flash_clipping=use_triton,
+            loss_reduction="mean",
+            enable_fastdp_bookkeeping=False,  # Standard 2-pass mode
+        )
+    else:
+        wrapped_model = GradSampleModuleFastGradientClipping(
+            model,
+            batch_first=True,
+            max_grad_norm=max_grad_norm,
+            use_ghost_clipping=True,
+            use_flash_clipping=use_triton,
+            loss_reduction="mean",
+            enable_fastdp_bookkeeping=False,  # Standard 2-pass mode
+        )
+    
+    if verbose:
+        print(f"[Rank {rank}] Running standard ghost clipping with FSDP={use_fsdp}, Triton={use_triton}")
     
     # Create optimizer
     base_optimizer = torch.optim.SGD(wrapped_model.parameters(), lr=0.01)
@@ -189,19 +237,37 @@ def run_bookkeeping_clipping(
     max_grad_norm: float = 1.0,
     batch_size: int = 4,
     use_triton: bool = False,
+    use_fsdp: bool = False,
+    verbose: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """Run Bookkeeping (BK) clipping (1-pass) and return gradients"""
     
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    
     # Wrap model with GradSampleModule (bookkeeping=True)
-    wrapped_model = GradSampleModuleFastGradientClipping(
-        model,
-        batch_first=True,
-        max_grad_norm=max_grad_norm,
-        use_ghost_clipping=True,
-        use_triton=use_triton,
-        loss_reduction="mean",
-        enable_fastdp_bookkeeping=True,  # Bookkeeping mode!
-    )
+    if use_fsdp:
+        wrapped_model = GradSampleModuleFastGradientClippingFSDP(
+            model,
+            batch_first=True,
+            max_grad_norm=max_grad_norm,
+            use_ghost_clipping=True,
+            use_flash_clipping=use_triton,
+            loss_reduction="mean",
+            enable_fastdp_bookkeeping=True,  # Bookkeeping mode!
+        )
+    else:
+        wrapped_model = GradSampleModuleFastGradientClipping(
+            model,
+            batch_first=True,
+            max_grad_norm=max_grad_norm,
+            use_ghost_clipping=True,
+            use_flash_clipping=use_triton,
+            loss_reduction="mean",
+            enable_fastdp_bookkeeping=True,  # Bookkeeping mode!
+        )
+    
+    if verbose:
+        print(f"[Rank {rank}] Running bookkeeping clipping with FSDP={use_fsdp}, Triton={use_triton}")
     
     # Create optimizer
     base_optimizer = torch.optim.SGD(wrapped_model.parameters(), lr=0.01)
@@ -243,11 +309,14 @@ def run_bookkeeping_clipping(
     return grads
 
 
-def test_2d_case(use_triton=False):
+def test_2d_case(use_triton=False, use_fsdp=False, verbose=False):
     """Test with 2D inputs (standard batch of vectors)"""
-    print("\n" + "="*80)
-    print(f"TEST 1: 2D Case (Batch of Vectors) - use_triton={use_triton}")
-    print("="*80)
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    
+    if rank == 0:
+        print("\n" + "="*80)
+        print(f"TEST 1: 2D Case (Batch of Vectors) - use_triton={use_triton}, use_fsdp={use_fsdp}")
+        print("="*80)
     
     # Set random seed for reproducibility
     torch.manual_seed(42)
@@ -262,39 +331,59 @@ def test_2d_case(use_triton=False):
     data = torch.randn(batch_size, input_dim)
     labels = torch.randint(0, output_dim, (batch_size,))
     
+    # Move to GPU if using FSDP
+    if use_fsdp and torch.cuda.is_available():
+        data = data.cuda()
+        labels = labels.cuda()
+    
     # Test with standard Ghost Clipping
-    print("\n--- Running Standard Ghost Clipping (2-pass) ---")
+    if rank == 0:
+        print("\n--- Running Standard Ghost Clipping (2-pass) ---")
     model1 = SimpleModel(input_dim, hidden_dim, output_dim)
+    if use_fsdp and torch.cuda.is_available():
+        model1 = model1.cuda()
     grads_standard = run_standard_ghost_clipping(
-        model1, data, labels, max_grad_norm=1.0, batch_size=batch_size, use_triton=use_triton
+        model1, data, labels, max_grad_norm=1.0, batch_size=batch_size, 
+        use_triton=use_triton, use_fsdp=use_fsdp, verbose=verbose
     )
     
     # Test with Bookkeeping
-    print("\n--- Running Bookkeeping (1-pass) ---")
+    if rank == 0:
+        print("\n--- Running Bookkeeping (1-pass) ---")
     model2 = SimpleModel(input_dim, hidden_dim, output_dim)
     # Copy weights to ensure same initialization
     model2.load_state_dict(model1.state_dict())
+    if use_fsdp and torch.cuda.is_available():
+        model2 = model2.cuda()
     grads_bookkeeping = run_bookkeeping_clipping(
-        model2, data, labels, max_grad_norm=1.0, batch_size=batch_size, use_triton=use_triton
+        model2, data, labels, max_grad_norm=1.0, batch_size=batch_size, 
+        use_triton=use_triton, use_fsdp=use_fsdp, verbose=verbose
     )
     
     # Compare gradients
-    print("\n--- Comparing Gradients ---")
+    if rank == 0:
+        print("\n--- Comparing Gradients ---")
     all_close, max_diffs = compare_gradients(grads_standard, grads_bookkeeping, rtol=1e-4, atol=1e-5)
     
-    if all_close:
-        print("\n✅ TEST PASSED: All gradients match!")
-        return True
-    else:
-        print("\n❌ TEST FAILED: Gradients do not match!")
-        return False
+    if rank == 0:
+        if all_close:
+            print("\n✅ TEST PASSED: All gradients match!")
+            return True
+        else:
+            print("\n❌ TEST FAILED: Gradients do not match!")
+            return False
+    
+    return all_close
 
 
-def test_3d_case(use_triton=False):
+def test_3d_case(use_triton=False, use_fsdp=False, verbose=False):
     """Test with 3D inputs (batch, sequence_length, features)"""
-    print("\n" + "="*80)
-    print(f"TEST 2: 3D Case (Sequence Data) - use_triton={use_triton}")
-    print("="*80)
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    
+    if rank == 0:
+        print("\n" + "="*80)
+        print(f"TEST 2: 3D Case (Sequence Data) - use_triton={use_triton}, use_fsdp={use_fsdp}")
+        print("="*80)
     
     # Set random seed
     torch.manual_seed(123)
@@ -310,38 +399,58 @@ def test_3d_case(use_triton=False):
     data = torch.randn(batch_size, seq_len, input_dim)
     labels = torch.randint(0, output_dim, (batch_size, seq_len))
     
+    # Move to GPU if using FSDP
+    if use_fsdp and torch.cuda.is_available():
+        data = data.cuda()
+        labels = labels.cuda()
+    
     # Test with standard Ghost Clipping
-    print("\n--- Running Standard Ghost Clipping (2-pass) ---")
+    if rank == 0:
+        print("\n--- Running Standard Ghost Clipping (2-pass) ---")
     model1 = SequenceModel(input_dim, hidden_dim, output_dim, seq_len)
+    if use_fsdp and torch.cuda.is_available():
+        model1 = model1.cuda()
     grads_standard = run_standard_ghost_clipping(
-        model1, data, labels, max_grad_norm=1.0, batch_size=batch_size, use_triton=use_triton
+        model1, data, labels, max_grad_norm=1.0, batch_size=batch_size, 
+        use_triton=use_triton, use_fsdp=use_fsdp, verbose=verbose
     )
     
     # Test with Bookkeeping
-    print("\n--- Running Bookkeeping (1-pass) ---")
+    if rank == 0:
+        print("\n--- Running Bookkeeping (1-pass) ---")
     model2 = SequenceModel(input_dim, hidden_dim, output_dim, seq_len)
     model2.load_state_dict(model1.state_dict())
+    if use_fsdp and torch.cuda.is_available():
+        model2 = model2.cuda()
     grads_bookkeeping = run_bookkeeping_clipping(
-        model2, data, labels, max_grad_norm=1.0, batch_size=batch_size, use_triton=use_triton
+        model2, data, labels, max_grad_norm=1.0, batch_size=batch_size, 
+        use_triton=use_triton, use_fsdp=use_fsdp, verbose=verbose
     )
     
     # Compare gradients
-    print("\n--- Comparing Gradients ---")
+    if rank == 0:
+        print("\n--- Comparing Gradients ---")
     all_close, max_diffs = compare_gradients(grads_standard, grads_bookkeeping, rtol=1e-4, atol=1e-5)
     
-    if all_close:
-        print("\n✅ TEST PASSED: All gradients match!")
-        return True
-    else:
-        print("\n❌ TEST FAILED: Gradients do not match!")
-        return False
+    if rank == 0:
+        if all_close:
+            print("\n✅ TEST PASSED: All gradients match!")
+            return True
+        else:
+            print("\n❌ TEST FAILED: Gradients do not match!")
+            return False
+    
+    return all_close
 
 
-def test_different_clipping_norms(use_triton=False):
+def test_different_clipping_norms(use_triton=False, use_fsdp=False, verbose=False):
     """Test with different gradient clipping norms"""
-    print("\n" + "="*80)
-    print(f"TEST 3: Different Clipping Norms - use_triton={use_triton}")
-    print("="*80)
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    
+    if rank == 0:
+        print("\n" + "="*80)
+        print(f"TEST 3: Different Clipping Norms - use_triton={use_triton}, use_fsdp={use_fsdp}")
+        print("="*80)
     
     batch_size = 8
     input_dim = 64
@@ -352,90 +461,138 @@ def test_different_clipping_norms(use_triton=False):
     all_passed = True
     
     for norm in test_norms:
-        print(f"\n--- Testing with max_grad_norm={norm} ---")
+        if rank == 0:
+            print(f"\n--- Testing with max_grad_norm={norm} ---")
         
         torch.manual_seed(42)
         data = torch.randn(batch_size, input_dim)
         labels = torch.randint(0, output_dim, (batch_size,))
         
+        # Move to GPU if using FSDP
+        if use_fsdp and torch.cuda.is_available():
+            data = data.cuda()
+            labels = labels.cuda()
+        
         model1 = SimpleModel(input_dim, hidden_dim, output_dim)
+        if use_fsdp and torch.cuda.is_available():
+            model1 = model1.cuda()
         grads_standard = run_standard_ghost_clipping(
-            model1, data, labels, max_grad_norm=norm, batch_size=batch_size, use_triton=use_triton
+            model1, data, labels, max_grad_norm=norm, batch_size=batch_size, 
+            use_triton=use_triton, use_fsdp=use_fsdp, verbose=verbose
         )
         
         model2 = SimpleModel(input_dim, hidden_dim, output_dim)
         model2.load_state_dict(model1.state_dict())
+        if use_fsdp and torch.cuda.is_available():
+            model2 = model2.cuda()
         grads_bookkeeping = run_bookkeeping_clipping(
-            model2, data, labels, max_grad_norm=norm, batch_size=batch_size, use_triton=use_triton
+            model2, data, labels, max_grad_norm=norm, batch_size=batch_size, 
+            use_triton=use_triton, use_fsdp=use_fsdp, verbose=verbose
         )
         
         all_close, max_diffs = compare_gradients(grads_standard, grads_bookkeeping, rtol=1e-4, atol=1e-5)
         
         if not all_close:
             all_passed = False
-            print(f"❌ Failed for norm={norm}")
+            if rank == 0:
+                print(f"❌ Failed for norm={norm}")
         else:
-            print(f"✅ Passed for norm={norm}")
+            if rank == 0:
+                print(f"✅ Passed for norm={norm}")
     
     return all_passed
 
 
 def main():
     """Run all verification tests"""
-    print("="*80)
-    print("FastDP Bookkeeping (BK) Correctness Verification")
-    print("="*80)
-    print("\nThis script verifies that Bookkeeping produces identical gradients")
-    print("to standard Ghost Clipping (within numerical tolerance).")
+    parser = argparse.ArgumentParser(description='Verify FastDP Bookkeeping correctness')
+    parser.add_argument('--use-fsdp', action='store_true',
+                        help='Use FSDP wrapper for distributed testing')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Enable verbose logging for debugging')
+    parser.add_argument('--enable-profiling', action='store_true',
+                        help='Enable detailed profiling output')
+    args = parser.parse_args()
     
-    # Check CUDA availability
-    device_info = f"Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}"
-    print(f"\n{device_info}")
+    # Setup distributed if needed
+    is_distributed, rank, world_size = setup_distributed()
+    
+    if args.enable_profiling:
+        os.environ['OPACUS_PROFILE_FSDP'] = '1'
+    
+    if rank == 0:
+        print("="*80)
+        print("FastDP Bookkeeping (BK) Correctness Verification")
+        print("="*80)
+        print("\nThis script verifies that Bookkeeping produces identical gradients")
+        print("to standard Ghost Clipping (within numerical tolerance).")
+        
+        # Check CUDA availability
+        device_info = f"Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}"
+        print(f"\n{device_info}")
+        if is_distributed:
+            print(f"Running in distributed mode with {world_size} processes")
+        print(f"Using FSDP: {args.use_fsdp}")
+        print(f"Verbose logging: {args.verbose}")
     
     # Run tests without Triton first (always available)
-    print("\n" + "="*80)
-    print("RUNNING TESTS WITHOUT TRITON ACCELERATION")
-    print("="*80)
+    if rank == 0:
+        print("\n" + "="*80)
+        print("RUNNING TESTS WITHOUT TRITON ACCELERATION")
+        print("="*80)
     
     results = []
-    results.append(("2D Case", test_2d_case(use_triton=False)))
-    results.append(("3D Case", test_3d_case(use_triton=False)))
-    results.append(("Different Norms", test_different_clipping_norms(use_triton=False)))
+    results.append(("2D Case", test_2d_case(use_triton=False, use_fsdp=args.use_fsdp, verbose=args.verbose)))
+    results.append(("3D Case", test_3d_case(use_triton=False, use_fsdp=args.use_fsdp, verbose=args.verbose)))
+    results.append(("Different Norms", test_different_clipping_norms(use_triton=False, use_fsdp=args.use_fsdp, verbose=args.verbose)))
     
     # Try tests with Triton if available
     try:
         import triton
-        print("\n" + "="*80)
-        print("RUNNING TESTS WITH TRITON ACCELERATION")
-        print("="*80)
-        results.append(("2D Case (Triton)", test_2d_case(use_triton=True)))
-        results.append(("3D Case (Triton)", test_3d_case(use_triton=True)))
-        results.append(("Different Norms (Triton)", test_different_clipping_norms(use_triton=True)))
+        if rank == 0:
+            print("\n" + "="*80)
+            print("RUNNING TESTS WITH TRITON ACCELERATION")
+            print("="*80)
+        results.append(("2D Case (Triton)", test_2d_case(use_triton=True, use_fsdp=args.use_fsdp, verbose=args.verbose)))
+        results.append(("3D Case (Triton)", test_3d_case(use_triton=True, use_fsdp=args.use_fsdp, verbose=args.verbose)))
+        results.append(("Different Norms (Triton)", test_different_clipping_norms(use_triton=True, use_fsdp=args.use_fsdp, verbose=args.verbose)))
     except ImportError:
-        print("\n⚠️  Triton not available, skipping Triton tests")
+        if rank == 0:
+            print("\n⚠️  Triton not available, skipping Triton tests")
     
     # Print summary
-    print("\n" + "="*80)
-    print("SUMMARY")
-    print("="*80)
-    
-    for test_name, passed in results:
-        status = "✅ PASSED" if passed else "❌ FAILED"
-        print(f"{test_name}: {status}")
-    
-    all_passed = all(passed for _, passed in results)
-    
-    if all_passed:
+    if rank == 0:
         print("\n" + "="*80)
-        print("🎉 ALL TESTS PASSED! 🎉")
+        print("SUMMARY")
         print("="*80)
-        print("\nThe Bookkeeping implementation is numerically correct.")
-        return 0
+        
+        for test_name, passed in results:
+            status = "✅ PASSED" if passed else "❌ FAILED"
+            print(f"{test_name}: {status}")
+        
+        all_passed = all(passed for _, passed in results)
+        
+        if all_passed:
+            print("\n" + "="*80)
+            print("🎉 ALL TESTS PASSED! 🎉")
+            print("="*80)
+            print("\nThe Bookkeeping implementation is numerically correct.")
+            exit_code = 0
+        else:
+            print("\n" + "="*80)
+            print("❌ SOME TESTS FAILED")
+            print("="*80)
+            exit_code = 1
     else:
-        print("\n" + "="*80)
-        print("❌ SOME TESTS FAILED")
-        print("="*80)
-        return 1
+        # Non-zero rank: check if all tests passed
+        all_passed = all(passed for _, passed in results)
+        exit_code = 0 if all_passed else 1
+    
+    # Cleanup distributed
+    if is_distributed:
+        cleanup_distributed()
+    
+    return exit_code
 
 
 if __name__ == "__main__":

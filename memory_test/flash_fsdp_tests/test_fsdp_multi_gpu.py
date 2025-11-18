@@ -14,7 +14,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset, DistributedSampler
+from torch.distributed.device_mesh import init_device_mesh
+from torch.utils.data import DataLoader, TensorDataset
 
 # Add parent directories to path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -65,7 +66,6 @@ def train_fsdp(
     step = 0
     for epoch in range(num_epochs):
         epoch_loss = 0.0
-        train_loader.sampler.set_epoch(epoch)  # For DistributedSampler
         
         for batch_idx, (inputs, labels) in enumerate(train_loader):
             inputs = inputs.to(device)
@@ -98,15 +98,18 @@ def train_fsdp(
             
             step_time = time.time() - step_start
             
-            # Track metrics on rank 0
+            # FIXED: Compute GLOBAL parameter norm (all ranks must participate in all_reduce)
+            local_squared_norm = 0.0
+            for p in model.parameters():
+                local_squared_norm += p.data.norm(2).item() ** 2
+            
+            # All ranks must participate in collective operations!
+            global_squared_norm_tensor = torch.tensor(local_squared_norm, device=device)
+            dist.all_reduce(global_squared_norm_tensor, op=dist.ReduceOp.SUM)
+            total_param_norm = global_squared_norm_tensor.item() ** 0.5
+            
+            # Track metrics on rank 0 only
             if rank == 0:
-                # Track parameter norm
-                total_param_norm = 0.0
-                for p in model.parameters():
-                    param_norm = p.data.norm(2)
-                    total_param_norm += param_norm.item() ** 2
-                total_param_norm = total_param_norm ** 0.5
-                
                 # Record metrics
                 metrics["losses"].append(loss.item())
                 metrics["step_times"].append(step_time)
@@ -144,8 +147,13 @@ def run_training(rank, world_size, args):
     if torch.cuda.is_available():
         torch.cuda.set_device(rank)
         device = torch.device(f"cuda:{rank}")
+        device_type = "cuda"
     else:
         device = torch.device("cpu")
+        device_type = "cpu"
+    
+    # Initialize device mesh for FSDP
+    device_mesh = init_device_mesh(device_type, (world_size,))
     
     # Set random seed (same across all ranks for reproducibility)
     torch.manual_seed(args.seed)
@@ -183,7 +191,7 @@ def run_training(rank, world_size, args):
         print(f"Model parameters: {model.count_parameters():,}")
     
     # Wrap with FSDP
-    model = FSDP2Wrapper(model)
+    model = FSDP2Wrapper(model, mesh=device_mesh)
     
     # Create dataset
     inputs, labels = create_synthetic_dataset(
@@ -195,12 +203,13 @@ def run_training(rank, world_size, args):
     )
     dataset = TensorDataset(inputs, labels)
     
-    # Use DistributedSampler for multi-GPU
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False)
+    # FIXED: Replicate full dataset on all ranks to match single GPU behavior
+    # Each rank processes the SAME batch (not partitioned), just like single GPU
+    # This ensures identical forward passes and loss values across all ranks
     train_loader = DataLoader(
         dataset,
-        batch_size=args.batch_size // world_size,
-        sampler=sampler,
+        batch_size=args.batch_size,
+        shuffle=False,
     )
     
     # Create optimizer

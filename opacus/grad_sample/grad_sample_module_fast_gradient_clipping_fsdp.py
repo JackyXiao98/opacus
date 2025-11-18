@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from typing import List
 
 import torch
@@ -112,6 +114,13 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
         instead of the parameter. For FSDP, we need to all-reduce the per-sample norms across 
         ranks to get the global gradient norms.
         """
+        enable_profiling = os.environ.get('OPACUS_PROFILE_FSDP', '0') == '1'
+        sync = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
+        
+        if enable_profiling:
+            sync()
+            t_start = time.time()
+        
         # Stack per-parameter norms from all modules
         stacked_norms = torch.stack(
             [
@@ -122,17 +131,49 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
             dim=0,
         )
         
+        if enable_profiling:
+            sync()
+            t_stack = time.time()
+        
         # Compute local contribution: sum of squared norms
         # norm^2 = sum(param_i_norm^2) for parameters on this rank
         norm_sample_squared = (stacked_norms ** 2).sum(dim=0)
+
+        if enable_profiling:
+            sync()
+            t_local = time.time()
+            # Log pre-allreduce values for correctness debugging
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(f"[FSDP Profile] Rank {rank} - Pre-allreduce squared norms shape: {norm_sample_squared.shape}, "
+                  f"mean: {norm_sample_squared.mean().item():.6f}, "
+                  f"max: {norm_sample_squared.max().item():.6f}")
 
         # All-reduce the squared norms across ranks to get global per-sample gradient norms
         # This is critical for FSDP: we need sqrt(sum_all_ranks(norm_i^2)), not sum(sqrt(norm_i^2))
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(norm_sample_squared, op=torch.distributed.ReduceOp.SUM)
 
+        if enable_profiling:
+            sync()
+            t_allreduce = time.time()
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(f"[FSDP Profile] Rank {rank} - Post-allreduce squared norms shape: {norm_sample_squared.shape}, "
+                  f"mean: {norm_sample_squared.mean().item():.6f}, "
+                  f"max: {norm_sample_squared.max().item():.6f}")
+
         # Take square root to get final per-sample gradient norms
         norm_sample = torch.sqrt(norm_sample_squared + 1e-12)  # Add epsilon for numerical stability
+
+        if enable_profiling:
+            sync()
+            t_end = time.time()
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            print(f"[FSDP Profile] Rank {rank} get_norm_sample timing breakdown:")
+            print(f"  - Stack norms:   {(t_stack - t_start)*1000:.2f} ms")
+            print(f"  - Local compute: {(t_local - t_stack)*1000:.2f} ms")
+            print(f"  - All-reduce:    {(t_allreduce - t_local)*1000:.2f} ms")
+            print(f"  - Final compute: {(t_end - t_allreduce)*1000:.2f} ms")
+            print(f"  - TOTAL:         {(t_end - t_start)*1000:.2f} ms")
 
         self.per_sample_gradient_norms = norm_sample
         return norm_sample
@@ -225,7 +266,25 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
                 norm_sampler_fn = self.FLASH_NORM_SAMPLERS[module_type]
             else:
                 norm_sampler_fn = self.NORM_SAMPLERS[module_type]
+            
+            # Profiling: Track per-layer norm computation time
+            enable_profiling = os.environ.get('OPACUS_PROFILE_FSDP', '0') == '1'
+            if enable_profiling:
+                sync = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
+                sync()
+                t_start = time.time()
+            
             norm_samples = norm_sampler_fn(module, activations, backprops)
+            
+            if enable_profiling:
+                sync()
+                t_end = time.time()
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                act_shape = activations[0].shape if activations else "N/A"
+                bp_shape = backprops.shape
+                print(f"[FSDP Profile] Rank {rank} Layer {module_type.__name__} norm computation: "
+                      f"{(t_end - t_start)*1000:.2f} ms "
+                      f"(act: {act_shape}, bp: {bp_shape})")
 
             for idx, (_, ns) in enumerate(
                 (item for item in norm_samples.items() if item[0].requires_grad)

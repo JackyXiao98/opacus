@@ -42,6 +42,7 @@ def FSDP2Wrapper(model: nn.Module, **kwargs) -> nn.Module:
         + list(GradSampleModuleFastGradientClippingFSDP.NORM_SAMPLERS.keys())
     )
     mp_policy = kwargs.get("mp_policy", MixedPrecisionPolicy())
+    mesh = kwargs.get("mesh", None)  # Extract mesh parameter if provided
     opacus_high_precision_layers = kwargs.get("opacus_high_precision_layers", [])
     for module in iterate_submodules(model):
         if (type(module) in sampler_classes) or (not has_trainable_params(module)):
@@ -51,11 +52,12 @@ def FSDP2Wrapper(model: nn.Module, **kwargs) -> nn.Module:
                 # For certain layers, higher precision is needed to stablize the training of DP-SGD.
                 fully_shard(
                     module,
+                    mesh=mesh,
                     mp_policy=MixedPrecisionPolicy(
                         param_dtype=torch.get_default_dtype()
                     ),
                 )
             else:
-                fully_shard(module, mp_policy=mp_policy)
-    model = fully_shard(model, mp_policy=mp_policy)
+                fully_shard(module, mesh=mesh, mp_policy=mp_policy)
+    model = fully_shard(model, mesh=mesh, mp_policy=mp_policy)
     return model

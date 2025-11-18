@@ -62,7 +62,7 @@ def run_fsdp_training(args):
         "--max_grad_norm", str(args.max_grad_norm),
         "--seed", str(args.seed),
         "--save_dir", "./results_fsdp",
-        "--world_size", "1",  # Use single GPU FSDP for exact comparison
+        "--world_size", "1",  # Use single-rank FSDP for exact accuracy comparison
     ]
     
     result = subprocess.run(cmd, cwd=os.path.dirname(__file__))

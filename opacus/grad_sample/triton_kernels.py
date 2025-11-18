@@ -796,7 +796,6 @@ def compute_linear_norm_sample_flash(
     ret: Dict[nn.Parameter, torch.Tensor] = {}
     # tile_size = A.shape[1]
     
-    time_start = time.time()
     # print(layer, "activation shape: ", A.shape, "backprop shape: ", backprops.shape)
     # device = "cuda"
     # print("*****current gpu number: ", torch.cuda.current_device(), "*******")
@@ -826,8 +825,6 @@ def compute_linear_norm_sample_flash(
         assert T == T_a, f"Mismatched sequence lengths: backprops T={T} vs activations T={T_a}"
 
         if layer.weight.requires_grad:
-            ret[layer.weight] = torch.ones(B, device=A.device, dtype=dtype_acc)
-
             # Select algorithm and acceleration method
             if use_flash_clipping and is_triton_available():
                 if algorithm == "input_length":
@@ -844,8 +841,6 @@ def compute_linear_norm_sample_flash(
             ret[layer.weight] = torch.sqrt(ga.clamp_min(0.0))
         
         if (layer.bias is not None) and layer.bias.requires_grad:
-            ret[layer.bias] = torch.ones(B, device=A.device, dtype=dtype_acc)+0.1
-
             # Bias gradient norm computation
             if use_flash_clipping and is_triton_available():
                 gg = _sum_over_time_norm_squared_triton(backprops, dtype_acc=dtype_acc)
@@ -855,7 +850,6 @@ def compute_linear_norm_sample_flash(
 
     else:
         raise ValueError(f"Unsupported backprops dim: {backprops.dim()}, expected 2 or 3")
-    time_end = time.time()
-    print(layer, "@@@@@ time cost: ", time_end - time_start)
+    
     return ret
 

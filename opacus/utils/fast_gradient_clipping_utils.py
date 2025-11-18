@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import torch
 import time
 from opacus.grad_sample.grad_sample_module_fast_gradient_clipping import (
@@ -179,6 +180,12 @@ class DPTensorFastGradientClipping:
           * Without FSDP: Standard two-pass ghost clipping
         - If enable_fastdp_bookkeeping=True: Single pass with manual gradient computation
         """
+        enable_profiling = os.environ.get('OPACUS_PROFILE_FSDP', '0') == '1'
+        sync = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
+        
+        if enable_profiling:
+            sync()
+            t_backward_start = time.time()
 
         if self.loss_reduction == "mean":
             reduced_loss = torch.mean(self.loss_per_sample, dim=0)
@@ -195,40 +202,49 @@ class DPTensorFastGradientClipping:
         if use_bookkeeping:
             # FastDP Bookkeeping (BK) mode: Single backward pass
             # No need to retain graph since we cache intermediate values
-            sync = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
-            sync()
-            t0 = time.perf_counter()
+            if enable_profiling:
+                sync()
+                t_bw1_start = time.time()
+            
             reduced_loss.backward()
-            sync()
-            t1 = time.perf_counter()
-            print(f"[BK] backward: {(t1 - t0) * 1000:.3f} ms")
             
+            if enable_profiling:
+                sync()
+                t_bw1_end = time.time()
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                print(f"[FSDP Profile] Rank {rank} First backward (bookkeeping): {(t_bw1_end - t_bw1_start)*1000:.2f} ms")
+
             # Compute clipping coefficients from per-sample gradient norms
-            sync()
-            t2 = time.perf_counter()
-            coeff = self.module.get_clipping_coef()
-            sync()
-            t3 = time.perf_counter()
-            print(f"[BK] get_clipping_coef: {(t3 - t2) * 1000:.3f} ms")
-            print("######## current device: ", torch.cuda.current_device(), "#########")
-            print("coeff: ", coeff)            
-            # Zero out any gradients from the first backward (these are non-private)
-            sync()
-            t4 = time.perf_counter()
-            self.optimizer.zero_grad()
-            sync()
-            t5 = time.perf_counter()
-            print(f"[BK] zero_grad: {(t5 - t4) * 1000:.3f} ms")
+            if enable_profiling:
+                sync()
+                t_coeff_start = time.time()
             
+            coeff = self.module.get_clipping_coef()
+            
+            if enable_profiling:
+                sync()
+                t_coeff_end = time.time()
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                print(f"[FSDP Profile] Rank {rank} Get clipping coef: {(t_coeff_end - t_coeff_start)*1000:.2f} ms")
+    
+            # Zero out any gradients from the first backward (these are non-private)
+            self.optimizer.zero_grad()
+
             # Manually populate clipped gradients using cached activations and backprops
             # This replaces the second backward pass
-            sync()
-            t6 = time.perf_counter()
-            self.module.populate_clipped_gradients(coeff)
-            sync()
-            t7 = time.perf_counter()
-            print(f"[BK] populate_clipped_gradients: {(t7 - t6) * 1000:.3f} ms")
+            if enable_profiling:
+                sync()
+                t_populate_start = time.time()
             
+            self.module.populate_clipped_gradients(coeff)
+            
+            if enable_profiling:
+                sync()
+                t_populate_end = time.time()
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                print(f"[FSDP Profile] Rank {rank} Populate gradients: {(t_populate_end - t_populate_start)*1000:.2f} ms")
+                print(f"[FSDP Profile] Rank {rank} TOTAL backward (bookkeeping): {(t_populate_end - t_backward_start)*1000:.2f} ms")
+
         else:
             # Two-pass ghost clipping with optional FSDP optimization
             is_fsdp = _is_fsdp_model(self.module)
@@ -240,12 +256,7 @@ class DPTensorFastGradientClipping:
             if is_fsdp:
                 # FSDP-optimized norm pass: register hooks to prevent gradient storage
                 # All parameters keep requires_grad=True for full backward flow
-                sync()
-                t0 = time.perf_counter()
                 hook_handles = _register_grad_blocking_hooks(self.module)
-                sync()
-                t1 = time.perf_counter()
-                print(f"[Ghost] register_hooks: {(t1 - t0) * 1000:.3f} ms")
                 
                 # Get FSDP root module and API version
                 fsdp_root, fsdp_api = _get_fsdp_root_module(self.module)
@@ -264,8 +275,10 @@ class DPTensorFastGradientClipping:
             # For FSDP1: Use no_sync() context to prevent gradient synchronization
             # For FSDP2: Already disabled sync with set_requires_gradient_sync(False, False)
             # Hooks prevent param.grad creation, avoiding communication
-            sync()
-            t2 = time.perf_counter()
+            
+            if enable_profiling:
+                sync()
+                t_bw1_start = time.time()
             
             if is_fsdp and fsdp_root is not None and fsdp_api == 'fsdp1':
                 # FSDP1: Use context manager
@@ -276,72 +289,59 @@ class DPTensorFastGradientClipping:
                 # For FSDP2, sync is already disabled via set_requires_gradient_sync
                 reduced_loss.backward(retain_graph=True)
             
-            sync()
-            t3 = time.perf_counter()
-            print(f"[Ghost] first_backward: {(t3 - t2) * 1000:.3f} ms")
-            
+            if enable_profiling:
+                sync()
+                t_bw1_end = time.time()
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                print(f"[FSDP Profile] Rank {rank} First backward (norm pass): {(t_bw1_end - t_bw1_start)*1000:.2f} ms")
+
             # Re-enable gradient synchronization for FSDP2 before second backward
             if is_fsdp and fsdp_root is not None and fsdp_api == 'fsdp2':
-                sync()
-                t_resync_start = time.perf_counter()
                 fsdp_root.set_requires_gradient_sync(True)
-                sync()
-                t_resync_end = time.perf_counter()
-                print(f"[Ghost] re-enable_sync: {(t_resync_end - t_resync_start) * 1000:.3f} ms")
-            
+
             if is_fsdp:
                 # Remove hooks after norm pass
-                sync()
-                t4 = time.perf_counter()
                 _remove_grad_blocking_hooks(hook_handles)
-                sync()
-                t5 = time.perf_counter()
-                print(f"[Ghost] remove_hooks: {(t5 - t4) * 1000:.3f} ms")
-            
+
             # Zero out any gradients (should be none if FSDP, but safe to call)
-            sync()
-            t6 = time.perf_counter()
             self.optimizer.zero_grad()
-            sync()
-            t7 = time.perf_counter()
-            print(f"[Ghost] zero_grad: {(t7 - t6) * 1000:.3f} ms")
             
             # Compute clipping coefficients from per-sample norms
-            sync()
-            t8 = time.perf_counter()
-            coeff = self.module.get_clipping_coef()
-            sync()
-            t9 = time.perf_counter()
-            print(f"[Ghost] get_clipping_coef: {(t9 - t8) * 1000:.3f} ms")
+            if enable_profiling:
+                sync()
+                t_coeff_start = time.time()
             
+            coeff = self.module.get_clipping_coef()
+            
+            if enable_profiling:
+                sync()
+                t_coeff_end = time.time()
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                print(f"[FSDP Profile] Rank {rank} Get clipping coef (includes get_norm_sample): {(t_coeff_end - t_coeff_start)*1000:.2f} ms")
+
             # Second backward: compute actual parameter gradients with clipping
-            t10 = time.perf_counter()
             second_loss_per_sample = (
                 coeff.to(self.loss_per_sample.device) * self.loss_per_sample
             )
             second_loss = torch.sum(second_loss_per_sample)
-            t11 = time.perf_counter()
-            print(f"[Ghost] compose_second_loss: {(t11 - t10) * 1000:.3f} ms")
-            
+
             # Disable hooks to avoid recomputing norms
-            sync()
-            t12 = time.perf_counter()
             self.module.disable_hooks()
-            sync()
-            t13 = time.perf_counter()
-            print(f"[Ghost] disable_hooks: {(t13 - t12) * 1000:.3f} ms")
-            sync()
-            t14 = time.perf_counter()
+            
+            if enable_profiling:
+                sync()
+                t_bw2_start = time.time()
+            
             second_loss.backward()
-            sync()
-            t15 = time.perf_counter()
-            print(f"[Ghost] second_backward: {(t15 - t14) * 1000:.3f} ms")
-            sync()
-            t16 = time.perf_counter()
+            
+            if enable_profiling:
+                sync()
+                t_bw2_end = time.time()
+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                print(f"[FSDP Profile] Rank {rank} Second backward (grad pass): {(t_bw2_end - t_bw2_start)*1000:.2f} ms")
+                print(f"[FSDP Profile] Rank {rank} TOTAL backward (2-pass): {(t_bw2_end - t_backward_start)*1000:.2f} ms")
+            
             self.module.enable_hooks()
-            sync()
-            t17 = time.perf_counter()
-            print(f"[Ghost] enable_hooks: {(t17 - t16) * 1000:.3f} ms")
 
 
 class DPLossFastGradientClipping:

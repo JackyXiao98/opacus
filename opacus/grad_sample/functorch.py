@@ -75,18 +75,36 @@ def prepare_layer(layer, batch_first=True):
     flayer, _ = make_functional(layer)
 
     def compute_loss_stateless_model(params, activations, backprops):
-        if batch_first or type(layer) is RNNLinear:
-            batched_activations = activations.unsqueeze(0)
-            batched_backprops = backprops.unsqueeze(0)
+        # Handle both single tensor and tuple of tensors for activations
+        if isinstance(activations, (tuple, list)):
+            # Multiple inputs: expand batch dimension for each
+            if batch_first or type(layer) is RNNLinear:
+                batched_activations = tuple(act.unsqueeze(0) for act in activations)
+                batched_backprops = backprops.unsqueeze(0)
+            else:
+                # If batch_first is False, the batch dimension is the second dimension
+                batched_activations = tuple(act.unsqueeze(1) for act in activations)
+                batched_backprops = backprops.unsqueeze(1)
+            
+            # mixed precision logic - check first activation
+            first_activation = activations[0]
+            is_mixed = first_activation.dtype != params[0].dtype
+            mixed_lowest_dtype = first_activation.dtype
+            device_type = first_activation.device.type
         else:
-            # If batch_first is False, the batch dimension is the second dimension
-            batched_activations = activations.unsqueeze(1)
-            batched_backprops = backprops.unsqueeze(1)
+            # Single input: original behavior
+            if batch_first or type(layer) is RNNLinear:
+                batched_activations = activations.unsqueeze(0)
+                batched_backprops = backprops.unsqueeze(0)
+            else:
+                # If batch_first is False, the batch dimension is the second dimension
+                batched_activations = activations.unsqueeze(1)
+                batched_backprops = backprops.unsqueeze(1)
 
-        # mixed precision logic
-        is_mixed = activations.dtype != params[0].dtype
-        mixed_lowest_dtype = activations.dtype
-        device_type = activations.device.type
+            # mixed precision logic
+            is_mixed = activations.dtype != params[0].dtype
+            mixed_lowest_dtype = activations.dtype
+            device_type = activations.device.type
 
         # use amp context if user is using mixed_precision, else proceed as usual
         with (
@@ -94,7 +112,11 @@ def prepare_layer(layer, batch_first=True):
             if is_mixed
             else nullcontext()
         ):
-            output = flayer(params, batched_activations)
+            # Call flayer with unpacked activations if it's a tuple
+            if isinstance(batched_activations, tuple):
+                output = flayer(params, *batched_activations)
+            else:
+                output = flayer(params, batched_activations)
             loss = (output * batched_backprops).sum()
         return loss
 
@@ -102,7 +124,9 @@ def prepare_layer(layer, batch_first=True):
     # Note that the vmap is done on the first dimension, regardless of batch_first
     # This is because the activations and backprops given by the GradSampleModule
     # are always batch_first=True
-    layer.ft_compute_sample_grad = vmap(ft_compute_grad, in_dims=(None, 0, 0))
+    # For multi-input models, we need to vmap over each activation tensor
+    # Use randomness='different' to support models with dropout/random operations
+    layer.ft_compute_sample_grad = vmap(ft_compute_grad, in_dims=(None, 0, 0), randomness='different')
 
 
 def ft_compute_per_sample_gradient(layer, activations, backprops):
@@ -110,17 +134,30 @@ def ft_compute_per_sample_gradient(layer, activations, backprops):
     Compute the per-sample gradient of the layer.
     Args:
         layer: the layer on which to compute the gradient
-        activations: the input to the layer
+        activations: the input to the layer (can be a single tensor or tuple of tensors)
         backprops: the  gradient of the loss w.r.t. outputs of the layer
     """
     parameters = list(layer.parameters(recurse=True))
     if not hasattr(layer, "ft_compute_sample_grad"):
         prepare_layer(layer)
 
-    activations = activations[0]
-    if activations.dtype != backprops.dtype and activations.is_floating_point():
-        activations = activations.to(backprops.dtype)
-    per_sample_grads = layer.ft_compute_sample_grad(parameters, activations, backprops)
+    # Handle both single activation and multiple activations
+    if len(activations) == 1:
+        # Single input case (backward compatible)
+        activations_data = activations[0]
+        if activations_data.dtype != backprops.dtype and activations_data.is_floating_point():
+            activations_data = activations_data.to(backprops.dtype)
+    else:
+        # Multiple inputs case - convert types if needed
+        activations_list = []
+        for act in activations:
+            if act.dtype != backprops.dtype and act.is_floating_point():
+                activations_list.append(act.to(backprops.dtype))
+            else:
+                activations_list.append(act)
+        activations_data = tuple(activations_list)
+    
+    per_sample_grads = layer.ft_compute_sample_grad(parameters, activations_data, backprops)
 
     ret = {}
     for i_p, p in enumerate(parameters):

@@ -214,13 +214,33 @@ def run_dpsgd_experiment(config, device, use_flash_clipping=False, enable_bookke
         loss_reduction="mean",
     )
 
-    # Create loss wrapper - we'll use MSE loss directly in the model
-    # but still need DPLoss for proper gradient handling
-    criterion = nn.MSELoss(reduction="mean")
+    # Create custom criterion that handles multi-dimensional DiT outputs
+    # DiT outputs (B, C, H, W) but flash clipping needs loss_per_sample shape (B,)
+    def dit_criterion(predicted, target):
+        """
+        Custom criterion for DiT that flattens outputs before computing loss.
+        Args:
+            predicted: (B, C, H, W) - predicted noise
+            target: (B, C, H, W) - target noise
+        Returns:
+            loss_per_sample: (B,) - per-sample MSE loss
+        """
+        batch_size = predicted.shape[0]
+        # Flatten spatial dimensions: (B, C, H, W) -> (B, C*H*W)
+        pred_flat = predicted.reshape(batch_size, -1)
+        target_flat = target.reshape(batch_size, -1)
+        # Compute per-sample MSE and reduce over features
+        loss_per_element = nn.functional.mse_loss(pred_flat, target_flat, reduction='none')
+        return loss_per_element.mean(dim=1)  # (B,)
+    
+    # Set reduction attribute (required by DPLossFastGradientClipping)
+    dit_criterion.reduction = "mean"
+    
+    # Wrap criterion with DP loss
     dp_loss = DPLossFastGradientClipping(
         model,
         optimizer,
-        criterion,
+        dit_criterion,
         loss_reduction="mean",
     )
     
@@ -242,19 +262,14 @@ def run_dpsgd_experiment(config, device, use_flash_clipping=False, enable_bookke
         if predicted_noise.shape[1] > config["in_channels"]:
             predicted_noise = predicted_noise[:, :config["in_channels"], :, :]
         
-        # Flatten tensors for DPLoss: (B, C, H, W) -> (B, C*H*W)
-        batch_size = predicted_noise.shape[0]
-        pred_flat = predicted_noise.view(batch_size, -1)
-        target_flat = target_noise.view(batch_size, -1)
-        
-        # Compute loss using DPLoss with proper shape
-        loss = dp_loss(pred_flat, target_flat, shape=(batch_size, pred_flat.shape[1]))
+        # Compute loss using DPLoss (criterion handles flattening internally)
+        loss = dp_loss(predicted_noise, target_noise)
         
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
         
-        del loss, images, timesteps, labels, target_noise, predicted_noise, pred_flat, target_flat
+        del loss, images, timesteps, labels, target_noise, predicted_noise
         if device == "cuda":
             torch.cuda.empty_cache()
     
@@ -292,13 +307,8 @@ def run_dpsgd_experiment(config, device, use_flash_clipping=False, enable_bookke
         if predicted_noise.shape[1] > config["in_channels"]:
             predicted_noise = predicted_noise[:, :config["in_channels"], :, :]
         
-        # Flatten tensors for DPLoss: (B, C, H, W) -> (B, C*H*W)
-        batch_size = predicted_noise.shape[0]
-        pred_flat = predicted_noise.view(batch_size, -1)
-        target_flat = target_noise.view(batch_size, -1)
-        
-        # Compute loss using DPLoss with proper shape
-        loss = dp_loss(pred_flat, target_flat, shape=(batch_size, pred_flat.shape[1]))
+        # Compute loss using DPLoss (criterion handles flattening internally)
+        loss = dp_loss(predicted_noise, target_noise)
         
         profiler.take_snapshot(f"5_iter{i}_after_forward")
         
@@ -318,7 +328,7 @@ def run_dpsgd_experiment(config, device, use_flash_clipping=False, enable_bookke
         
         profiler.take_snapshot(f"7_iter{i}_after_step")
         
-        del loss, images, timesteps, labels, target_noise, predicted_noise, pred_flat, target_flat
+        del loss, images, timesteps, labels, target_noise, predicted_noise
         if device == "cuda":
             torch.cuda.empty_cache()
     

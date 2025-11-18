@@ -272,7 +272,7 @@ class GradSampleModule(AbstractGradSampleModule):
     def capture_activations_hook(
         self,
         module: nn.Module,
-        forward_input: List[torch.Tensor],
+        forward_input: Tuple[torch.Tensor, ...],
         _forward_output: torch.Tensor,
     ):
         if (
@@ -287,6 +287,8 @@ class GradSampleModule(AbstractGradSampleModule):
 
         if not hasattr(module, "activations"):
             module.activations = []
+        # Store all forward inputs (detached) to support multi-argument forward()
+        # This maintains backward compatibility: single-input models still work
         module.activations.append([t.detach() for t in forward_input])  # pyre-ignore
 
         for _, p in trainable_parameters(module):
