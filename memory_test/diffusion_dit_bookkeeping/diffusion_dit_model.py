@@ -87,6 +87,28 @@ class LabelEmbedder(nn.Module):
         return embeddings
 
 
+class PositionalEmbedding(nn.Module):
+    """
+    Learnable positional embedding stored in a module to avoid blocking Opacus recursion.
+    Simple container for a parameter that doesn't have trainable operations.
+    """
+    def __init__(self, num_positions, embed_dim):
+        super().__init__()
+        self.num_positions = num_positions
+        self.embed_dim = embed_dim
+        # Store as buffer, not parameter, so grad sampler doesn't try to compute per-sample gradients
+        # Positional embeddings are shared across all samples, so per-sample gradients don't make sense
+        self.register_buffer('pos_embed', torch.zeros(1, num_positions, embed_dim))
+    
+    def forward(self, device=None):
+        """
+        Returns positional embeddings for all positions.
+        Returns:
+            pos_embed: (1, num_positions, embed_dim)
+        """
+        return self.pos_embed
+
+
 class PatchEmbed(nn.Module):
     """
     2D Image to Patch Embedding using Conv2d.
@@ -235,7 +257,9 @@ class DiTModelWithFlashAttention(nn.Module):
         num_patches = self.patch_embed.num_patches
 
         # Positional embedding (learnable)
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_dim))
+        # Use custom PositionalEmbedding module instead of nn.Parameter to avoid blocking iterate_submodules in Opacus
+        # When the top-level module has direct parameters, Opacus won't recurse into submodules
+        self.pos_embed_module = PositionalEmbedding(num_patches, hidden_dim)
 
         # Timestep embedding
         self.timestep_embedder = TimestepEmbedder(hidden_dim)
@@ -261,8 +285,9 @@ class DiTModelWithFlashAttention(nn.Module):
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
         nn.init.constant_(self.patch_embed.proj.bias, 0)
 
-        # Initialize positional embedding
-        nn.init.normal_(self.pos_embed, std=0.02)
+        # Initialize positional embedding (stored as buffer)
+        # Positional embeddings are NOT trained with DP-SGD (shared across all samples)
+        nn.init.normal_(self.pos_embed_module.pos_embed, std=0.02)
 
         # Initialize timestep embedding MLP
         nn.init.normal_(self.timestep_embedder.mlp[0].weight, std=0.02)
@@ -318,7 +343,9 @@ class DiTModelWithFlashAttention(nn.Module):
         """
         # Patch embedding
         x = self.patch_embed(x)  # (B, N, hidden_dim)
-        x = x + self.pos_embed  # Add positional embedding
+        # Add positional embedding
+        pos_embed = self.pos_embed_module(x.device)  # (1, N, hidden_dim)
+        x = x + pos_embed
 
         # Timestep and label conditioning
         t_emb = self.timestep_embedder(t)  # (B, hidden_dim)

@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .conv import compute_conv_grad_sample  # noqa
+from .conv import compute_conv_grad_sample, compute_conv_norm_sample, compute_conv_norm_sample_flash_wrapper  # noqa
 from .dp_multihead_attention import compute_sequence_bias_grad_sample  # noqa
 from .dp_rnn import compute_rnn_linear_grad_sample  # noqa
 from .embedding import compute_embedding_grad_sample  # noqa

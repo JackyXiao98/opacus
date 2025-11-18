@@ -11,16 +11,16 @@ echo "========================================================================"
 echo ""
 
 # Configuration - DiT-L with 1024 tokens
-IMAGE_SIZE=256
+IMAGE_SIZE=1024
 PATCH_SIZE=8
 IN_CHANNELS=3
 NUM_CLASSES=1000
 HIDDEN_DIM=1024
-NUM_LAYERS=24
-NUM_HEADS=16
-BATCH_SIZE=2
-NUM_ITER=3
-WARMUP_ITER=0
+NUM_LAYERS=6
+NUM_HEADS=4
+BATCH_SIZE=1
+NUM_ITER=1
+WARMUP_ITER=1
 
 # Compute number of tokens
 NUM_TOKENS=$(( (IMAGE_SIZE / PATCH_SIZE) * (IMAGE_SIZE / PATCH_SIZE) ))

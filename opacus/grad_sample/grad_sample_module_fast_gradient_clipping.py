@@ -384,14 +384,9 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
             # Apply per-sample clipping coefficients to backprops
             # backprops shape: [batch_size, ...], clipping_coef shape: [batch_size]
             # We need to reshape clipping_coef to broadcast properly
-            if backprops.dim() == 2:
-                # [B, d] -> multiply by [B, 1]
-                clipped_backprops = backprops * clipping_coef.view(-1, 1).to(backprops.device)
-            elif backprops.dim() == 3:
-                # [B, T, d] -> multiply by [B, 1, 1]
-                clipped_backprops = backprops * clipping_coef.view(-1, 1, 1).to(backprops.device)
-            else:
-                raise ValueError(f"Unsupported backprops dimension: {backprops.dim()}")
+            # Create shape [B, 1, 1, ...] with appropriate number of 1s
+            coef_shape = [backprops.shape[0]] + [1] * (backprops.dim() - 1)
+            clipped_backprops = backprops * clipping_coef.view(*coef_shape).to(backprops.device)
             
             # Now compute gradients using the clipped backprops
             # This is equivalent to the second backward pass but done manually
@@ -469,6 +464,34 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
                     if param.requires_grad:
                         coef_shape = [gs.shape[0]] + [1] * (gs.dim() - 1)
                         clipped_gs = gs * clipping_coef.view(*coef_shape).to(gs.device)
+                        grad = clipped_gs.sum(dim=0)
+                        
+                        if param.grad is None:
+                            param.grad = grad
+                        else:
+                            param.grad += grad
+            
+            elif type(module) in [nn.Conv1d, nn.Conv2d, nn.Conv3d]:
+                # For Conv layers, use the registered grad_sampler with raw activations
+                # Note: activations are NOT yet unfolded in the cache (stored raw)
+                if not self.force_functorch and type(module) in self.GRAD_SAMPLERS:
+                    grad_sampler_fn = self.GRAD_SAMPLERS[type(module)]
+                else:
+                    from opacus.grad_sample.functorch import ft_compute_per_sample_gradient
+                    grad_sampler_fn = ft_compute_per_sample_gradient
+                
+                # Compute per-sample gradients using raw activations and backprops
+                grad_samples = grad_sampler_fn(module, activations, backprops)
+                
+                # Apply clipping coefficients and sum
+                for param, gs in grad_samples.items():
+                    if param.requires_grad:
+                        # gs shape: [B, ...] for per-sample gradients
+                        # Apply clipping coefficient: [B] -> [B, 1, 1, ...]
+                        coef_shape = [gs.shape[0]] + [1] * (gs.dim() - 1)
+                        clipped_gs = gs * clipping_coef.view(*coef_shape).to(gs.device)
+                        
+                        # Sum over batch dimension
                         grad = clipped_gs.sum(dim=0)
                         
                         if param.grad is None:

@@ -22,7 +22,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from opacus.utils.tensor_utils import unfold2d, unfold3d
 
-from .utils import register_grad_sampler
+from .utils import register_grad_sampler, register_norm_sampler
+from .triton_kernels import is_triton_available
+import logging
+
+logger = logging.getLogger(__name__)
+logging.disabled = False
 
 
 @register_grad_sampler([nn.Conv1d, nn.Conv2d, nn.Conv3d])
@@ -190,3 +195,180 @@ def convolution2d_backward_as_a_convolution(
         ret[layer.bias] = torch.sum(backprops, dim=[-1, -2])
 
     return ret
+
+
+@register_norm_sampler([nn.Conv1d, nn.Conv2d, nn.Conv3d])
+def compute_conv_norm_sample(
+    layer: Union[nn.Conv1d, nn.Conv2d, nn.Conv3d],
+    activations: List[torch.Tensor],
+    backprops: torch.Tensor,
+) -> Dict[nn.Parameter, torch.Tensor]:
+    """
+    Computes per sample gradient norms for convolutional layers.
+    
+    This function efficiently computes the norm of per-sample gradients without
+    materializing the full gradient tensors, following the formula:
+    ||grad|| = sqrt(||backprops||^2 * ||activations||^2)
+    
+    Args:
+        layer: Convolutional layer (Conv1d, Conv2d, or Conv3d)
+        activations: Activations from forward pass
+        backprops: Backpropagated gradients
+        
+    Returns:
+        Dictionary mapping parameters to their gradient norms
+    """
+    activations = activations[0]
+    activations = activations.to(backprops.dtype)
+    
+    n = activations.shape[0]
+    if n == 0:
+        # Empty batch
+        ret = {}
+        if layer.weight.requires_grad:
+            ret[layer.weight] = torch.zeros(0, device=backprops.device, dtype=backprops.dtype)
+        if layer.bias is not None and layer.bias.requires_grad:
+            ret[layer.bias] = torch.zeros(0, device=backprops.device, dtype=backprops.dtype)
+        return ret
+    
+    # Determine layer type (handle FSDP wrapper case)
+    layer_type = (
+        layer.__class__.__bases__[1]
+        if isinstance(layer, torch.distributed.fsdp.FSDPModule)
+        else type(layer)
+    )
+    
+    # Unfold activations depending on the Conv layer type
+    # This transforms spatial convolution into matrix multiplication
+    if layer_type is nn.Conv2d:
+        activations = unfold2d(
+            activations,
+            kernel_size=layer.kernel_size,
+            padding=layer.padding,
+            stride=layer.stride,
+            dilation=layer.dilation,
+        )
+    elif layer_type is nn.Conv1d:
+        activations = activations.unsqueeze(-2)  # add the H dimension
+        # set arguments to tuples with appropriate second element
+        if layer.padding == "same":
+            total_pad = layer.dilation[0] * (layer.kernel_size[0] - 1)
+            left_pad = math.floor(total_pad / 2)
+            right_pad = total_pad - left_pad
+        elif layer.padding == "valid":
+            left_pad, right_pad = 0, 0
+        else:
+            left_pad, right_pad = layer.padding[0], layer.padding[0]
+        activations = F.pad(activations, (left_pad, right_pad))
+        activations = torch.nn.functional.unfold(
+            activations,
+            kernel_size=(1, layer.kernel_size[0]),
+            stride=(1, layer.stride[0]),
+            dilation=(1, layer.dilation[0]),
+        )
+    elif layer_type is nn.Conv3d:
+        activations = unfold3d(
+            activations,
+            kernel_size=layer.kernel_size,
+            padding=layer.padding,
+            stride=layer.stride,
+            dilation=layer.dilation,
+        )
+    
+    # Reshape backprops: (batch, out_channels, *spatial) -> (batch, out_channels, spatial_flat)
+    backprops = backprops.reshape(n, -1, activations.shape[-1])
+    
+    ret = {}
+    
+    if layer.weight.requires_grad:
+        # activations: (n, p, q) where p=(in_channels/groups)*kernel_size, q=output_spatial
+        # backprops: (n, o, q) where o=out_channels
+        
+        # For grouped convolutions, compute norm per group and sum
+        if layer.groups > 1:
+            out_channels_per_group = layer.out_channels // layer.groups
+            in_channels_per_group = layer.in_channels // layer.groups
+            kernel_size_flat = int(np.prod(layer.kernel_size))
+            p_per_group = in_channels_per_group * kernel_size_flat
+            
+            norm_sqr = torch.zeros(n, device=backprops.device, dtype=backprops.dtype)
+            
+            for g in range(layer.groups):
+                # Extract backprops and activations for this group
+                o_start = g * out_channels_per_group
+                o_end = (g + 1) * out_channels_per_group
+                p_start = g * p_per_group
+                p_end = (g + 1) * p_per_group
+                
+                backprops_g = backprops[:, o_start:o_end, :]  # (n, out_per_group, q)
+                activations_g = activations[:, p_start:p_end, :]  # (n, p_per_group, q)
+                
+                # Compute ggT and aaT for this group
+                ggT_g = torch.einsum("noq,nom->nqm", backprops_g, backprops_g)
+                aaT_g = torch.einsum("npq,npm->nqm", activations_g, activations_g)
+                
+                # Add this group's contribution to the total norm squared
+                norm_sqr += torch.einsum("nqm,nqm->n", ggT_g, aaT_g)
+            
+            ret[layer.weight] = torch.sqrt(norm_sqr.clamp(min=0))
+        else:
+            # Non-grouped case (groups=1)
+            # The norm squared computation for conv follows:
+            # ||grad||^2 = sum_{o,c,k} (sum_q backprop[o,q] * activation[c*K+k,q])^2
+            #            = tr(ggT @ aaT)
+            # where:
+            #   ggT[q1,q2] = sum_o backprop[o,q1] * backprop[o,q2]  (spatial correlation from backprops)
+            #   aaT[q1,q2] = sum_{c,k} activation[c*K+k,q1] * activation[c*K+k,q2]  (spatial correlation from activations)
+            
+            # Compute ggT: sum over output channels -> (n, q, q)
+            ggT = torch.einsum("noq,nom->nqm", backprops, backprops)
+            
+            # Compute aaT: sum over input channels and kernel positions -> (n, q, q)
+            aaT = torch.einsum("npq,npm->nqm", activations, activations)
+            
+            # Compute norm squared: tr(ggT @ aaT) = sum_{q1,q2} ggT[q1,q2] * aaT[q1,q2]
+            norm_sqr = torch.einsum("nqm,nqm->n", ggT, aaT).clamp(min=0)
+            
+            ret[layer.weight] = torch.sqrt(norm_sqr)
+    
+    if layer.bias is not None and layer.bias.requires_grad:
+        # Bias gradient: grad[o] = sum_q backprops[o, q]
+        # Norm squared: ||grad||^2 = sum_o (sum_q backprops[o, q])^2
+        # First sum over spatial dimension (q)
+        bias_grad = backprops.sum(dim=2)  # (n, o)
+        # Then compute norm over output channels
+        bias_norm_sqr = torch.einsum("no,no->n", bias_grad, bias_grad)
+        ret[layer.bias] = torch.sqrt(bias_norm_sqr.clamp(min=0))
+    
+    return ret
+
+
+@register_norm_sampler([nn.Conv2d], "flash")
+def compute_conv_norm_sample_flash_wrapper(
+    layer: nn.Conv2d,
+    activations: List[torch.Tensor],
+    backprops: torch.Tensor,
+) -> Dict[nn.Parameter, torch.Tensor]:
+    """
+    Flash Clipping accelerated version of per sample gradient norms for Conv2d layer.
+    
+    Currently falls back to standard implementation. Future optimization could include
+    Triton kernels for the unfolding and norm computation operations.
+    
+    Args:
+        layer: Conv2d layer
+        activations: Activations from forward pass
+        backprops: Backpropagated gradients
+        
+    Returns:
+        Dictionary mapping parameters to their gradient norms
+    """
+    if not is_triton_available():
+        logger.warning(
+            "Triton is not available for Flash Clipping. Falling back to standard norm computation. "
+            "Install triton for potential future performance improvements: pip install triton"
+        )
+    
+    # For now, fallback to standard implementation
+    # Future work: Implement optimized Triton kernel for Conv2d norm computation
+    return compute_conv_norm_sample(layer, activations, backprops)
