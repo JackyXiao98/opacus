@@ -32,6 +32,7 @@ import torch.nn as nn
 from opacus.grad_sample.conv import (
     compute_conv_grad_sample,
     compute_conv_norm_sample,
+    compute_conv_norm_sample_flash,
     compute_conv_norm_sample_flash_wrapper,
 )
 
@@ -392,6 +393,277 @@ class ConvNormSampleTest(unittest.TestCase):
         for param, norm in norms_large.items():
             self.assertTrue(torch.all(norm >= 0), f"Negative norm found for {param}")
             self.assertTrue(torch.all(torch.isfinite(norm)), f"Non-finite norm found for {param}")
+
+
+class FlashClippingAccuracyTest(unittest.TestCase):
+    """
+    Test flash clipping accuracy against ghost clipping and ground truth.
+    
+    Flash clipping should produce identical results to ghost clipping,
+    just more efficiently by avoiding materialization of large (spatial, spatial) matrices.
+    """
+    
+    def _compute_expected_norm_from_grad_sample(
+        self,
+        layer: Union[nn.Conv1d, nn.Conv2d, nn.Conv3d],
+        activations: torch.Tensor,
+        backprops: torch.Tensor,
+    ) -> dict:
+        """Compute ground truth norms from full per-sample gradients."""
+        grad_samples = compute_conv_grad_sample(layer, [activations], backprops)
+        
+        norms = {}
+        for param, gs in grad_samples.items():
+            gs_flat = gs.reshape(gs.shape[0], -1)
+            norms[param] = torch.norm(gs_flat, dim=1, p=2)
+        
+        return norms
+    
+    def test_flash_vs_ghost_clipping_equivalence(self):
+        """Test that flash clipping produces same results as ghost clipping."""
+        configs = [
+            # (in_channels, out_channels, kernel_size, stride, padding, groups, bias)
+            (3, 16, 3, 1, 1, 1, True),    # Basic
+            (3, 16, 3, 1, 1, 1, False),   # No bias
+            (3, 16, 5, 1, 2, 1, True),    # Larger kernel
+            (3, 16, 3, 2, 1, 1, True),    # Stride 2
+            (3, 16, 3, 1, 0, 1, True),    # No padding
+            (4, 8, 3, 1, 1, 2, True),     # Grouped (groups=2)
+            (8, 8, 3, 1, 1, 8, True),     # Depthwise
+        ]
+        
+        for in_ch, out_ch, k_size, stride, padding, groups, bias in configs:
+            with self.subTest(
+                in_ch=in_ch, out_ch=out_ch, k=k_size, 
+                stride=stride, pad=padding, groups=groups, bias=bias
+            ):
+                layer = nn.Conv2d(
+                    in_channels=in_ch,
+                    out_channels=out_ch,
+                    kernel_size=k_size,
+                    stride=stride,
+                    padding=padding,
+                    groups=groups,
+                    bias=bias,
+                )
+                layer.eval()
+                
+                # Create test data
+                input_shape = (4, in_ch, 16, 16)
+                activations = torch.randn(input_shape)
+                output = layer(activations)
+                backprops = torch.randn_like(output)
+                
+                # Compute with ghost clipping
+                ghost_norms = compute_conv_norm_sample(layer, [activations], backprops)
+                
+                # Compute with flash clipping
+                flash_norms = compute_conv_norm_sample_flash(layer, [activations], backprops)
+                
+                # Compare
+                for param in ghost_norms.keys():
+                    torch.testing.assert_close(
+                        flash_norms[param],
+                        ghost_norms[param],
+                        rtol=1e-4,
+                        atol=1e-5,
+                        msg=f"Flash and ghost clipping disagree for {param}",
+                    )
+    
+    def test_flash_clipping_conv2d_various_configs(self):
+        """Test flash clipping accuracy for Conv2d with various configurations."""
+        configs = [
+            # (in_channels, out_channels, kernel_size, stride, padding, groups, bias)
+            (3, 16, 3, 1, 1, 1, True),    # Basic
+            (3, 16, 3, 1, 1, 1, False),   # No bias
+            (3, 16, 5, 1, 2, 1, True),    # Larger kernel
+            (3, 16, 3, 2, 1, 1, True),    # Stride 2
+            (3, 16, 3, 1, 0, 1, True),    # No padding
+            (4, 8, 3, 1, 1, 2, True),     # Grouped (groups=2)
+            (8, 8, 3, 1, 1, 8, True),     # Depthwise
+        ]
+        
+        for in_ch, out_ch, k_size, stride, padding, groups, bias in configs:
+            with self.subTest(
+                in_ch=in_ch, out_ch=out_ch, k=k_size, 
+                stride=stride, pad=padding, groups=groups, bias=bias
+            ):
+                layer = nn.Conv2d(
+                    in_channels=in_ch,
+                    out_channels=out_ch,
+                    kernel_size=k_size,
+                    stride=stride,
+                    padding=padding,
+                    groups=groups,
+                    bias=bias,
+                )
+                layer.eval()
+                
+                # Create test data
+                input_shape = (4, in_ch, 16, 16)
+                activations = torch.randn(input_shape)
+                output = layer(activations)
+                backprops = torch.randn_like(output)
+                
+                # Compute expected norms from full gradients
+                expected_norms = self._compute_expected_norm_from_grad_sample(
+                    layer, activations, backprops
+                )
+                
+                # Compute with flash clipping
+                flash_norms = compute_conv_norm_sample_flash(layer, [activations], backprops)
+                
+                # Compare
+                for param in expected_norms.keys():
+                    torch.testing.assert_close(
+                        flash_norms[param],
+                        expected_norms[param],
+                        rtol=1e-4,
+                        atol=1e-5,
+                        msg=f"Flash clipping norm mismatch for {param}",
+                    )
+    
+    def test_flash_clipping_conv1d_accuracy(self):
+        """Test flash clipping accuracy for Conv1d."""
+        layer = nn.Conv1d(
+            in_channels=4,
+            out_channels=8,
+            kernel_size=5,
+            stride=2,
+            padding=2,
+            bias=True,
+        )
+        layer.eval()
+        
+        input_shape = (8, 4, 32)  # (batch, channels, length)
+        activations = torch.randn(input_shape)
+        output = layer(activations)
+        backprops = torch.randn_like(output)
+        
+        expected_norms = self._compute_expected_norm_from_grad_sample(
+            layer, activations, backprops
+        )
+        flash_norms = compute_conv_norm_sample(layer, [activations], backprops)
+        
+        for param in expected_norms.keys():
+            torch.testing.assert_close(
+                flash_norms[param],
+                expected_norms[param],
+                rtol=1e-4,
+                atol=1e-5,
+                msg=f"Flash clipping norm mismatch for Conv1d {param}",
+            )
+    
+    def test_flash_clipping_conv3d_accuracy(self):
+        """Test flash clipping accuracy for Conv3d."""
+        layer = nn.Conv3d(
+            in_channels=2,
+            out_channels=4,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=True,
+        )
+        layer.eval()
+        
+        input_shape = (4, 2, 8, 8, 8)  # (batch, channels, D, H, W)
+        activations = torch.randn(input_shape)
+        output = layer(activations)
+        backprops = torch.randn_like(output)
+        
+        expected_norms = self._compute_expected_norm_from_grad_sample(
+            layer, activations, backprops
+        )
+        flash_norms = compute_conv_norm_sample_flash(layer, [activations], backprops)
+        
+        for param in expected_norms.keys():
+            torch.testing.assert_close(
+                flash_norms[param],
+                expected_norms[param],
+                rtol=1e-4,
+                atol=1e-5,
+                msg=f"Flash clipping norm mismatch for Conv3d {param}",
+            )
+    
+    def test_flash_clipping_large_spatial_dimensions(self):
+        """
+        Test flash clipping with large spatial dimensions.
+        
+        This is where flash clipping really shines - avoiding (q, q) matrices
+        where q is the spatial dimension product can save significant memory.
+        For 32x32 output, ghost clipping would create 1024x1024 matrices.
+        """
+        layer = nn.Conv2d(
+            in_channels=3,
+            out_channels=8,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=True,
+        )
+        layer.eval()
+        
+        # Large spatial dimensions
+        input_shape = (4, 3, 32, 32)
+        activations = torch.randn(input_shape)
+        output = layer(activations)
+        backprops = torch.randn_like(output)
+        
+        expected_norms = self._compute_expected_norm_from_grad_sample(
+            layer, activations, backprops
+        )
+        flash_norms = compute_conv_norm_sample_flash(layer, [activations], backprops)
+        
+        for param in expected_norms.keys():
+            torch.testing.assert_close(
+                flash_norms[param],
+                expected_norms[param],
+                rtol=1e-4,
+                atol=1e-5,
+                msg=f"Flash clipping norm mismatch for large spatial dims {param}",
+            )
+    
+    def test_flash_clipping_grouped_conv_accuracy(self):
+        """Test flash clipping with various group configurations."""
+        test_cases = [
+            # (in_channels, out_channels, groups)
+            (4, 8, 2),   # Standard grouped
+            (6, 12, 3),  # 3 groups
+            (8, 8, 4),   # 4 groups
+            (16, 16, 16),  # Depthwise
+        ]
+        
+        for in_ch, out_ch, groups in test_cases:
+            with self.subTest(in_ch=in_ch, out_ch=out_ch, groups=groups):
+                layer = nn.Conv2d(
+                    in_channels=in_ch,
+                    out_channels=out_ch,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    groups=groups,
+                    bias=True,
+                )
+                layer.eval()
+                
+                input_shape = (4, in_ch, 8, 8)
+                activations = torch.randn(input_shape)
+                output = layer(activations)
+                backprops = torch.randn_like(output)
+                
+                expected_norms = self._compute_expected_norm_from_grad_sample(
+                    layer, activations, backprops
+                )
+                flash_norms = compute_conv_norm_sample_flash(layer, [activations], backprops)
+                
+                for param in expected_norms.keys():
+                    torch.testing.assert_close(
+                        flash_norms[param],
+                        expected_norms[param],
+                        rtol=1e-4,
+                        atol=1e-5,
+                        msg=f"Flash clipping norm mismatch for grouped conv {param}",
+                    )
 
 
 if __name__ == "__main__":

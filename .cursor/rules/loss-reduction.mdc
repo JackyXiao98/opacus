@@ -1,0 +1,10 @@
+---
+alwaysApply: true
+---
+When writing test files with opacus, always check the following
+assert (
+    loss_reduction
+    == criterion.reduction
+    == module.loss_reduction
+    == optimizer.loss_reduction
+), "loss_reduction should be the same across GradSampleModule, Optimizer, Criterion, and loss_reduction"

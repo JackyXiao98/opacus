@@ -117,6 +117,12 @@ def prepare_layer(layer, batch_first=True):
                 output = flayer(params, *batched_activations)
             else:
                 output = flayer(params, batched_activations)
+            
+            # Handle tuple outputs (some models return tuples instead of tensors)
+            if isinstance(output, tuple):
+                # Take the first element if it's a tuple
+                output = output[0]
+            
             loss = (output * batched_backprops).sum()
         return loss
 
