@@ -11,13 +11,13 @@ echo "========================================================================"
 echo ""
 
 # Configuration - DiT-L with 1024 tokens
-IMAGE_SIZE=1024
+IMAGE_SIZE=256
 PATCH_SIZE=8
-IN_CHANNELS=3
+IN_CHANNELS=4
 NUM_CLASSES=1000
-HIDDEN_DIM=1024
-NUM_LAYERS=6
-NUM_HEADS=4
+HIDDEN_DIM=1152
+NUM_LAYERS=28
+NUM_HEADS=16
 BATCH_SIZE=1
 NUM_ITER=1
 WARMUP_ITER=1

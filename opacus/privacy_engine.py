@@ -197,7 +197,7 @@ class PrivacyEngine:
 
             return module
         else:
-            if grad_sample_mode in ["ghost", "ghost_fsdp", "flash", "flash_fsdp", "ghost_bk", "flash_fsdp_bk"]:
+            if grad_sample_mode in ["ghost", "ghost_fsdp", "flash", "flash_bk", "flash_fsdp", "ghost_bk", "ghost_fsdp_bk", "flash_fsdp_bk"]:
                 return wrap_model(
                     module,
                     grad_sample_mode=grad_sample_mode,

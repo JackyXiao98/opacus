@@ -13,21 +13,44 @@ import numpy as np
 
 # Display names for modes
 MODE_NAMES = {
+    # Multi-GPU FSDP modes
     "no_dp": "Non-DP\nFSDP2",
-    "ghost_fsdp": "Ghost\nClipping",
-    "flash_fsdp": "Flash\nClipping",
-    "flash_fsdp_bk": "Flash\nClipping\n(BK)",
-    "ghost_bk": "Ghost\nClipping\n(BK)",
+    "ghost_fsdp": "Ghost\nFSDP",
+    "flash_fsdp": "Flash\nFSDP",
+    "flash_fsdp_bk": "Flash\nFSDP\n(BK)",
+    "ghost_fsdp_bk": "Ghost\nFSDP\n(BK)",
+    # Single-GPU modes
+    "no_dp_single": "Non-DP\nSingle",
+    "ghost": "Ghost\nSingle",
+    "flash": "Flash\nSingle",
+    "flash_bk": "Flash\nSingle\n(BK)",
+    "ghost_bk": "Ghost\nSingle\n(BK)",
 }
 
 # Colors for modes
 MODE_COLORS = {
-    "no_dp": "#3498db",      # Blue
-    "ghost_fsdp": "#e74c3c",  # Red
-    "flash_fsdp": "#2ecc71",  # Green
-    "flash_fsdp_bk": "#f39c12",  # Orange
-    "ghost_bk": "#9b59b6",  # Purple
+    # Multi-GPU FSDP modes (darker shades)
+    "no_dp": "#2980b9",           # Dark Blue
+    "ghost_fsdp": "#c0392b",      # Dark Red
+    "flash_fsdp": "#27ae60",      # Dark Green
+    "flash_fsdp_bk": "#d68910",   # Dark Orange
+    "ghost_fsdp_bk": "#8e44ad",   # Dark Purple
+    # Single-GPU modes (lighter shades)
+    "no_dp_single": "#5dade2",    # Light Blue
+    "ghost": "#ec7063",           # Light Red
+    "flash": "#58d68d",           # Light Green
+    "flash_bk": "#f8c471",        # Light Orange
+    "ghost_bk": "#bb8fce",        # Light Purple
 }
+
+# Mode ordering for plots
+MODE_ORDER = [
+    "no_dp", "no_dp_single",
+    "ghost_fsdp", "ghost", 
+    "flash_fsdp", "flash",
+    "flash_fsdp_bk", "flash_bk",
+    "ghost_fsdp_bk", "ghost_bk"
+]
 
 # Markers for sequence lengths
 SEQ_MARKERS = {
@@ -66,7 +89,8 @@ def plot_memory_comparison(results, output_dir):
     seq_lengths = sorted(set(
         seq_len for mode_data in results.values() for seq_len in mode_data.keys()
     ))
-    modes = sorted(results.keys(), key=lambda x: ["no_dp", "ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_bk"].index(x))
+    # Sort modes by defined order, only include modes present in results
+    modes = [m for m in MODE_ORDER if m in results]
     
     fig, axes = plt.subplots(1, len(seq_lengths), figsize=(6 * len(seq_lengths), 6))
     
@@ -117,7 +141,8 @@ def plot_time_comparison(results, output_dir):
     seq_lengths = sorted(set(
         seq_len for mode_data in results.values() for seq_len in mode_data.keys()
     ))
-    modes = sorted(results.keys(), key=lambda x: ["no_dp", "ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_bk"].index(x))
+    # Sort modes by defined order, only include modes present in results
+    modes = [m for m in MODE_ORDER if m in results]
     
     fig, axes = plt.subplots(1, len(seq_lengths), figsize=(6 * len(seq_lengths), 6))
     
@@ -165,9 +190,10 @@ def plot_time_comparison(results, output_dir):
 
 def plot_memory_vs_time_tradeoff(results, output_dir):
     """Plot memory vs time tradeoff"""
-    fig, ax = plt.subplots(figsize=(12, 8))
+    fig, ax = plt.subplots(figsize=(14, 10))
     
-    modes = sorted(results.keys(), key=lambda x: ["no_dp", "ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_bk"].index(x))
+    # Sort modes by defined order, only include modes present in results
+    modes = [m for m in MODE_ORDER if m in results]
     
     for mode in modes:
         for seq_len, data in results[mode].items():
@@ -219,88 +245,118 @@ def plot_memory_vs_time_tradeoff(results, output_dir):
 
 
 def plot_overhead_analysis(results, output_dir):
-    """Plot overhead analysis (DP vs non-DP)"""
-    if "no_dp" not in results:
-        print("⚠️  No baseline (no_dp) results found, skipping overhead analysis")
+    """Plot overhead analysis (DP vs non-DP) for both FSDP and Single-GPU modes"""
+    
+    # Determine which baselines are available
+    has_fsdp_baseline = "no_dp" in results
+    has_single_baseline = "no_dp_single" in results
+    
+    if not has_fsdp_baseline and not has_single_baseline:
+        print("⚠️  No baseline results found, skipping overhead analysis")
         return
     
-    seq_lengths = sorted(results["no_dp"].keys())
-    dp_modes = [m for m in results.keys() if m != "no_dp"]
+    # Create subplots
+    num_plots = sum([has_fsdp_baseline, has_single_baseline])
+    fig, axes = plt.subplots(num_plots, 2, figsize=(16, 6 * num_plots))
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    if num_plots == 1:
+        axes = axes.reshape(1, -1)
     
-    # Memory overhead
-    x = np.arange(len(seq_lengths))
-    width = 0.35
+    plot_idx = 0
     
-    for idx, mode in enumerate(dp_modes):
-        memory_overheads = []
-        for seq_len in seq_lengths:
-            if seq_len in results["no_dp"] and seq_len in results[mode]:
-                baseline = results["no_dp"][seq_len]["peak_memory_gb"]
-                dp_mem = results[mode][seq_len]["peak_memory_gb"]
-                overhead = dp_mem - baseline
-                memory_overheads.append(overhead)
-            else:
-                memory_overheads.append(0)
+    # Helper function to plot overhead for a specific baseline
+    def plot_baseline_overhead(baseline_mode, dp_mode_list, ax_mem, ax_time, title_prefix):
+        seq_lengths = sorted(results[baseline_mode].keys())
+        x = np.arange(len(seq_lengths))
+        width = 0.8 / len(dp_mode_list)
         
-        offset = width * (idx - len(dp_modes) / 2 + 0.5)
-        bars = ax1.bar(x + offset, memory_overheads, width,
-                      label=MODE_NAMES[mode].replace('\n', ' '),
-                      color=MODE_COLORS[mode],
-                      edgecolor='black',
-                      linewidth=1.5)
+        # Memory overhead
+        for idx, mode in enumerate(dp_mode_list):
+            memory_overheads = []
+            for seq_len in seq_lengths:
+                if seq_len in results[baseline_mode] and seq_len in results[mode]:
+                    baseline = results[baseline_mode][seq_len]["peak_memory_gb"]
+                    dp_mem = results[mode][seq_len]["peak_memory_gb"]
+                    overhead = dp_mem - baseline
+                    memory_overheads.append(overhead)
+                else:
+                    memory_overheads.append(0)
+            
+            offset = width * (idx - len(dp_mode_list) / 2 + 0.5)
+            bars = ax_mem.bar(x + offset, memory_overheads, width,
+                          label=MODE_NAMES[mode].replace('\n', ' '),
+                          color=MODE_COLORS[mode],
+                          edgecolor='black',
+                          linewidth=1.5)
+            
+            # Add value labels
+            for bar, overhead in zip(bars, memory_overheads):
+                if overhead > 0:
+                    ax_mem.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1,
+                            f'{overhead:.1f}', ha='center', va='bottom',
+                            fontsize=9, fontweight='bold')
         
-        # Add value labels
-        for bar, overhead in zip(bars, memory_overheads):
-            if overhead > 0:
-                ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1,
-                        f'{overhead:.1f}', ha='center', va='bottom',
-                        fontsize=10, fontweight='bold')
-    
-    ax1.set_xlabel('Sequence Length', fontsize=14, fontweight='bold')
-    ax1.set_ylabel('Memory Overhead (GB)', fontsize=14, fontweight='bold')
-    ax1.set_title('Memory Overhead vs Non-DP Baseline', fontsize=16, fontweight='bold')
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(seq_lengths, fontsize=12)
-    ax1.legend(fontsize=11)
-    ax1.grid(axis='y', alpha=0.3, linestyle='--')
-    ax1.axhline(y=0, color='black', linewidth=1)
-    
-    # Time overhead (percentage)
-    for idx, mode in enumerate(dp_modes):
-        time_overheads = []
-        for seq_len in seq_lengths:
-            if seq_len in results["no_dp"] and seq_len in results[mode]:
-                baseline = results["no_dp"][seq_len]["avg_time_ms"]
-                dp_time = results[mode][seq_len]["avg_time_ms"]
-                overhead_pct = ((dp_time - baseline) / baseline) * 100 if baseline > 0 else 0
-                time_overheads.append(overhead_pct)
-            else:
-                time_overheads.append(0)
+        ax_mem.set_xlabel('Sequence Length', fontsize=14, fontweight='bold')
+        ax_mem.set_ylabel('Memory Overhead (GB)', fontsize=14, fontweight='bold')
+        ax_mem.set_title(f'{title_prefix} - Memory Overhead', fontsize=16, fontweight='bold')
+        ax_mem.set_xticks(x)
+        ax_mem.set_xticklabels(seq_lengths, fontsize=12)
+        ax_mem.legend(fontsize=10, loc='best')
+        ax_mem.grid(axis='y', alpha=0.3, linestyle='--')
+        ax_mem.axhline(y=0, color='black', linewidth=1)
         
-        offset = width * (idx - len(dp_modes) / 2 + 0.5)
-        bars = ax2.bar(x + offset, time_overheads, width,
-                      label=MODE_NAMES[mode].replace('\n', ' '),
-                      color=MODE_COLORS[mode],
-                      edgecolor='black',
-                      linewidth=1.5)
+        # Time overhead (percentage)
+        for idx, mode in enumerate(dp_mode_list):
+            time_overheads = []
+            for seq_len in seq_lengths:
+                if seq_len in results[baseline_mode] and seq_len in results[mode]:
+                    baseline = results[baseline_mode][seq_len]["avg_time_ms"]
+                    dp_time = results[mode][seq_len]["avg_time_ms"]
+                    overhead_pct = ((dp_time - baseline) / baseline) * 100 if baseline > 0 else 0
+                    time_overheads.append(overhead_pct)
+                else:
+                    time_overheads.append(0)
+            
+            offset = width * (idx - len(dp_mode_list) / 2 + 0.5)
+            bars = ax_time.bar(x + offset, time_overheads, width,
+                          label=MODE_NAMES[mode].replace('\n', ' '),
+                          color=MODE_COLORS[mode],
+                          edgecolor='black',
+                          linewidth=1.5)
+            
+            # Add value labels
+            for bar, overhead in zip(bars, time_overheads):
+                if abs(overhead) > 0.1:
+                    ax_time.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+                            f'{overhead:.1f}%', ha='center', va='bottom',
+                            fontsize=9, fontweight='bold')
         
-        # Add value labels
-        for bar, overhead in zip(bars, time_overheads):
-            if abs(overhead) > 0.1:
-                ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
-                        f'{overhead:.1f}%', ha='center', va='bottom',
-                        fontsize=10, fontweight='bold')
+        ax_time.set_xlabel('Sequence Length', fontsize=14, fontweight='bold')
+        ax_time.set_ylabel('Time Overhead (%)', fontsize=14, fontweight='bold')
+        ax_time.set_title(f'{title_prefix} - Time Overhead', fontsize=16, fontweight='bold')
+        ax_time.set_xticks(x)
+        ax_time.set_xticklabels(seq_lengths, fontsize=12)
+        ax_time.legend(fontsize=10, loc='best')
+        ax_time.grid(axis='y', alpha=0.3, linestyle='--')
+        ax_time.axhline(y=0, color='black', linewidth=1)
     
-    ax2.set_xlabel('Sequence Length', fontsize=14, fontweight='bold')
-    ax2.set_ylabel('Time Overhead (%)', fontsize=14, fontweight='bold')
-    ax2.set_title('Time Overhead vs Non-DP Baseline', fontsize=16, fontweight='bold')
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(seq_lengths, fontsize=12)
-    ax2.legend(fontsize=11)
-    ax2.grid(axis='y', alpha=0.3, linestyle='--')
-    ax2.axhline(y=0, color='black', linewidth=1)
+    # Plot FSDP overhead
+    if has_fsdp_baseline:
+        fsdp_dp_modes = [m for m in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_fsdp_bk"] 
+                         if m in results]
+        plot_baseline_overhead("no_dp", fsdp_dp_modes, 
+                             axes[plot_idx, 0], axes[plot_idx, 1],
+                             "FSDP Modes (vs no_dp)")
+        plot_idx += 1
+    
+    # Plot Single-GPU overhead
+    if has_single_baseline:
+        single_dp_modes = [m for m in ["ghost", "flash", "flash_bk", "ghost_bk"] 
+                          if m in results]
+        plot_baseline_overhead("no_dp_single", single_dp_modes,
+                             axes[plot_idx, 0], axes[plot_idx, 1],
+                             "Single-GPU Modes (vs no_dp_single)")
+        plot_idx += 1
     
     plt.tight_layout()
     output_path = Path(output_dir) / "overhead_analysis.png"
@@ -312,20 +368,20 @@ def plot_overhead_analysis(results, output_dir):
 def generate_summary_table(results, output_dir):
     """Generate summary table"""
     summary_lines = []
-    summary_lines.append("=" * 100)
-    summary_lines.append("FSDP LLAMA3 PROFILING SUMMARY")
-    summary_lines.append("=" * 100)
+    summary_lines.append("=" * 110)
+    summary_lines.append("LLAMA3 PROFILING SUMMARY (FSDP + Single-GPU)")
+    summary_lines.append("=" * 110)
     summary_lines.append("")
     
     # Get all modes and sequence lengths
-    modes = sorted(results.keys(), key=lambda x: ["no_dp", "ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_bk"].index(x))
+    modes = [m for m in MODE_ORDER if m in results]
     seq_lengths = sorted(set(
         seq_len for mode_data in results.values() for seq_len in mode_data.keys()
     ))
     
     # Header
-    summary_lines.append(f"{'Mode':<20} {'Seq Length':>12} {'Peak Mem (GB)':>15} {'Avg Time (ms)':>15} {'Batch Size':>12}")
-    summary_lines.append("-" * 100)
+    summary_lines.append(f"{'Mode':<25} {'Seq Length':>12} {'Peak Mem (GB)':>15} {'Avg Time (ms)':>15} {'GPUs':>8} {'Batch/GPU':>12}")
+    summary_lines.append("-" * 110)
     
     # Data rows
     for mode in modes:
@@ -333,43 +389,76 @@ def generate_summary_table(results, output_dir):
             if seq_len in results[mode]:
                 data = results[mode][seq_len]
                 mode_name = MODE_NAMES[mode].replace('\n', ' ')
+                num_gpus = data.get('num_gpus', 1)
+                batch_per_gpu = data.get('batch_size', data['total_batch_size'] // num_gpus)
                 summary_lines.append(
-                    f"{mode_name:<20} {seq_len:>12} {data['peak_memory_gb']:>15.2f} "
-                    f"{data['avg_time_ms']:>15.2f} {data['total_batch_size']:>12}"
+                    f"{mode_name:<25} {seq_len:>12} {data['peak_memory_gb']:>15.2f} "
+                    f"{data['avg_time_ms']:>15.2f} {num_gpus:>8} {batch_per_gpu:>12}"
                 )
-        summary_lines.append("-" * 100)
+        summary_lines.append("-" * 110)
     
     summary_lines.append("")
     
-    # Overhead analysis
+    # Overhead analysis for FSDP modes
     if "no_dp" in results:
-        summary_lines.append("OVERHEAD ANALYSIS (vs Non-DP Baseline):")
+        summary_lines.append("OVERHEAD ANALYSIS - FSDP MODES (vs no_dp baseline):")
         summary_lines.append("")
         
-        dp_modes = [m for m in modes if m != "no_dp"]
+        fsdp_dp_modes = [m for m in modes if m in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_fsdp_bk"]]
         
-        summary_lines.append(f"{'Mode':<20} {'Seq Length':>12} {'Mem Overhead (GB)':>20} {'Time Overhead (%)':>20}")
-        summary_lines.append("-" * 100)
+        if fsdp_dp_modes:
+            summary_lines.append(f"{'Mode':<25} {'Seq Length':>12} {'Mem Overhead (GB)':>20} {'Time Overhead (%)':>20}")
+            summary_lines.append("-" * 110)
+            
+            for mode in fsdp_dp_modes:
+                for seq_len in seq_lengths:
+                    if seq_len in results["no_dp"] and seq_len in results[mode]:
+                        baseline_mem = results["no_dp"][seq_len]["peak_memory_gb"]
+                        dp_mem = results[mode][seq_len]["peak_memory_gb"]
+                        mem_overhead = dp_mem - baseline_mem
+                        
+                        baseline_time = results["no_dp"][seq_len]["avg_time_ms"]
+                        dp_time = results[mode][seq_len]["avg_time_ms"]
+                        time_overhead = ((dp_time - baseline_time) / baseline_time) * 100 if baseline_time > 0 else 0
+                        
+                        mode_name = MODE_NAMES[mode].replace('\n', ' ')
+                        summary_lines.append(
+                            f"{mode_name:<25} {seq_len:>12} {mem_overhead:>20.2f} {time_overhead:>20.2f}"
+                        )
+                summary_lines.append("-" * 110)
+            
+            summary_lines.append("")
+    
+    # Overhead analysis for Single-GPU modes
+    if "no_dp_single" in results:
+        summary_lines.append("OVERHEAD ANALYSIS - SINGLE-GPU MODES (vs no_dp_single baseline):")
+        summary_lines.append("")
         
-        for mode in dp_modes:
-            for seq_len in seq_lengths:
-                if seq_len in results["no_dp"] and seq_len in results[mode]:
-                    baseline_mem = results["no_dp"][seq_len]["peak_memory_gb"]
-                    dp_mem = results[mode][seq_len]["peak_memory_gb"]
-                    mem_overhead = dp_mem - baseline_mem
-                    
-                    baseline_time = results["no_dp"][seq_len]["avg_time_ms"]
-                    dp_time = results[mode][seq_len]["avg_time_ms"]
-                    time_overhead = ((dp_time - baseline_time) / baseline_time) * 100 if baseline_time > 0 else 0
-                    
-                    mode_name = MODE_NAMES[mode].replace('\n', ' ')
-                    summary_lines.append(
-                        f"{mode_name:<20} {seq_len:>12} {mem_overhead:>20.2f} {time_overhead:>20.2f}"
-                    )
-            summary_lines.append("-" * 100)
+        single_dp_modes = [m for m in modes if m in ["ghost", "flash", "flash_bk", "ghost_bk"]]
+        
+        if single_dp_modes:
+            summary_lines.append(f"{'Mode':<25} {'Seq Length':>12} {'Mem Overhead (GB)':>20} {'Time Overhead (%)':>20}")
+            summary_lines.append("-" * 110)
+            
+            for mode in single_dp_modes:
+                for seq_len in seq_lengths:
+                    if seq_len in results["no_dp_single"] and seq_len in results[mode]:
+                        baseline_mem = results["no_dp_single"][seq_len]["peak_memory_gb"]
+                        dp_mem = results[mode][seq_len]["peak_memory_gb"]
+                        mem_overhead = dp_mem - baseline_mem
+                        
+                        baseline_time = results["no_dp_single"][seq_len]["avg_time_ms"]
+                        dp_time = results[mode][seq_len]["avg_time_ms"]
+                        time_overhead = ((dp_time - baseline_time) / baseline_time) * 100 if baseline_time > 0 else 0
+                        
+                        mode_name = MODE_NAMES[mode].replace('\n', ' ')
+                        summary_lines.append(
+                            f"{mode_name:<25} {seq_len:>12} {mem_overhead:>20.2f} {time_overhead:>20.2f}"
+                        )
+                summary_lines.append("-" * 110)
     
     summary_lines.append("")
-    summary_lines.append("=" * 100)
+    summary_lines.append("=" * 110)
     
     # Save to file
     output_path = Path(output_dir) / "summary.txt"

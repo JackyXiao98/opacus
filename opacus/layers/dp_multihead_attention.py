@@ -453,3 +453,164 @@ class DPMultiheadAttention(nn.Module):
                 destination_alter = hook_result
 
         return destination_alter
+
+
+class DPMultiheadAttentionWithFlashAttention(DPMultiheadAttention):
+    r"""
+    DP-compatible MultiheadAttention using PyTorch's scaled_dot_product_attention.
+    
+    This is a subclass of DPMultiheadAttention that uses F.scaled_dot_product_attention
+    (Flash Attention 2) for improved performance when available (PyTorch 2.0+).
+    
+    The key difference from the parent class is the forward pass, which uses
+    the fused Flash Attention kernel instead of manual attention computation.
+    This provides significant speedup and memory savings while maintaining
+    compatibility with Opacus's per-sample gradient computation.
+    
+    Inherits all parameters and methods from DPMultiheadAttention, including
+    the ability to load state dicts from standard nn.MultiheadAttention.
+    """
+    
+    def __init__(
+        self,
+        embed_dim,
+        num_heads,
+        dropout=0.0,
+        bias=True,
+        kdim=None,
+        vdim=None,
+        batch_first=False,
+        device=None,
+        dtype=None,
+    ):
+        # Initialize parent class (which will set up qlinear, klinear, vlinear, out_proj)
+        # Note: We don't support add_bias_kv and add_zero_attn for Flash Attention
+        super(DPMultiheadAttentionWithFlashAttention, self).__init__(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            bias=bias,
+            add_bias_kv=False,  # Not supported with Flash Attention
+            add_zero_attn=False,  # Not supported with Flash Attention
+            kdim=kdim,
+            vdim=vdim,
+            batch_first=batch_first,
+            device=device,
+            dtype=dtype,
+        )
+    
+    def forward(
+        self,
+        query,
+        key,
+        value,
+        key_padding_mask=None,
+        need_weights=True,
+        attn_mask=None,
+        is_causal=False,
+    ):
+        r"""
+        Forward pass using Flash Attention when available.
+        
+        Args:
+            query: Query tensor
+            key: Key tensor  
+            value: Value tensor
+            key_padding_mask: Mask for padding tokens
+            need_weights: Whether to return attention weights (Note: Flash Attention returns None)
+            attn_mask: Attention mask
+            is_causal: Whether to use causal masking
+            
+        Returns:
+            Tuple of (attention_output, attention_weights)
+            Note: attention_weights will be None when using Flash Attention
+        """
+        is_batched = query.dim() == 3
+        assert is_batched == True, "The query must have a dimension of 3."
+        
+        # Flash Attention doesn't support causal masking via is_causal parameter in all contexts
+        assert is_causal == False, "Causal masking not supported with Flash Attention in Opacus"
+        
+        if not self.batch_first:
+            tgt_len, bsz, embed_dim = query.size()
+        else:
+            bsz, tgt_len, embed_dim = query.size()
+        
+        if embed_dim != self.embed_dim:
+            raise ValueError(
+                f"query has as size of {embed_dim} while the embedding size is {self.embed_dim}"
+            )
+        
+        head_dim = embed_dim // self.num_heads
+        scaling = float(head_dim) ** -0.5
+        
+        # Project Q, K, V using inherited linear layers
+        q = self.qlinear(query) * scaling
+        k = self.klinear(key)
+        v = self.vlinear(value)
+        
+        # Convert to batch_first if needed
+        if not self.batch_first:
+            q, k, v = [x.transpose(0, 1) for x in (q, k, v)]
+            # Now shapes are [bsz, seq_len, embed_dim]
+        
+        # Reshape for multi-head attention: [bsz, seq_len, embed_dim] -> [bsz, num_heads, seq_len, head_dim]
+        q = q.contiguous().view(bsz, -1, self.num_heads, head_dim).transpose(1, 2)
+        k = k.contiguous().view(bsz, -1, self.num_heads, head_dim).transpose(1, 2)
+        v = v.contiguous().view(bsz, -1, self.num_heads, head_dim).transpose(1, 2)
+        
+        # Prepare attention mask if provided
+        # Flash Attention expects [bsz, num_heads, seq_len, seq_len] or broadcastable
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                # Convert bool mask to float mask (True -> -inf, False -> 0)
+                attn_mask = torch.zeros_like(attn_mask, dtype=q.dtype)
+                attn_mask.masked_fill_(attn_mask.to(torch.bool), float('-inf'))
+        
+        # Use PyTorch's scaled_dot_product_attention (Flash Attention)
+        if hasattr(F, 'scaled_dot_product_attention'):
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=False,
+            )
+        else:
+            # Fallback to manual computation if Flash Attention not available
+            attn_weights = torch.matmul(q, k.transpose(-2, -1))
+            
+            if attn_mask is not None:
+                if attn_mask.dtype == torch.bool:
+                    attn_weights.masked_fill_(attn_mask, float('-inf'))
+                else:
+                    attn_weights = attn_weights + attn_mask
+            
+            if key_padding_mask is not None:
+                attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, -1)
+                attn_weights = attn_weights.masked_fill(
+                    key_padding_mask.unsqueeze(1).unsqueeze(2), float('-inf')
+                )
+                attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, -1)
+            
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+            attn_output = torch.matmul(attn_weights, v)
+        
+        # Reshape back: [bsz, num_heads, seq_len, head_dim] -> [bsz, seq_len, embed_dim]
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, -1, embed_dim)
+        
+        # Apply output projection
+        attn_output = self.out_proj(attn_output)
+        
+        # Convert back to original format if needed
+        if not self.batch_first:
+            attn_output = attn_output.transpose(0, 1)
+        
+        # Flash Attention doesn't return attention weights
+        if need_weights:
+            warnings.warn(
+                "need_weights=True is not supported with Flash Attention. "
+                "Returning None for attention weights."
+            )
+        
+        return attn_output, None

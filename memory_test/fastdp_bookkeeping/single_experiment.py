@@ -1,32 +1,21 @@
 #!/usr/bin/env python3
 """
-Run a single memory profiling experiment in isolation.
+Run a single FSDP Llama3 memory profiling experiment.
 This script is designed to be called from a shell script with different arguments.
 """
 
 import argparse
-import json
-import sys
-import os
 import gc
+import json
+import os
+import sys
+
 import torch
-import torch.nn as nn
-
-# Add parent directories to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '..'))
-
-from opacus.grad_sample import GradSampleModuleFastGradientClipping
-from opacus.optimizers import DPOptimizerFastGradientClipping
-from opacus.utils.fast_gradient_clipping_utils import DPLossFastGradientClipping
-from memory_test.test_algo.memory_profile_with_flash_attention import (
-    SimpleBigModelWithFlashAttention,
-    DPMultiheadAttentionWithFlashAttention
-)
-from memory_test.test_algo.detailed_memory_profiler import (
-    EnhancedMemoryProfiler,
-    print_memory_breakdown
-)
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from opacus import PrivacyEngine
+from opacus.utils.fsdp_utils import FSDP2Wrapper
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 
 def aggressive_cleanup():
@@ -39,346 +28,359 @@ def aggressive_cleanup():
     gc.collect(generation=2)
 
 
-def run_vanilla_experiment(config, device, num_iter=3, warmup_iter=2):
-    """Run Vanilla (no DP-SGD) experiment"""
-    print(f"\n{'='*80}")
-    print("EXPERIMENT: Vanilla (No DP-SGD)")
-    print(f"{'='*80}\n")
+def generate_synthetic_batch(batch_size, seq_length, vocab_size, device, num_labels=3):
+    """Generate synthetic random data batch for sequence classification"""
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_length), device=device)
+    labels = torch.randint(0, num_labels, (batch_size,), device=device)  # One label per sequence
+    attention_mask = torch.ones((batch_size, seq_length), device=device, dtype=torch.long)
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+
+
+def setup(rank, world_size):
+    """Setup distributed training"""
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12355"
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+
+def cleanup():
+    """Cleanup distributed training"""
+    dist.destroy_process_group()
+
+
+def run_experiment_worker(
+    rank,
+    world_size,
+    mode,
+    model_name,
+    token,
+    seq_length,
+    batch_size,
+    num_iter,
+    warmup_iter,
+    vocab_size,
+    learning_rate,
+    sigma,
+    max_grad_norm,
+    results_dict,
+):
+    """Run experiment on a single GPU worker"""
+    torch.cuda.set_device(rank)
+    setup(rank, world_size)
     
-    aggressive_cleanup()
+    master_process = rank == 0
+    torch.manual_seed(1337 + rank)
     
-    # Create model
-    model = SimpleBigModelWithFlashAttention(
-        vocab_size=config["vocab_size"],
-        hidden_dim=config["hidden_dim"],
-        num_layers=config["num_layers"],
-        num_heads=config["num_heads"],
-        seq_len=config["seq_len"]
-    ).to(device)
+    if master_process:
+        print(f"\n{'='*80}")
+        print(f"EXPERIMENT: mode={mode}, seq_length={seq_length}, batch_size={batch_size}")
+        print(f"{'='*80}\n")
+    
+    # Load model and tokenizer
+    if master_process:
+        print(f"Loading model: {model_name}")
+    
+    try:
+        from huggingface_hub import login
+        login(token)
+    except Exception as e:
+        if master_process:
+            print(f"Warning: Could not login to HuggingFace: {e}")
+    
+    # Load tokenizer to get pad_token_id
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # Load pretrained model
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name,
+        num_labels=3,  # For classification task
+    )
+    
+    # Set pad_token_id in model config
+    model.config.pad_token_id = tokenizer.pad_token_id
+    
+    # Wrap with FSDP2
+    mp_policy = dist.fsdp.MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16, 
+        reduce_dtype=torch.float32
+    )
+    model = FSDP2Wrapper(model, mp_policy=mp_policy)
+    model.train()
     
     # Create optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+    criterion = torch.nn.CrossEntropyLoss()
     
-    # Create profiler
-    profiler = EnhancedMemoryProfiler(model, device)
-    profiler.take_snapshot("0_model_loaded")
-    
-    # Warmup
-    print(f"Running {warmup_iter} warmup iterations...")
-    for i in range(warmup_iter):
-        input_ids = torch.randint(0, config["vocab_size"], 
-                                  (config["batch_size"], config["seq_len"]), device=device)
-        labels = torch.randint(0, config["vocab_size"], 
-                              (config["batch_size"], config["seq_len"]), device=device)
+    # Apply DP-SGD if needed
+    if mode in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk"]:
+        if master_process:
+            print(f"Applying DP-SGD with mode: {mode}")
         
-        outputs = model(input_ids, labels=labels)
-        loss = outputs["loss"]
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad()
+        privacy_engine = PrivacyEngine()
         
-        del loss, outputs, input_ids, labels
-        if device == "cuda":
-            torch.cuda.empty_cache()
-    
-    # Reset stats after warmup
-    profiler.reset()
-    profiler.take_snapshot("1_after_warmup")
-    
-    # Actual profiling iterations
-    print(f"\nRunning {num_iter} profiling iterations...")
-    total_time = 0
-    
-    for i in range(num_iter):
-        input_ids = torch.randint(0, config["vocab_size"], 
-                                  (config["batch_size"], config["seq_len"]), device=device)
-        labels = torch.randint(0, config["vocab_size"], 
-                              (config["batch_size"], config["seq_len"]), device=device)
+        # Create dummy dataloader for make_private
+        from torch.utils.data import TensorDataset, DataLoader, DistributedSampler
+        dummy_data = torch.randn(batch_size * world_size, seq_length)
+        dummy_labels = torch.randint(0, 3, (batch_size * world_size,))
+        dummy_dataset = TensorDataset(dummy_data, dummy_labels)
+        dummy_dataloader = DataLoader(
+            dummy_dataset,
+            batch_size=batch_size,
+            sampler=DistributedSampler(dummy_dataset, num_replicas=world_size, rank=rank),
+        )
         
-        profiler.take_snapshot(f"2_iter{i}_before_forward")
+        model, optimizer, criterion, _ = privacy_engine.make_private(
+            module=model,
+            optimizer=optimizer,
+            data_loader=dummy_dataloader,
+            noise_multiplier=sigma,
+            max_grad_norm=max_grad_norm,
+            grad_sample_mode=mode,
+            criterion=criterion,
+            poisson_sampling=False,
+        )
         
-        # Forward
-        if device == "cuda":
-            torch.cuda.synchronize()
-        start_time = torch.cuda.Event(enable_timing=True)
-        end_time = torch.cuda.Event(enable_timing=True)
-        start_time.record()
-        
-        outputs = model(input_ids, labels=labels)
-        loss = outputs["loss"]
-        
-        profiler.take_snapshot(f"3_iter{i}_after_forward")
-        
-        # Backward
-        loss.backward()
-        
-        profiler.take_snapshot(f"4_iter{i}_after_backward")
-        
-        # Optimizer step
-        optimizer.step()
-        optimizer.zero_grad()
-        
-        end_time.record()
-        torch.cuda.synchronize()
-        iter_time = start_time.elapsed_time(end_time)
-        total_time += iter_time
-        
-        profiler.take_snapshot(f"5_iter{i}_after_step")
-        
-        del loss, outputs, input_ids, labels
-        if device == "cuda":
-            torch.cuda.empty_cache()
-    
-    avg_time = total_time / num_iter
-    print(f"\n⏱️  Average iteration time: {avg_time:.3f} ms")
-    
-    # Get final breakdown
-    breakdown = profiler.get_detailed_breakdown(optimizer)
-    print_memory_breakdown(breakdown)
-    
-    peak_mem_mb = torch.cuda.max_memory_allocated() / 1e6 if device == "cuda" else 0
-
-    # Save results
-    results = {
-        "experiment": "vanilla",
-        "config": config,
-        "avg_time_ms": avg_time,
-        "peak_memory_mb": peak_mem_mb,
-        "peak_allocated_memory_mb": breakdown.get("peak_allocated_mb", 0),
-        "breakdown": breakdown,
-        "snapshots": [s.to_dict() for s in profiler.snapshots]
-    }
-    
-    # Cleanup
-    profiler.clear_hooks()
-    del model, optimizer, profiler
-    aggressive_cleanup()
-    
-    return results
-
-
-def run_dpsgd_experiment(config, device, use_flash_clipping=False, enable_bookkeeping=False, num_iter=3, warmup_iter=2):
-    """Run DP-SGD experiment (Ghost, Flash Clipping, or Bookkeeping)"""
-    if enable_bookkeeping:
-        exp_name = "Bookkeeping"
+        if master_process:
+            print("DP-SGD setup complete")
     else:
-        exp_name = "Flash Clipping" if use_flash_clipping else "Ghost Clipping"
-
-    if use_flash_clipping and enable_bookkeeping:
-        exp_name = "Flash Clipping w/ Bookkeeping"
-
-    print(f"\n{'='*80}")
-    print(f"EXPERIMENT: {exp_name}")
-    print(f"{'='*80}\n")
+        if master_process:
+            print("Running in non-DP mode")
     
-    aggressive_cleanup()
+    device = torch.device(f"cuda:{rank}")
     
-    # Create model
-    model = SimpleBigModelWithFlashAttention(
-        vocab_size=config["vocab_size"],
-        hidden_dim=config["hidden_dim"],
-        num_layers=config["num_layers"],
-        num_heads=config["num_heads"],
-        seq_len=config["seq_len"]
-    ).to(device)
+    # Warmup iterations
+    if master_process:
+        print(f"\nRunning {warmup_iter} warmup iterations...")
     
-    # Create profiler BEFORE wrapping with GradSampleModule
-    profiler = EnhancedMemoryProfiler(model, device)
-    profiler.take_snapshot("0_model_loaded")
-    
-    # Wrap with DP-SGD
-    model = GradSampleModuleFastGradientClipping(
-        model,
-        use_flash_clipping=use_flash_clipping,
-        use_ghost_clipping=True,  # All fast gradient clipping methods use this
-        enable_fastdp_bookkeeping=enable_bookkeeping,
-    )
-    
-    profiler.model = model  # Update reference
-    profiler.take_snapshot("1_wrapped_with_dp")
-    
-    # Register component-level hooks
-    profiler.register_component_hooks()
-    
-    # Create optimizer
-    base_optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    optimizer = DPOptimizerFastGradientClipping(
-        optimizer=base_optimizer,
-        noise_multiplier=0.0,
-        max_grad_norm=1.0,
-        expected_batch_size=config["batch_size"],
-    )
-
-    # Create loss wrapper
-    criterion = nn.CrossEntropyLoss()
-    dp_loss = DPLossFastGradientClipping(
-        model,
-        optimizer,
-        criterion,
-    )
-    
-    profiler.take_snapshot("2_optimizer_created")
-    
-    # Warmup
-    print(f"Running {warmup_iter} warmup iterations...")
     for i in range(warmup_iter):
-        input_ids = torch.randint(0, config["vocab_size"], 
-                                  (config["batch_size"], config["seq_len"]), device=device)
-        labels = torch.randint(0, config["vocab_size"], 
-                              (config["batch_size"], config["seq_len"]), device=device)
+        batch = generate_synthetic_batch(batch_size, seq_length, vocab_size, device)
         
-        outputs = model(input_ids, labels=labels)
-        logits = outputs["logits"]
-        loss = dp_loss(logits.view(-1, logits.shape[-1]), labels.view(-1), shape=logits.shape[:2])
-        loss.backward()
-        optimizer.step()
         optimizer.zero_grad()
         
-        del loss, outputs, input_ids, labels, logits
-        if device == "cuda":
-            torch.cuda.empty_cache()
+        # Model computes loss internally when labels are provided
+        if mode in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk"]:
+            # For DP modes, we need to use the criterion wrapper
+            outputs = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"]
+            )
+            loss = criterion(outputs.logits, batch["labels"])
+        else:
+            # For non-DP mode, model computes loss internally
+            outputs = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                labels=batch["labels"]
+            )
+            loss = outputs.loss
+        
+        loss.backward()
+        optimizer.step()
+        
+        del batch, outputs, loss
+        torch.cuda.empty_cache()
     
-    # Reset stats after warmup
-    if device == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
-    profiler.activation_memory = 0
-    profiler.norm_sample_memory = 0
-    profiler.take_snapshot("3_after_warmup")
+    # Reset memory stats after warmup
+    torch.cuda.reset_peak_memory_stats(device)
     
-    # Actual profiling iterations
-    print(f"\nRunning {num_iter} profiling iterations...")
-    total_time = 0
+    # Profiling iterations
+    if master_process:
+        print(f"\nRunning {num_iter} profiling iterations...")
+    
+    total_time = 0.0
     
     for i in range(num_iter):
-        input_ids = torch.randint(0, config["vocab_size"], 
-                                  (config["batch_size"], config["seq_len"]), device=device)
-        labels = torch.randint(0, config["vocab_size"], 
-                              (config["batch_size"], config["seq_len"]), device=device)
+        batch = generate_synthetic_batch(batch_size, seq_length, vocab_size, device)
         
-        profiler.take_snapshot(f"4_iter{i}_before_forward")
+        # Time the iteration
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
         
-        # Forward
-        if device == "cuda":
-            torch.cuda.synchronize()
-        start_time = torch.cuda.Event(enable_timing=True)
-        end_time = torch.cuda.Event(enable_timing=True)
-        start_time.record()
-        
-        outputs = model(input_ids, labels=labels)
-        logits = outputs["logits"]
-        loss = dp_loss(logits.view(-1, logits.shape[-1]), labels.view(-1), shape=logits.shape[:2])
-        
-        profiler.take_snapshot(f"5_iter{i}_after_forward")
-        
-        # Backward
-        loss.backward()
-        
-        profiler.take_snapshot(f"6_iter{i}_after_backward")
-        
-        # Optimizer step
-        optimizer.step()
         optimizer.zero_grad()
         
-        end_time.record()
+        # Model computes loss internally when labels are provided
+        if mode in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk"]:
+            # For DP modes, we need to use the criterion wrapper
+            outputs = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"]
+            )
+            loss = criterion(outputs.logits, batch["labels"])
+        else:
+            # For non-DP mode, model computes loss internally
+            outputs = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                labels=batch["labels"]
+            )
+            loss = outputs.loss
+        
+        loss.backward()
+        optimizer.step()
+        
+        end_event.record()
         torch.cuda.synchronize()
-        iter_time = start_time.elapsed_time(end_time)
+        
+        iter_time = start_event.elapsed_time(end_event)
         total_time += iter_time
         
-        profiler.take_snapshot(f"7_iter{i}_after_step")
+        if master_process:
+            print(f"  Iteration {i+1}/{num_iter}: {iter_time:.2f} ms")
         
-        del loss, outputs, input_ids, labels, logits
-        if device == "cuda":
-            torch.cuda.empty_cache()
+        del batch, outputs, loss
+        torch.cuda.empty_cache()
     
     avg_time_ms = total_time / num_iter
-    print(f"\n⏱️  Average iteration time: {avg_time_ms:.3f} ms")
+    peak_memory_bytes = torch.cuda.max_memory_allocated(device)
+    peak_memory_mb = peak_memory_bytes / (1024 ** 2)
+    peak_memory_gb = peak_memory_bytes / (1024 ** 3)
     
-    # Get final breakdown
-    breakdown = profiler.get_detailed_breakdown(optimizer)
-    print_memory_breakdown(breakdown)
+    if master_process:
+        print(f"\n⏱️  Average iteration time: {avg_time_ms:.2f} ms")
+        print(f"💾 Peak memory usage: {peak_memory_gb:.2f} GB ({peak_memory_mb:.2f} MB)")
     
-    peak_mem_mb = torch.cuda.max_memory_allocated() / 1e6 if device == "cuda" else 0
+    # Store results in shared dict (only from rank 0)
+    if master_process:
+        results_dict["peak_memory_mb"] = peak_memory_mb
+        results_dict["peak_memory_gb"] = peak_memory_gb
+        results_dict["avg_time_ms"] = avg_time_ms
+    
+    cleanup()
 
-    results = {
-        "peak_memory_mb": peak_mem_mb,
-        "peak_allocated_memory_mb": breakdown.get("peak_allocated_mb", 0),
-        "avg_time_ms": avg_time_ms,
-        "breakdown": breakdown,
-        "snapshots": [s.to_dict() for s in profiler.snapshots]
-    }
+
+def run_experiment(config):
+    """Run the experiment with the given configuration"""
+    world_size = torch.cuda.device_count()
     
-    # Cleanup
-    profiler.clear_hooks()
-    del model, optimizer, profiler
-    aggressive_cleanup()
+    if world_size == 0:
+        raise RuntimeError("No CUDA devices available")
+    
+    print(f"\n{'#'*80}")
+    print(f"Configuration:")
+    print(f"  Mode: {config['mode']}")
+    print(f"  Model: {config['model_name']}")
+    print(f"  Sequence Length: {config['seq_length']}")
+    print(f"  Batch Size (per GPU): {config['batch_size']}")
+    print(f"  Number of GPUs: {world_size}")
+    print(f"  Total Batch Size: {config['batch_size'] * world_size}")
+    print(f"  Profiling Iterations: {config['num_iter']}")
+    print(f"  Warmup Iterations: {config['warmup_iter']}")
+    print(f"{'#'*80}\n")
+    
+    # Use multiprocessing manager for sharing results
+    manager = mp.Manager()
+    results_dict = manager.dict()
+    
+    # Spawn processes
+    mp.spawn(
+        run_experiment_worker,
+        args=(
+            world_size,
+            config["mode"],
+            config["model_name"],
+            config["token"],
+            config["seq_length"],
+            config["batch_size"],
+            config["num_iter"],
+            config["warmup_iter"],
+            config["vocab_size"],
+            config["learning_rate"],
+            config["sigma"],
+            config["max_grad_norm"],
+            results_dict,
+        ),
+        nprocs=world_size,
+        join=True,
+    )
+    
+    # Extract results
+    results = {
+        "mode": config["mode"],
+        "seq_length": config["seq_length"],
+        "batch_size": config["batch_size"],
+        "total_batch_size": config["batch_size"] * world_size,
+        "num_gpus": world_size,
+        "peak_memory_mb": results_dict.get("peak_memory_mb", 0),
+        "peak_memory_gb": results_dict.get("peak_memory_gb", 0),
+        "avg_time_ms": results_dict.get("avg_time_ms", 0),
+        "config": {
+            "model_name": config["model_name"],
+            "vocab_size": config["vocab_size"],
+            "learning_rate": config["learning_rate"],
+            "sigma": config["sigma"],
+            "max_grad_norm": config["max_grad_norm"],
+        }
+    }
     
     return results
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run single memory profiling experiment")
-    parser.add_argument("--experiment", type=str, required=True,
-                       choices=["vanilla", "ghost", "flash_clip", "bookkeeping", "flash_clip_bookkeeping"],
-                       help="Which experiment to run")
+    parser = argparse.ArgumentParser(description="Run single FSDP Llama3 profiling experiment")
+    parser.add_argument("--mode", type=str, required=True,
+                       choices=["no_dp", "ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_bk", "flash", "flash_bk", "ghost", "ghost_bk"],
+                       help="Training mode")
+    parser.add_argument("--seq-length", type=int, required=True,
+                       help="Sequence length")
+    parser.add_argument("--batch-size", type=int, default=1,
+                       help="Batch size per GPU")
+    parser.add_argument("--num-iter", type=int, default=3,
+                       help="Number of profiling iterations")
+    parser.add_argument("--warmup-iter", type=int, default=1,
+                       help="Number of warmup iterations")
     parser.add_argument("--output", type=str, required=True,
                        help="Output JSON file path")
-    parser.add_argument("--vocab-size", type=int, default=32000)
-    parser.add_argument("--hidden-dim", type=int, default=2048)
-    parser.add_argument("--num-layers", type=int, default=20)
-    parser.add_argument("--num-heads", type=int, default=16)
-    parser.add_argument("--seq-len", type=int, default=16384)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--num-iter", type=int, default=3)
-    parser.add_argument("--warmup-iter", type=int, default=2)
+    parser.add_argument("--model-name", type=str, default="meta-llama/Llama-3.1-8B-Instruct",
+                       help="Model name")
+    parser.add_argument("--token", type=str, required=True,
+                       help="HuggingFace token")
+    parser.add_argument("--vocab-size", type=int, default=128256,
+                       help="Vocabulary size for synthetic data")
+    parser.add_argument("--learning-rate", type=float, default=1e-5,
+                       help="Learning rate")
+    parser.add_argument("--sigma", type=float, default=1.0,
+                       help="Noise multiplier for DP")
+    parser.add_argument("--max-grad-norm", type=float, default=1.0,
+                       help="Max gradient norm for DP")
     
     args = parser.parse_args()
     
-    # Configuration
     config = {
+        "mode": args.mode,
+        "seq_length": args.seq_length,
+        "batch_size": args.batch_size,
+        "num_iter": args.num_iter,
+        "warmup_iter": args.warmup_iter,
+        "model_name": args.model_name,
+        "token": args.token,
         "vocab_size": args.vocab_size,
-        "hidden_dim": args.hidden_dim,
-        "num_layers": args.num_layers,
-        "num_heads": args.num_heads,
-        "seq_len": args.seq_len,
-        "batch_size": args.batch_size
+        "learning_rate": args.learning_rate,
+        "sigma": args.sigma,
+        "max_grad_norm": args.max_grad_norm,
     }
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    print(f"\n{'#'*80}")
-    print(f"Configuration: {config}")
-    print(f"Device: {device}")
-    print(f"{'#'*80}\n")
-    
     # Run experiment
-    if args.experiment == "vanilla":
-        results = run_vanilla_experiment(config, device, args.num_iter, args.warmup_iter)
-    elif args.experiment == "ghost":
-        results = run_dpsgd_experiment(config, device, use_flash_clipping=False, 
-                                      num_iter=args.num_iter, warmup_iter=args.warmup_iter)
-    elif args.experiment == "flash_clip":
-        results = run_dpsgd_experiment(config, device, use_flash_clipping=True,
-                                      num_iter=args.num_iter, warmup_iter=args.warmup_iter)
-    elif args.experiment == "bookkeeping":
-        results = run_dpsgd_experiment(config, device, use_flash_clipping=False, enable_bookkeeping=True,
-                                      num_iter=args.num_iter, warmup_iter=args.warmup_iter)
-    elif args.experiment == "flash_clip_bookkeeping":
-        results = run_dpsgd_experiment(config, device, use_flash_clipping=True, enable_bookkeeping=True,
-                                      num_iter=args.num_iter, warmup_iter=args.warmup_iter)
+    aggressive_cleanup()
+    results = run_experiment(config)
+    aggressive_cleanup()
     
     # Save results
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
     with open(args.output, 'w') as f:
         json.dump(results, f, indent=2)
     
     print(f"\n{'='*80}")
-    print(f"✅ Experiment {args.experiment} finished!")
-    print(f"✅ Peak Memory: {results['peak_memory_mb']:.2f} MB")
-    print(f"✅ Peak Allocated Memory: {results['peak_allocated_memory_mb']:.2f} MB")
-    print(f"✅ Average time per iteration: {results['avg_time_ms']:.2f} ms")
-    print(f"{'='*80}\n")
-    
+    print(f"✅ Experiment completed!")
+    print(f"✅ Mode: {results['mode']}")
+    print(f"✅ Seq Length: {results['seq_length']}")
+    print(f"✅ Peak Memory: {results['peak_memory_gb']:.2f} GB")
+    print(f"✅ Avg Time: {results['avg_time_ms']:.2f} ms")
     print(f"✅ Results saved to: {args.output}")
-    print(f"✅ Avg Time: {results['avg_time_ms']:.2f} ms\n")
+    print(f"{'='*80}\n")
 
 
 if __name__ == "__main__":

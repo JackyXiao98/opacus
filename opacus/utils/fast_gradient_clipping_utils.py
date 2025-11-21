@@ -180,7 +180,12 @@ class DPTensorFastGradientClipping:
           * Without FSDP: Standard two-pass ghost clipping
         - If enable_fastdp_bookkeeping=True: Single pass with manual gradient computation
         """
-        enable_profiling = os.environ.get('OPACUS_PROFILE_FSDP', '0') == '1'
+        # Enable profiling for both FSDP and non-FSDP modes
+        enable_profiling = (
+            os.environ.get('OPACUS_PROFILE_FSDP', '0') == '1' or 
+            os.environ.get('OPACUS_PROFILE_DETAILED', '0') == '1' or
+            os.environ.get('OPACUS_PROFILE_FSDP_DETAILED', '0') == '1'
+        )
         sync = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
         
         if enable_profiling:
@@ -199,6 +204,10 @@ class DPTensorFastGradientClipping:
         # Check if bookkeeping mode is enabled
         use_bookkeeping = hasattr(self.module, 'enable_fastdp_bookkeeping') and self.module.enable_fastdp_bookkeeping
         
+        # Determine profiling label based on mode
+        is_fsdp = _is_fsdp_model(self.module)
+        profile_label = "[FSDP Profile]" if is_fsdp else "[Profile]"
+        
         if use_bookkeeping:
             # FastDP Bookkeeping (BK) mode: Single backward pass
             # No need to retain graph since we cache intermediate values
@@ -212,7 +221,7 @@ class DPTensorFastGradientClipping:
                 sync()
                 t_bw1_end = time.time()
                 rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                print(f"[FSDP Profile] Rank {rank} First backward (bookkeeping): {(t_bw1_end - t_bw1_start)*1000:.2f} ms")
+                print(f"{profile_label} Rank {rank} First backward (bookkeeping): {(t_bw1_end - t_bw1_start)*1000:.2f} ms")
 
             # Compute clipping coefficients from per-sample gradient norms
             if enable_profiling:
@@ -225,7 +234,7 @@ class DPTensorFastGradientClipping:
                 sync()
                 t_coeff_end = time.time()
                 rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                print(f"[FSDP Profile] Rank {rank} Get clipping coef: {(t_coeff_end - t_coeff_start)*1000:.2f} ms")
+                print(f"{profile_label} Rank {rank} Get clipping coef: {(t_coeff_end - t_coeff_start)*1000:.2f} ms")
     
             # Zero out any gradients from the first backward (these are non-private)
             self.optimizer.zero_grad()
@@ -242,12 +251,12 @@ class DPTensorFastGradientClipping:
                 sync()
                 t_populate_end = time.time()
                 rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                print(f"[FSDP Profile] Rank {rank} Populate gradients: {(t_populate_end - t_populate_start)*1000:.2f} ms")
-                print(f"[FSDP Profile] Rank {rank} TOTAL backward (bookkeeping): {(t_populate_end - t_backward_start)*1000:.2f} ms")
+                print(f"{profile_label} Rank {rank} Populate gradients: {(t_populate_end - t_populate_start)*1000:.2f} ms")
+                print(f"{profile_label} Rank {rank} TOTAL backward (bookkeeping): {(t_populate_end - t_backward_start)*1000:.2f} ms")
 
         else:
             # Two-pass ghost clipping with optional FSDP optimization
-            is_fsdp = _is_fsdp_model(self.module)
+            # Note: is_fsdp and profile_label already defined above
             hook_handles = []
             fsdp_root = None
             fsdp_api = None
@@ -293,7 +302,7 @@ class DPTensorFastGradientClipping:
                 sync()
                 t_bw1_end = time.time()
                 rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                print(f"[FSDP Profile] Rank {rank} First backward (norm pass): {(t_bw1_end - t_bw1_start)*1000:.2f} ms")
+                print(f"{profile_label} Rank {rank} First backward (norm pass): {(t_bw1_end - t_bw1_start)*1000:.2f} ms")
 
             # Re-enable gradient synchronization for FSDP2 before second backward
             if is_fsdp and fsdp_root is not None and fsdp_api == 'fsdp2':
@@ -317,7 +326,7 @@ class DPTensorFastGradientClipping:
                 sync()
                 t_coeff_end = time.time()
                 rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                print(f"[FSDP Profile] Rank {rank} Get clipping coef (includes get_norm_sample): {(t_coeff_end - t_coeff_start)*1000:.2f} ms")
+                print(f"{profile_label} Rank {rank} Get clipping coef (includes get_norm_sample): {(t_coeff_end - t_coeff_start)*1000:.2f} ms")
 
             # Second backward: compute actual parameter gradients with clipping
             second_loss_per_sample = (
@@ -338,8 +347,8 @@ class DPTensorFastGradientClipping:
                 sync()
                 t_bw2_end = time.time()
                 rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                print(f"[FSDP Profile] Rank {rank} Second backward (grad pass): {(t_bw2_end - t_bw2_start)*1000:.2f} ms")
-                print(f"[FSDP Profile] Rank {rank} TOTAL backward (2-pass): {(t_bw2_end - t_backward_start)*1000:.2f} ms")
+                print(f"{profile_label} Rank {rank} Second backward (grad pass): {(t_bw2_end - t_bw2_start)*1000:.2f} ms")
+                print(f"{profile_label} Rank {rank} TOTAL backward (2-pass): {(t_bw2_end - t_backward_start)*1000:.2f} ms")
             
             self.module.enable_hooks()
 

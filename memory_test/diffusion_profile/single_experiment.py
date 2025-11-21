@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Run a single memory profiling experiment for HuggingFace DiT in isolation.
+Run a single memory profiling experiment for DiT (facebook/DiT-XL-2-256) in isolation.
 This script is designed to be called from a shell script with different arguments.
 """
 
@@ -84,7 +84,7 @@ def create_dit_criterion():
     return dit_criterion
 
 
-def run_vanilla_experiment(config, device, num_iter=3, warmup_iter=2):
+def run_vanilla_experiment(config, device, num_iter=3, warmup_iter=2, use_flash_attention=True):
     """Run Vanilla (no DP-SGD) experiment"""
     print(f"\n{'='*80}")
     print("EXPERIMENT: Vanilla (No DP-SGD)")
@@ -92,14 +92,15 @@ def run_vanilla_experiment(config, device, num_iter=3, warmup_iter=2):
     
     aggressive_cleanup()
     
-    # Create model using HuggingFace wrapper
+    # Create model using DiT wrapper (facebook/DiT-XL-2-256 architecture)
     model = DiTHuggingFaceWrapper(
-        model_name="microsoft/dit-large",
+        model_name="facebook/DiT-XL-2-256",
         img_size=config["image_size"],
         patch_size=config["patch_size"],
         in_channels=config["in_channels"],
         num_classes=config["num_classes"],
-        pretrained=False,  # Use config only for faster loading
+        pretrained=True,  # Load pretrained diffusers model (requires 4-channel latent space inputs)
+        use_flash_attention=use_flash_attention,
     ).to(device)
     
     # Create optimizer
@@ -205,7 +206,7 @@ def run_vanilla_experiment(config, device, num_iter=3, warmup_iter=2):
     return results
 
 
-def run_dpsgd_experiment(config, device, use_flash_clipping=False, enable_bookkeeping=False, num_iter=3, warmup_iter=2):
+def run_dpsgd_experiment(config, device, use_flash_clipping=False, enable_bookkeeping=False, num_iter=3, warmup_iter=2, use_flash_attention=True):
     """Run DP-SGD experiment using PrivacyEngine with ghost/flash/bookkeeping modes"""
     # Determine experiment name and grad_sample_mode
     if use_flash_clipping and enable_bookkeeping:
@@ -227,14 +228,15 @@ def run_dpsgd_experiment(config, device, use_flash_clipping=False, enable_bookke
     
     aggressive_cleanup()
     
-    # Create model using HuggingFace wrapper
+    # Create model using DiT wrapper (facebook/DiT-XL-2-256 architecture)
     model = DiTHuggingFaceWrapper(
-        model_name="microsoft/dit-large",
+        model_name="facebook/DiT-XL-2-256",
         img_size=config["image_size"],
         patch_size=config["patch_size"],
         in_channels=config["in_channels"],
         num_classes=config["num_classes"],
-        pretrained=False,  # Use config only for faster loading
+        pretrained=True,  # Load pretrained diffusers model (requires 4-channel latent space inputs)
+        use_flash_attention=use_flash_attention,
     ).to(device)
     
     # Create profiler BEFORE wrapping with PrivacyEngine
@@ -411,19 +413,26 @@ def run_dpsgd_experiment(config, device, use_flash_clipping=False, enable_bookke
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run single memory profiling experiment for HuggingFace DiT")
+    parser = argparse.ArgumentParser(description="Run single memory profiling experiment for DiT (facebook/DiT-XL-2-256)")
     parser.add_argument("--experiment", type=str, required=True,
-                       choices=["vanilla", "ghost", "flash_clip", "bookkeeping", "flash_clip_bookkeeping"],
+                       choices=["vanilla", "ghost", "flash_clip", "flash_clip_bk", "bookkeeping", "ghost_fsdp_bk"],
                        help="Which experiment to run")
     parser.add_argument("--output", type=str, required=True,
                        help="Output JSON file path")
-    parser.add_argument("--image-size", type=int, default=1024)
-    parser.add_argument("--patch-size", type=int, default=8)
-    parser.add_argument("--in-channels", type=int, default=3)
+    parser.add_argument("--image-size", type=int, default=256,
+                       help="Input image size (256 for DiT-XL-2-256)")
+    parser.add_argument("--patch-size", type=int, default=8,
+                       help="Patch size (2 for DiT-XL-2-256)")
+    parser.add_argument("--in-channels", type=int, default=4,
+                       help="Number of input channels (4 for latent space, 3 for RGB)")
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-iter", type=int, default=1)
     parser.add_argument("--warmup-iter", type=int, default=1)
+    parser.add_argument("--use-flash-attention", action="store_true", default=False,
+                       help="Enable Flash Attention for memory efficiency (default: enabled)")
+    parser.add_argument("--no-flash-attention", dest="use_flash_attention", action="store_false",
+                       help="Disable Flash Attention")
     
     args = parser.parse_args()
     
@@ -441,23 +450,44 @@ def main():
     print(f"\n{'#'*80}")
     print(f"Configuration: {config}")
     print(f"Device: {device}")
+    print(f"Flash Attention: {'Enabled' if args.use_flash_attention else 'Disabled'}")
+    
+    # Validate configuration for pretrained model
+    if config["in_channels"] != 4:
+        print(f"\n⚠️  WARNING: in_channels={config['in_channels']}")
+        print(f"⚠️  Pretrained facebook/DiT-XL-2-256 model expects 4-channel latent space inputs")
+        print(f"⚠️  The model will attempt to load pretrained weights but may fail during forward pass")
+        print(f"⚠️  Consider using --in-channels 4 for pretrained model")
+    
     print(f"{'#'*80}\n")
     
     # Run experiment
     if args.experiment == "vanilla":
-        results = run_vanilla_experiment(config, device, args.num_iter, args.warmup_iter)
+        results = run_vanilla_experiment(config, device, args.num_iter, args.warmup_iter, 
+                                        use_flash_attention=args.use_flash_attention)
     elif args.experiment == "ghost":
         results = run_dpsgd_experiment(config, device, use_flash_clipping=False, 
-                                      num_iter=args.num_iter, warmup_iter=args.warmup_iter)
+                                      num_iter=args.num_iter, warmup_iter=args.warmup_iter,
+                                      use_flash_attention=args.use_flash_attention)
     elif args.experiment == "flash_clip":
         results = run_dpsgd_experiment(config, device, use_flash_clipping=True,
-                                      num_iter=args.num_iter, warmup_iter=args.warmup_iter)
+                                      num_iter=args.num_iter, warmup_iter=args.warmup_iter,
+                                      use_flash_attention=args.use_flash_attention)
+    elif args.experiment == "flash_clip_bk":
+        results = run_dpsgd_experiment(config, device, use_flash_clipping=True, enable_bookkeeping=True,
+                                      num_iter=args.num_iter, warmup_iter=args.warmup_iter,
+                                      use_flash_attention=args.use_flash_attention)
     elif args.experiment == "bookkeeping":
         results = run_dpsgd_experiment(config, device, use_flash_clipping=False, enable_bookkeeping=True,
-                                      num_iter=args.num_iter, warmup_iter=args.warmup_iter)
-    elif args.experiment == "flash_clip_bookkeeping":
-        results = run_dpsgd_experiment(config, device, use_flash_clipping=True, enable_bookkeeping=True,
-                                      num_iter=args.num_iter, warmup_iter=args.warmup_iter)
+                                      num_iter=args.num_iter, warmup_iter=args.warmup_iter,
+                                      use_flash_attention=args.use_flash_attention)
+    elif args.experiment == "ghost_fsdp_bk":
+        # Note: This requires FSDP setup, which is not implemented in this single-GPU experiment
+        print("⚠️  ghost_fsdp_bk requires FSDP (multi-GPU) setup")
+        print("⚠️  Running as ghost_bk (bookkeeping) instead...")
+        results = run_dpsgd_experiment(config, device, use_flash_clipping=False, enable_bookkeeping=True,
+                                      num_iter=args.num_iter, warmup_iter=args.warmup_iter,
+                                      use_flash_attention=args.use_flash_attention)
     
     # Save results
     with open(args.output, 'w') as f:

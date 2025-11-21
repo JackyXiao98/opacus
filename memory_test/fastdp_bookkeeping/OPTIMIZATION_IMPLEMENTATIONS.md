@@ -372,13 +372,13 @@ After applying any optimization:
 
 ### 1. Verify Correctness
 ```bash
-python memory_test/fastdp_bookkeeping/verify_correctness.py --use-fsdp --verbose
+python verify_correctness.py --use-fsdp --verbose
 ```
 
 ### 2. Profile Performance
 ```bash
 export OPACUS_PROFILE_FSDP=1
-python memory_test/fastdp_bookkeeping/profile_fsdp_bottlenecks.py \
+python profile_fsdp_bottlenecks.py \
     --seq-lengths 1024 4096 16384 \
     --use-flash
 ```

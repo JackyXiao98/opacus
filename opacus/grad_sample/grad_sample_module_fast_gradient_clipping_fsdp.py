@@ -97,6 +97,14 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
             use_flash_clipping=use_flash_clipping,
             enable_fastdp_bookkeeping=enable_fastdp_bookkeeping,
         )
+        
+        # FSDP communication profiling infrastructure
+        self._comm_stats = {
+            'total_hooks': 0,
+            'total_comm_time': 0.0,
+            'total_comp_time': 0.0,
+            'per_layer_stats': []
+        }
 
     def _get_module_type(self, module: nn.Module) -> str:
         module_type = (
@@ -175,6 +183,9 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
             print(f"  - Final compute: {(t_end - t_allreduce)*1000:.2f} ms")
             print(f"  - TOTAL:         {(t_end - t_start)*1000:.2f} ms")
 
+        # Print detailed communication summary if detailed profiling is enabled
+        self.print_fsdp_comm_summary()
+
         self.per_sample_gradient_norms = norm_sample
         return norm_sample
 
@@ -234,6 +245,16 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
         if not self.hooks_enabled:
             return
 
+        # Detailed FSDP communication profiling
+        enable_detailed_profiling = os.environ.get('OPACUS_PROFILE_FSDP_DETAILED', '0') == '1'
+        enable_profiling = os.environ.get('OPACUS_PROFILE_FSDP', '0') == '1'
+        sync = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
+        
+        if enable_detailed_profiling:
+            sync()
+            t_hook_entry = time.time()
+            layer_stats = {}
+
         backprops = forward_output[0].detach()
 
         activations, backprops = self.rearrange_grad_samples(
@@ -243,9 +264,15 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
             batch_first=batch_first,
         )
 
+        # Track time before parameter access (which triggers FSDP all-gather)
+        if enable_detailed_profiling:
+            sync()
+            t_before_param_access = time.time()
+
         if not hasattr(module, "norm_sample"):
             # currently, we don't support freezing and unfreezing params in between training. Making this a dictionary and mapping with param names might fix this.
             module.norm_sample = []
+            # This call to trainable_parameters triggers FSDP all-gather!
             for _, param in trainable_parameters(module):
                 module.norm_sample.append(
                     torch.zeros(
@@ -254,6 +281,12 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
                         dtype=param.dtype,
                     )
                 )
+
+        # Track time after parameter access (all-gather completed)
+        if enable_detailed_profiling:
+            sync()
+            t_after_param_access = time.time()
+            layer_stats['param_access_time'] = (t_after_param_access - t_before_param_access) * 1000
 
         module_type = self._get_module_type(module)
         module._forward_counter -= 1
@@ -267,24 +300,28 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
             else:
                 norm_sampler_fn = self.NORM_SAMPLERS[module_type]
             
-            # Profiling: Track per-layer norm computation time
-            enable_profiling = os.environ.get('OPACUS_PROFILE_FSDP', '0') == '1'
-            if enable_profiling:
-                sync = torch.cuda.synchronize if torch.cuda.is_available() else (lambda: None)
+            # Track norm computation time separately
+            if enable_profiling or enable_detailed_profiling:
                 sync()
-                t_start = time.time()
+                t_comp_start = time.time()
             
             norm_samples = norm_sampler_fn(module, activations, backprops)
             
-            if enable_profiling:
+            if enable_profiling or enable_detailed_profiling:
                 sync()
-                t_end = time.time()
-                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-                act_shape = activations[0].shape if activations else "N/A"
-                bp_shape = backprops.shape
-                print(f"[FSDP Profile] Rank {rank} Layer {module_type.__name__} norm computation: "
-                      f"{(t_end - t_start)*1000:.2f} ms "
-                      f"(act: {act_shape}, bp: {bp_shape})")
+                t_comp_end = time.time()
+                comp_time = (t_comp_end - t_comp_start) * 1000
+                
+                if enable_detailed_profiling:
+                    layer_stats['comp_time'] = comp_time
+                
+                if enable_profiling:
+                    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+                    act_shape = activations[0].shape if activations else "N/A"
+                    bp_shape = backprops.shape
+                    print(f"[FSDP Profile] Rank {rank} Layer {module_type.__name__} norm computation: "
+                          f"{comp_time:.2f} ms "
+                          f"(act: {act_shape}, bp: {bp_shape})")
 
             for idx, (_, ns) in enumerate(
                 (item for item in norm_samples.items() if item[0].requires_grad)
@@ -305,11 +342,51 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
             else:
                 grad_sampler_fn = ft_compute_per_sample_gradient
 
+            if enable_detailed_profiling:
+                sync()
+                t_comp_start = time.time()
+
             grad_samples = grad_sampler_fn(module, activations, backprops)
+
+            if enable_detailed_profiling:
+                sync()
+                t_comp_end = time.time()
+                layer_stats['comp_time'] = (t_comp_end - t_comp_start) * 1000
 
             for idx, (_, gs) in enumerate((item for item in grad_samples.items())):
                 module.norm_sample[idx] = gs.reshape(len(gs), -1).norm(2, dim=-1)
             del grad_samples
+
+        # Track hook exit time
+        if enable_detailed_profiling:
+            sync()
+            t_hook_exit = time.time()
+            layer_stats['total_time'] = (t_hook_exit - t_hook_entry) * 1000
+            layer_stats['hook_overhead'] = layer_stats['total_time'] - layer_stats.get('comp_time', 0)
+            layer_stats['module_type'] = module_type.__name__
+            
+            # Store stats for later aggregation
+            self._comm_stats['total_hooks'] += 1
+            if 'param_access_time' in layer_stats:
+                self._comm_stats['total_comm_time'] += layer_stats['param_access_time']
+            if 'comp_time' in layer_stats:
+                self._comm_stats['total_comp_time'] += layer_stats['comp_time']
+            self._comm_stats['per_layer_stats'].append(layer_stats)
+            
+            # Print per-layer detailed stats
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            if rank == 0:  # Only print from rank 0 to avoid clutter
+                print(f"[FSDP Comm Profile] Layer {module_type.__name__}:")
+                print(f"  - Hook entry: 0.00 ms (relative)")
+                if 'param_access_time' in layer_stats:
+                    print(f"  - Wait for params (all-gather): {layer_stats['param_access_time']:.2f} ms")
+                if 'comp_time' in layer_stats:
+                    print(f"  - Norm computation: {layer_stats['comp_time']:.2f} ms")
+                print(f"  - Hook exit: {layer_stats['total_time']:.2f} ms")
+                print(f"  - Total hook time: {layer_stats['total_time']:.2f} ms")
+                if 'param_access_time' in layer_stats:
+                    comm_pct = (layer_stats['param_access_time'] / layer_stats['total_time'] * 100) if layer_stats['total_time'] > 0 else 0
+                    print(f"  - Communication overhead: {layer_stats['param_access_time']:.2f} ms ({comm_pct:.1f}%)")
 
         if len(module.activations) == 0:
             if hasattr(module, "max_batch_len"):
@@ -484,3 +561,44 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
         """Clear the bookkeeping cache to free memory."""
         if self._bk_cache is not None:
             self._bk_cache.clear()
+    
+    def print_fsdp_comm_summary(self):
+        """
+        Print summary statistics for FSDP communication profiling.
+        Should be called after backward pass completes.
+        """
+        enable_detailed_profiling = os.environ.get('OPACUS_PROFILE_FSDP_DETAILED', '0') == '1'
+        if not enable_detailed_profiling:
+            return
+        
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank != 0:  # Only print from rank 0
+            return
+        
+        stats = self._comm_stats
+        if stats['total_hooks'] == 0:
+            return
+        
+        total_time = stats['total_comm_time'] + stats['total_comp_time']
+        comm_pct = (stats['total_comm_time'] / total_time * 100) if total_time > 0 else 0
+        comp_pct = (stats['total_comp_time'] / total_time * 100) if total_time > 0 else 0
+        avg_comm = stats['total_comm_time'] / stats['total_hooks'] if stats['total_hooks'] > 0 else 0
+        
+        print(f"\n{'='*80}")
+        print(f"[FSDP Comm Summary] Rank {rank}:")
+        print(f"  - Total layers processed: {stats['total_hooks']}")
+        print(f"  - Total communication time (all-gather): {stats['total_comm_time']:.2f} ms")
+        print(f"  - Total computation time: {stats['total_comp_time']:.2f} ms")
+        print(f"  - Total time in hooks: {total_time:.2f} ms")
+        print(f"  - Communication overhead: {comm_pct:.1f}%")
+        print(f"  - Computation: {comp_pct:.1f}%")
+        print(f"  - Avg per-layer all-gather: {avg_comm:.2f} ms")
+        print(f"{'='*80}\n")
+        
+        # Reset stats for next iteration
+        self._comm_stats = {
+            'total_hooks': 0,
+            'total_comm_time': 0.0,
+            'total_comp_time': 0.0,
+            'per_layer_stats': []
+        }

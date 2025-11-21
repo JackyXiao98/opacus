@@ -66,7 +66,13 @@ def run_experiment_worker(
 ):
     """Run experiment on a single GPU worker"""
     torch.cuda.set_device(rank)
-    setup(rank, world_size)
+    
+    # Determine if this is an FSDP mode
+    is_fsdp_mode = mode in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_fsdp_bk", "no_dp"]
+    
+    # Only setup distributed for FSDP modes
+    if is_fsdp_mode:
+        setup(rank, world_size)
     
     master_process = rank == 0
     torch.manual_seed(1337 + rank)
@@ -101,35 +107,60 @@ def run_experiment_worker(
     # Set pad_token_id in model config
     model.config.pad_token_id = tokenizer.pad_token_id
     
-    # Wrap with FSDP2
-    mp_policy = dist.fsdp.MixedPrecisionPolicy(
-        param_dtype=torch.bfloat16, 
-        reduce_dtype=torch.float32
-    )
-    model = FSDP2Wrapper(model, mp_policy=mp_policy)
+    # Wrap with FSDP2 only for FSDP modes
+    if is_fsdp_mode:
+        if master_process:
+            print("Wrapping model with FSDP2")
+        mp_policy = dist.fsdp.MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16, 
+            reduce_dtype=torch.float32
+        )
+        model = FSDP2Wrapper(model, mp_policy=mp_policy)
+    else:
+        if master_process:
+            print("Using single-GPU mode (no FSDP)")
+        # Move model to device for single-GPU mode
+        model = model.to(f"cuda:{rank}")
+    
     model.train()
     
     # Create optimizer
     optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
     criterion = torch.nn.CrossEntropyLoss()
     
-    # Apply DP-SGD if needed
-    if mode in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk"]:
+    # Apply DP-SGD if needed (exclude no_dp and no_dp_single)
+    is_dp_mode = mode not in ["no_dp", "no_dp_single"]
+    
+    if is_dp_mode:
         if master_process:
             print(f"Applying DP-SGD with mode: {mode}")
         
         privacy_engine = PrivacyEngine()
         
         # Create dummy dataloader for make_private
-        from torch.utils.data import TensorDataset, DataLoader, DistributedSampler
-        dummy_data = torch.randn(batch_size * world_size, seq_length)
-        dummy_labels = torch.randint(0, 3, (batch_size * world_size,))
-        dummy_dataset = TensorDataset(dummy_data, dummy_labels)
-        dummy_dataloader = DataLoader(
-            dummy_dataset,
-            batch_size=batch_size,
-            sampler=DistributedSampler(dummy_dataset, num_replicas=world_size, rank=rank),
-        )
+        from torch.utils.data import TensorDataset, DataLoader
+        
+        if is_fsdp_mode:
+            # FSDP mode: use DistributedSampler
+            from torch.utils.data import DistributedSampler
+            dummy_data = torch.randn(batch_size * world_size, seq_length)
+            dummy_labels = torch.randint(0, 3, (batch_size * world_size,))
+            dummy_dataset = TensorDataset(dummy_data, dummy_labels)
+            dummy_dataloader = DataLoader(
+                dummy_dataset,
+                batch_size=batch_size,
+                sampler=DistributedSampler(dummy_dataset, num_replicas=world_size, rank=rank),
+            )
+        else:
+            # Single-GPU mode: regular dataloader
+            dummy_data = torch.randn(batch_size, seq_length)
+            dummy_labels = torch.randint(0, 3, (batch_size,))
+            dummy_dataset = TensorDataset(dummy_data, dummy_labels)
+            dummy_dataloader = DataLoader(
+                dummy_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+            )
         
         model, optimizer, criterion, _ = privacy_engine.make_private(
             module=model,
@@ -160,7 +191,7 @@ def run_experiment_worker(
         optimizer.zero_grad()
         
         # Model computes loss internally when labels are provided
-        if mode in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk"]:
+        if is_dp_mode:
             # For DP modes, we need to use the criterion wrapper
             outputs = model(
                 input_ids=batch["input_ids"],
@@ -203,7 +234,7 @@ def run_experiment_worker(
         optimizer.zero_grad()
         
         # Model computes loss internally when labels are provided
-        if mode in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk"]:
+        if is_dp_mode:
             # For DP modes, we need to use the criterion wrapper
             outputs = model(
                 input_ids=batch["input_ids"],
@@ -249,15 +280,26 @@ def run_experiment_worker(
         results_dict["peak_memory_gb"] = peak_memory_gb
         results_dict["avg_time_ms"] = avg_time_ms
     
-    cleanup()
+    # Only cleanup distributed for FSDP modes
+    if is_fsdp_mode:
+        cleanup()
 
 
 def run_experiment(config):
     """Run the experiment with the given configuration"""
-    world_size = torch.cuda.device_count()
+    # Determine if this is an FSDP mode (multi-GPU)
+    is_fsdp_mode = config["mode"] in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_fsdp_bk", "no_dp"]
     
-    if world_size == 0:
-        raise RuntimeError("No CUDA devices available")
+    if is_fsdp_mode:
+        # FSDP mode: use all available GPUs
+        world_size = torch.cuda.device_count()
+        if world_size == 0:
+            raise RuntimeError("No CUDA devices available")
+    else:
+        # Single-GPU mode: use only 1 GPU
+        world_size = 1
+        if torch.cuda.device_count() == 0:
+            raise RuntimeError("No CUDA devices available")
     
     print(f"\n{'#'*80}")
     print(f"Configuration:")
@@ -275,27 +317,46 @@ def run_experiment(config):
     manager = mp.Manager()
     results_dict = manager.dict()
     
-    # Spawn processes
-    mp.spawn(
-        run_experiment_worker,
-        args=(
-            world_size,
-            config["mode"],
-            config["model_name"],
-            config["token"],
-            config["seq_length"],
-            config["batch_size"],
-            config["num_iter"],
-            config["warmup_iter"],
-            config["vocab_size"],
-            config["learning_rate"],
-            config["sigma"],
-            config["max_grad_norm"],
-            results_dict,
-        ),
-        nprocs=world_size,
-        join=True,
-    )
+    if is_fsdp_mode:
+        # FSDP mode: spawn multiple processes
+        mp.spawn(
+            run_experiment_worker,
+            args=(
+                world_size,
+                config["mode"],
+                config["model_name"],
+                config["token"],
+                config["seq_length"],
+                config["batch_size"],
+                config["num_iter"],
+                config["warmup_iter"],
+                config["vocab_size"],
+                config["learning_rate"],
+                config["sigma"],
+                config["max_grad_norm"],
+                results_dict,
+            ),
+            nprocs=world_size,
+            join=True,
+        )
+    else:
+        # Single-GPU mode: run directly without multiprocessing
+        run_experiment_worker(
+            rank=0,
+            world_size=1,
+            mode=config["mode"],
+            model_name=config["model_name"],
+            token=config["token"],
+            seq_length=config["seq_length"],
+            batch_size=config["batch_size"],
+            num_iter=config["num_iter"],
+            warmup_iter=config["warmup_iter"],
+            vocab_size=config["vocab_size"],
+            learning_rate=config["learning_rate"],
+            sigma=config["sigma"],
+            max_grad_norm=config["max_grad_norm"],
+            results_dict=results_dict,
+        )
     
     # Extract results
     results = {
@@ -320,10 +381,10 @@ def run_experiment(config):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run single FSDP Llama3 profiling experiment")
+    parser = argparse.ArgumentParser(description="Run single FSDP/Single-GPU Llama3 profiling experiment")
     parser.add_argument("--mode", type=str, required=True,
-                       choices=["no_dp", "ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_bk"],
-                       help="Training mode")
+                       choices=["no_dp", "no_dp_single", "ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_fsdp_bk", "flash", "flash_bk", "ghost", "ghost_bk"],
+                       help="Training mode: no_dp (multi-GPU no DP), no_dp_single (single-GPU no DP), *_fsdp (multi-GPU with DP), others (single-GPU with DP)")
     parser.add_argument("--seq-length", type=int, required=True,
                        help="Sequence length")
     parser.add_argument("--batch-size", type=int, default=1,
