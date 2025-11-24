@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import List
 
 import torch
@@ -33,11 +32,17 @@ logger = logging.getLogger(__name__)
 logger.disabled = True
 
 
-class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipping):
+class GradSampleModuleFastGradientClippingFSDPAsync(GradSampleModuleFastGradientClipping):
     """
-    Hooks-based implementation of GradSampleModule with Fast Gradient and Ghost Clipping and FSDP support
-
-    Computes norms of gradients without gradient instantiation
+    Async CUDA stream version of GradSampleModuleFastGradientClippingFSDP
+    
+    Uses async CUDA streams to overlap norm computation with FSDP communication,
+    eliminating pipeline bubbles during backward pass.
+    
+    Key optimizations:
+    - Norm computation happens in parallel CUDA stream
+    - No blocking of FSDP backward communication
+    - Memory-safe tensor lifetime management
     """
     # Note: FLASH_NORM_SAMPLERS is inherited from parent class
     # Do not redefine it here, otherwise it will create an empty dict that shadows the parent's registered samplers
@@ -97,9 +102,10 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
             enable_fastdp_bookkeeping=enable_fastdp_bookkeeping,
         )
 
-        # Deferred norm computation cache
-        self._deferred_norm_cache = []
-        self._use_deferred_norm = os.environ.get('OPACUS_USE_DEFERRED_NORM', '0') == '1'
+        # Async CUDA stream for norm computation
+        self._norm_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        self._async_keep_alive = []  # Keep tensors alive during async computation
+        self._async_norm_futures = []  # Store pending norm results
 
     def _get_module_type(self, module: nn.Module) -> str:
         module_type = (
@@ -109,14 +115,45 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
         )
         return module_type
 
+    def _is_fsdp_active(self) -> bool:
+        """Check if model is actually using FSDP."""
+        try:
+            # Check if any module is FSDP wrapped
+            for m in self._module.modules():
+                if hasattr(m, '__class__'):
+                    class_name = m.__class__.__name__
+                    type_str = str(type(m)).lower()
+                    if 'FSDP' in class_name or 'fsdp' in type_str:
+                        return True
+            return False
+        except:
+            return False
+
+    def wait_for_norms(self):
+        """
+        Synchronize async norm stream before accessing norms.
+        
+        This must be called before:
+        - Accessing per_sample_gradient_norms
+        - Computing clipping coefficients
+        - Performing optimizer step
+        """
+        if self._norm_stream is not None:
+            torch.cuda.current_stream().wait_stream(self._norm_stream)
+        
+        # Clear cached tensors after sync
+        self._async_keep_alive.clear()
+        self._async_norm_futures.clear()
+
     def get_norm_sample(self) -> torch.Tensor:
         """
         Get per-example gradient norms with distributed reduction.
         
-        This is different from the parent class as norm_sample is an attribute of the module 
-        instead of the parameter. For FSDP, we need to all-reduce the per-sample norms across 
-        ranks to get the global gradient norms.
+        Automatically synchronizes async norm computation before accessing norms.
         """
+        # Wait for async norm computation to complete
+        self.wait_for_norms()
+        
         # Stack per-parameter norms from all modules
         stacked_norms = torch.stack(
             [
@@ -182,12 +219,14 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
         batch_first: bool,
     ):
         """
-        Computes norms of per sample gradient given the current backprops and activations
-        stored by the associated forward hook. Computed per sample gradient norms are
-        stored in ``norm_sample`` field in each module.
-        This function differs from capture_backprops_hook in GradSampleModuleFastGradientClipping in that
-        it attaches all the attributes to the module instead of the parameter variable.
-
+        Computes norms of per sample gradient using async CUDA streams.
+        
+        Key differences from synchronous version:
+        - Parameter checks happen in main thread before stream context
+        - Norm computation launches in async stream
+        - Returns immediately without blocking
+        - Tensors kept alive in _async_keep_alive
+        
         Args:
             module: nn.Module,
             _forward_input: torch.Tensor,
@@ -210,50 +249,11 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
         module_type = self._get_module_type(module)
         module._forward_counter -= 1
         
-        # Deferred norm computation mode: only collect data, don't compute norms
-        if self._use_deferred_norm:
-            # IMPORTANT: In Ghost Clipping mode, gradient sync is disabled during first backward
-            # Calling trainable_parameters() here would trigger FSDP all-gather and cause deadlock
-            # Solution: Don't count parameters here, defer everything to compute_all_norms_parallel()
-            
-            # Cache metadata before module state gets cleaned up
-            cached_max_batch_len = module.max_batch_len if hasattr(module, "max_batch_len") else None
-            
-            # Mark norm_sample as uninitialized (will be created later)
-            if not hasattr(module, "norm_sample"):
-                module.norm_sample = None
-            
-            # Cache data for later parallel computation
-            # DO NOT call trainable_parameters() here to avoid FSDP deadlock!
-            self._deferred_norm_cache.append({
-                'module': module,
-                'module_type': module_type,
-                'activations': activations,
-                'backprops': backprops,
-                'loss_reduction': loss_reduction,
-                'batch_first': batch_first,
-                'max_batch_len': cached_max_batch_len,
-            })
-            
-            # Still cache for bookkeeping if enabled
-            if self.enable_fastdp_bookkeeping:
-                self._bk_cache.append({
-                    'module': module,
-                    'activations': activations,
-                    'backprops': backprops,
-                })
-            
-            # Exit early - no immediate norm computation
-            if len(module.activations) == 0:
-                if hasattr(module, "max_batch_len"):
-                    del module.max_batch_len
-            return
-
-        # Original immediate computation path
+        # MAIN THREAD: Initialize norm_sample storage and check parameter requirements
+        # This must happen BEFORE entering the async stream context
         if not hasattr(module, "norm_sample"):
-            # currently, we don't support freezing and unfreezing params in between training. Making this a dictionary and mapping with param names might fix this.
             module.norm_sample = []
-            # This call to trainable_parameters triggers FSDP all-gather!
+            # Safe to call trainable_parameters here (main thread, no stream context)
             for _, param in trainable_parameters(module):
                 module.norm_sample.append(
                     torch.zeros(
@@ -262,23 +262,123 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
                         dtype=param.dtype,
                     )
                 )
+        
+        # MAIN THREAD: Check parameter requirements (for Linear layers with flash clipping)
+        weight_requires_grad = False
+        bias_requires_grad = False
+        weight_param = None
+        bias_param = None
+        
+        if module_type == nn.Linear and self.use_flash_clipping:
+            # Check parameters in main thread before entering async stream
+            for param_name, param in trainable_parameters(module):
+                if param_name.endswith('weight'):
+                    weight_requires_grad = param.requires_grad
+                    weight_param = param
+                elif param_name.endswith('bias'):
+                    bias_requires_grad = param.requires_grad
+                    bias_param = param
 
+        # ASYNC STREAM: Launch norm computation without blocking (only if FSDP is active)
+        # Only use async stream if FSDP is active (otherwise just adds overhead)
+        use_async = self._norm_stream is not None and torch.cuda.is_available() and self._is_fsdp_active()
+        
+        if use_async:
+            # Wait for main stream to ensure activations and backprops are ready
+            self._norm_stream.wait_stream(torch.cuda.current_stream())
+            
+            with torch.cuda.stream(self._norm_stream):
+                self._compute_norms_async(
+                    module=module,
+                    module_type=module_type,
+                    activations=activations,
+                    backprops=backprops,
+                    weight_requires_grad=weight_requires_grad,
+                    bias_requires_grad=bias_requires_grad,
+                    weight_param=weight_param,
+                    bias_param=bias_param,
+                )
+            
+            # Keep tensors alive until async computation completes
+            self._async_keep_alive.append({
+                'activations': activations,
+                'backprops': backprops,
+                'module': module,
+            })
+            
+            # Prevent unbounded growth - if cache too large, sync immediately
+            if len(self._async_keep_alive) > 100:  # Safety limit
+                self.wait_for_norms()
+        else:
+            # CPU fallback or non-FSDP: compute synchronously
+            self._compute_norms_async(
+                module=module,
+                module_type=module_type,
+                activations=activations,
+                backprops=backprops,
+                weight_requires_grad=weight_requires_grad,
+                bias_requires_grad=bias_requires_grad,
+                weight_param=weight_param,
+                bias_param=bias_param,
+            )
+        
+        # Clean up activations
+        if len(module.activations) == 0:
+            if hasattr(module, "max_batch_len"):
+                del module.max_batch_len
+
+    def _compute_norms_async(
+        self,
+        module: nn.Module,
+        module_type: type,
+        activations: List[torch.Tensor],
+        backprops: torch.Tensor,
+        weight_requires_grad: bool,
+        bias_requires_grad: bool,
+        weight_param: nn.Parameter = None,
+        bias_param: nn.Parameter = None,
+    ):
+        """
+        Internal method to compute norms. Can be called in async stream.
+        
+        This method is stream-safe: it doesn't access any parameter attributes
+        that could trigger FSDP synchronization.
+        """
         if self.use_ghost_clipping and (
             module_type in self.NORM_SAMPLERS or 
             (self.use_flash_clipping and module_type in self.FLASH_NORM_SAMPLERS)
         ):
             # Use Flash sampler if available and enabled, otherwise use standard sampler
             if self.use_flash_clipping and module_type in self.FLASH_NORM_SAMPLERS:
-                norm_sampler_fn = self.FLASH_NORM_SAMPLERS[module_type]
+                # Import async version for Linear layers
+                if module_type == nn.Linear:
+                    from opacus.grad_sample.triton_kernels_async import compute_linear_norm_sample_flash_async
+                    norm_samples = compute_linear_norm_sample_flash_async(
+                        activations=activations,
+                        backprops=backprops,
+                        weight_requires_grad=weight_requires_grad,
+                        bias_requires_grad=bias_requires_grad,
+                        weight_param=weight_param,
+                        bias_param=bias_param,
+                        algorithm="input_length",
+                        use_flash_clipping=self.use_flash_clipping,
+                    )
+                else:
+                    # Other flash samplers (not Linear)
+                    norm_sampler_fn = self.FLASH_NORM_SAMPLERS[module_type]
+                    norm_samples = norm_sampler_fn(module, activations, backprops)
             else:
+                # Standard norm sampler
                 norm_sampler_fn = self.NORM_SAMPLERS[module_type]
-            
-            norm_samples = norm_sampler_fn(module, activations, backprops)
+                norm_samples = norm_sampler_fn(module, activations, backprops)
 
-            for idx, (_, ns) in enumerate(
+            # Assign norms to module.norm_sample
+            # IMPORTANT: Must filter by requires_grad and iterate in same order as original
+            for idx, (param, ns) in enumerate(
                 (item for item in norm_samples.items() if item[0].requires_grad)
             ):
-                module.norm_sample[idx] = ns
+                if idx < len(module.norm_sample):
+                    module.norm_sample[idx] = ns
             
             # FastDP Bookkeeping: Cache activations and backprops for later gradient computation
             if self.enable_fastdp_bookkeeping:
@@ -289,6 +389,7 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
                     'backprops': backprops,
                 })
         else:
+            # Fall back to grad sampler
             if not self.force_functorch and module_type in self.GRAD_SAMPLERS:
                 grad_sampler_fn = self.GRAD_SAMPLERS[module_type]
             else:
@@ -299,10 +400,6 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
             for idx, (_, gs) in enumerate((item for item in grad_samples.items())):
                 module.norm_sample[idx] = gs.reshape(len(gs), -1).norm(2, dim=-1)
             del grad_samples
-
-        if len(module.activations) == 0:
-            if hasattr(module, "max_batch_len"):
-                del module.max_batch_len
     
     def populate_clipped_gradients(self, clipping_coef: torch.Tensor):
         """
@@ -473,161 +570,4 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
         """Clear the bookkeeping cache to free memory."""
         if self._bk_cache is not None:
             self._bk_cache.clear()
-    
-    def compute_all_norms_parallel(self):
-        """
-        Compute all deferred norms in parallel after backward pass completes.
-        This is the key optimization that replaces per-layer serial norm computation.
-        
-        Called after the first backward pass when using deferred norm computation mode.
-        """
-        if not hasattr(self, '_deferred_norm_cache') or len(self._deferred_norm_cache) == 0:
-            return
-        
-        # Process all cached layers and compute norms
-        for layer_data in self._deferred_norm_cache:
-            self._compute_single_layer_norm(layer_data)
-        
-        # Clear cache after computation
-        self._deferred_norm_cache.clear()
-    
-    def _compute_single_layer_norm(self, layer_data):
-        """
-        Compute norm for a single layer using cached activations and backprops.
-        This is called by compute_all_norms_parallel() for each layer.
-        
-        Args:
-            layer_data: Dict containing module, activations, backprops, and metadata
-        """
-        module = layer_data['module']
-        module_type = layer_data['module_type']
-        activations = layer_data['activations']
-        backprops = layer_data['backprops']
-        max_batch_len = layer_data.get('max_batch_len')
-        
-        # Initialize norm_sample storage if needed
-        # In deferred mode, this was set to None, so we need to properly initialize it
-        # This is called AFTER backward completes and gradient sync is re-enabled,
-        # so it's now safe to call trainable_parameters()
-        if not hasattr(module, "norm_sample") or module.norm_sample is None:
-            module.norm_sample = []
-            
-            # Infer device and dtype from backprops instead of accessing parameters
-            device = backprops.device
-            dtype = backprops.dtype
-            
-            # Now it's safe to count parameters (gradient sync is re-enabled)
-            num_params = sum(1 for _ in trainable_parameters(module))
-            
-            # Create norm_sample tensors
-            for _ in range(num_params):
-                module.norm_sample.append(
-                    torch.zeros(
-                        torch.Size([max_batch_len, 1]),
-                        device=device,
-                        dtype=dtype,
-                    )
-                )
-        
-        # Compute norms using appropriate sampler
-        if self.use_ghost_clipping and (
-            module_type in self.NORM_SAMPLERS or 
-            (self.use_flash_clipping and module_type in self.FLASH_NORM_SAMPLERS)
-        ):
-            # Use Flash sampler if available and enabled
-            if self.use_flash_clipping and module_type in self.FLASH_NORM_SAMPLERS:
-                norm_sampler_fn = self.FLASH_NORM_SAMPLERS[module_type]
-            else:
-                norm_sampler_fn = self.NORM_SAMPLERS[module_type]
-            
-            norm_samples = norm_sampler_fn(module, activations, backprops)
-            
-            # IMPORTANT: In deferred mode, avoid accessing parameter attributes
-            # The norm_sampler returns a dict {param: norm_tensor}
-            # We only care about the norm values, in the order they were created
-            # Since trainable_parameters() returns params in a consistent order,
-            # and norm_sampler uses the same iteration, we can just use values()
-            for idx, ns in enumerate(norm_samples.values()):
-                if idx < len(module.norm_sample):
-                    module.norm_sample[idx] = ns
-        else:
-            # Use grad sampler for non-ghost clipping layers
-            if not self.force_functorch and module_type in self.GRAD_SAMPLERS:
-                grad_sampler_fn = self.GRAD_SAMPLERS[module_type]
-                grad_samples = grad_sampler_fn(module, activations, backprops)
-                
-                for idx, (_, gs) in enumerate((item for item in grad_samples.items())):
-                    module.norm_sample[idx] = gs.reshape(len(gs), -1).norm(2, dim=-1)
-                del grad_samples
-            else:
-                # functorch doesn't work with FSDP DTensors in deferred norm mode
-                # For layers without specialized samplers, check if they have trainable parameters
-                has_trainable_params = any(p.requires_grad for p in module.parameters(recurse=False))
-                
-                if has_trainable_params:
-                    # Layer has trainable parameters but no specialized sampler
-                    # This will lead to incorrect gradient norms, so we must error out
-                    raise NotImplementedError(
-                        f"Layer type {module_type.__name__} doesn't have a specialized grad_sampler "
-                        f"and cannot be used with FSDP + deferred norm computation. "
-                        f"Please register a grad_sampler or norm_sampler for this layer type, "
-                        f"or disable deferred norm computation (set OPACUS_USE_DEFERRED_NORM=0)."
-                    )
-                else:
-                    # Layer has no trainable parameters, safe to skip (contributes zero to grad norm)
-                    # This should not happen as we filter in capture_backprops_hook, but handle gracefully
-                    pass
-    
-    def verify_norm_correctness(self, rtol=1e-4, atol=1e-6):
-        """
-        Verify that deferred norm computation produces the same results as immediate computation.
-        This should be called after both methods have computed norms for comparison.
-        
-        Args:
-            rtol: Relative tolerance for comparison
-            atol: Absolute tolerance for comparison
-            
-        Returns:
-            bool: True if norms match within tolerance, raises ValueError otherwise
-        """
-        if not hasattr(self, '_deferred_norms') or not hasattr(self, '_immediate_norms'):
-            raise RuntimeError("Both deferred and immediate norms must be computed before verification")
-        
-        deferred = self._deferred_norms
-        immediate = self._immediate_norms
-        
-        if len(deferred) != len(immediate):
-            raise ValueError(
-                f"Norm count mismatch: deferred={len(deferred)}, immediate={len(immediate)}"
-            )
-        
-        max_diff = 0.0
-        max_rel_diff = 0.0
-        
-        for i, (d_norm, i_norm) in enumerate(zip(deferred, immediate)):
-            if not torch.allclose(d_norm, i_norm, rtol=rtol, atol=atol):
-                diff = (d_norm - i_norm).abs()
-                max_diff_i = diff.max().item()
-                rel_diff = (diff / (i_norm.abs() + 1e-10)).max().item()
-                
-                if max_diff_i > max_diff:
-                    max_diff = max_diff_i
-                if rel_diff > max_rel_diff:
-                    max_rel_diff = rel_diff
-        
-        if max_diff > atol or max_rel_diff > rtol:
-            raise ValueError(
-                f"Norm mismatch detected!\n"
-                f"  Max absolute difference: {max_diff:.6e}\n"
-                f"  Max relative difference: {max_rel_diff:.6e}\n"
-                f"  Tolerance: rtol={rtol}, atol={atol}"
-            )
-        
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        if rank == 0:
-            print(f"\n✓ Norm correctness verified!")
-            print(f"  Compared {len(deferred)} norms")
-            print(f"  Max absolute difference: {max_diff:.6e}")
-            print(f"  Max relative difference: {max_rel_diff:.6e}\n")
-        
-        return True
+

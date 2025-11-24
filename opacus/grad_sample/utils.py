@@ -24,6 +24,9 @@ from .grad_sample_module_fast_gradient_clipping import (
 from .grad_sample_module_fast_gradient_clipping_fsdp import (
     GradSampleModuleFastGradientClippingFSDP,
 )
+from .grad_sample_module_fast_gradient_clipping_fsdp_async import (
+    GradSampleModuleFastGradientClippingFSDPAsync,
+)
 from .gsm_base import AbstractGradSampleModule
 from .gsm_exp_weights import GradSampleModuleExpandedWeights
 from .gsm_no_op import GradSampleModuleNoOp
@@ -147,9 +150,9 @@ def get_gsm_class(grad_sample_mode: str) -> Type[AbstractGradSampleModule]:
     elif grad_sample_mode == "ghost_fsdp_bk":
         return GradSampleModuleFastGradientClippingFSDP
     elif grad_sample_mode == "flash_fsdp":
-        return GradSampleModuleFastGradientClippingFSDP
+        return GradSampleModuleFastGradientClippingFSDPAsync
     elif grad_sample_mode == "flash_fsdp_bk":
-        return GradSampleModuleFastGradientClippingFSDP
+        return GradSampleModuleFastGradientClippingFSDPAsync
     elif grad_sample_mode == "no_op":
         return GradSampleModuleNoOp
     else:

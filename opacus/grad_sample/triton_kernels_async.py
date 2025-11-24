@@ -1,17 +1,16 @@
 """
-Flash Clipping Algorithms for Linear Layers
+Flash Clipping Algorithms for Linear Layers - Async Stream Safe Version
 
-This module implements two flash clipping algorithms:
+This module implements async CUDA stream-safe versions of flash clipping algorithms:
 1. Input-Length-Linear Algorithm: O(T * d^2) - optimal for long sequences
 2. Width-Linear Algorithm: O(T^2 * d) - optimal for wide models
 
-Both algorithms compute per-sample gradient norms efficiently without materializing
-the full per-sample gradients.
-
-With optional Triton acceleration for GPU computation.
+Key difference from triton_kernels.py:
+- Parameter-safe interface that avoids accessing layer.weight/layer.bias inside streams
+- Designed to be called from async CUDA streams without triggering FSDP synchronization
 """
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
 
@@ -261,37 +260,46 @@ def _width_frobenius_triton(
 
 
 @torch.no_grad()
-def compute_linear_norm_sample_flash(
-    layer: nn.Linear,
+def compute_linear_norm_sample_flash_async(
     activations: List[torch.Tensor],
     backprops: torch.Tensor,
+    weight_requires_grad: bool,
+    bias_requires_grad: bool,
+    weight_param: Optional[nn.Parameter] = None,
+    bias_param: Optional[nn.Parameter] = None,
     algorithm: str = "input_length",
     tile_size: int = 1024,
     dtype_acc = torch.float32,
     use_flash_clipping: bool = False,
 ) -> Dict[nn.Parameter, torch.Tensor]:
     """
-    Compute per-sample gradient norms for a linear layer using flash clipping algorithms.
+    Async CUDA stream-safe version of compute_linear_norm_sample_flash.
     
-    This function implements two algorithms that can be selected via the 'algorithm' parameter:
-    - "input_length": Input-Length-Linear Algorithm, O(T * d^2), optimal for long sequences
-    - "width": Width-Linear Algorithm, O(T^2 * d), optimal for wide models
+    This function is designed to be called from async CUDA streams without
+    triggering FSDP parameter gathering or synchronization. It avoids
+    accessing any layer parameter attributes inside the computation.
     
-    Both algorithms can optionally use Triton acceleration for GPU computation.
+    Key differences from the original:
+    - Takes boolean flags instead of checking layer.weight.requires_grad
+    - Takes parameter references as arguments instead of accessing layer.weight/bias
+    - No parameter attribute access inside computation blocks
     
     Args:
-        layer: The linear layer (nn.Linear)
         activations: List containing input activations [A]
         backprops: Gradient w.r.t. layer output (2D: [B, d_out] or 3D: [B, T, d_out])
+        weight_requires_grad: Whether weight requires gradient (checked in main thread)
+        bias_requires_grad: Whether bias requires gradient (checked in main thread)
+        weight_param: Weight parameter reference for dict key (optional)
+        bias_param: Bias parameter reference for dict key (optional)
         algorithm: Algorithm selection - "input_length" or "width"
         tile_size: Block size for tiling (B_T in the algorithm specification)
         dtype_acc: Accumulation dtype for numerical stability
-        use_triton: Whether to use Triton acceleration (requires CUDA and Triton)
+        use_flash_clipping: Whether flash clipping is enabled (for compatibility)
     
     Returns:
-        Dictionary mapping layer parameters to their per-sample gradient norms
-        - layer.weight: [B] tensor of weight gradient norms
-        - layer.bias: [B] tensor of bias gradient norms (if bias exists)
+        Dictionary mapping parameters to their per-sample gradient norms
+        - weight_param: [B] tensor of weight gradient norms (if weight_requires_grad)
+        - bias_param: [B] tensor of bias gradient norms (if bias_requires_grad)
     
     Raises:
         ValueError: If algorithm is not "input_length" or "width"
@@ -306,16 +314,25 @@ def compute_linear_norm_sample_flash(
     if backprops.dim() == 2:
         # 2D case: [B, d_out]
         # For 2D, use simple einsum (both algorithms are equivalent and efficient)
-        if layer.weight.requires_grad:
+        if weight_requires_grad:
             # Gradient norm = sqrt(||g||^2 * ||a||^2)
             g2 = torch.sum(backprops * backprops, dim=1)  # [B]
             a2 = torch.sum(A * A, dim=1)  # [B]
-            ret[layer.weight] = torch.sqrt((g2 * a2).clamp_min(0.0))
+            norm_weight = torch.sqrt((g2 * a2).clamp_min(0.0))
+            if weight_param is not None:
+                ret[weight_param] = norm_weight
+            else:
+                # Fallback: return with a placeholder key
+                ret['weight'] = norm_weight
         
-        if (layer.bias is not None) and layer.bias.requires_grad:
+        if bias_requires_grad:
             # Bias gradient norm = ||g||
             g2 = torch.sum(backprops * backprops, dim=1)  # [B]
-            ret[layer.bias] = torch.sqrt(g2.clamp_min(0.0))
+            norm_bias = torch.sqrt(g2.clamp_min(0.0))
+            if bias_param is not None:
+                ret[bias_param] = norm_bias
+            else:
+                ret['bias'] = norm_bias
     
     elif backprops.dim() == 3:
         # 3D case: [B, T, d_out]
@@ -323,19 +340,27 @@ def compute_linear_norm_sample_flash(
         _, T_a, d_in = A.shape
         assert T == T_a, f"Mismatched sequence lengths: backprops T={T} vs activations T={T_a}"
 
-        if layer.weight.requires_grad:
+        if weight_requires_grad:
             # Select algorithm - use PyTorch implementation
             if algorithm == "input_length":
                 ga = _input_length_frobenius(A, backprops, tile_size=tile_size, dtype_acc=dtype_acc)
             else:  # algorithm == "width"
                 ga = _width_frobenius(A, backprops, tile_size=tile_size, dtype_acc=dtype_acc)
         
-            ret[layer.weight] = torch.sqrt(ga.clamp_min(0.0))
+            norm_weight = torch.sqrt(ga.clamp_min(0.0))
+            if weight_param is not None:
+                ret[weight_param] = norm_weight
+            else:
+                ret['weight'] = norm_weight
         
-        if (layer.bias is not None) and layer.bias.requires_grad:
+        if bias_requires_grad:
             # Bias gradient norm computation
             gg = _sum_over_time_norm_squared(backprops, dtype_acc=dtype_acc)
-            ret[layer.bias] = torch.sqrt(gg.clamp_min(0.0))
+            norm_bias = torch.sqrt(gg.clamp_min(0.0))
+            if bias_param is not None:
+                ret[bias_param] = norm_bias
+            else:
+                ret['bias'] = norm_bias
 
     else:
         raise ValueError(f"Unsupported backprops dim: {backprops.dim()}, expected 2 or 3")
