@@ -22,18 +22,28 @@ BATCH_SIZE=2
 NUM_ITER=1
 WARMUP_ITER=1
 VOCAB_SIZE=128256
+# VOCAB_SIZE=32000
 LEARNING_RATE=1e-5
 SIGMA=1.0
 MAX_GRAD_NORM=1.0
 
+# Accuracy test mode (set to "true" to enable)
+# When enabled: uses low noise (sigma=0.01, epsilon≈1e-3) and high clip norm (10000)
+# to verify algorithm consistency
+ACCURACY_TEST_MODE=false
+ACCURACY_TEST_SIGMA=0.01
+ACCURACY_TEST_MAX_GRAD_NORM=10000
+ACCURACY_TEST_RANDOM_SEED=42
+
 # Sequence lengths to test
-SEQ_LENGTHS=(16384)
+SEQ_LENGTHS=(1024)
 
 # Modes to test
 # Available FSDP modes: no_dp, ghost_fsdp, flash_fsdp, flash_fsdp_bk, ghost_fsdp_bk, flash_fsdp_fuse, flash_fsdp_fuse_bk
 # Available Single-GPU modes: no_dp_single, ghost, flash, flash_bk, ghost_bk
 # MODES=("no_dp" "ghost_fsdp" "flash_fsdp" "flash_fsdp_fuse")
-MODES=("flash_fsdp" "flash_fsdp_fuse")
+MODES=("flash_fsdp_fuse" "flash_fsdp_fuse_bk" "flash_fsdp_bk" "flash_fsdp" "no_dp") 
+# MODES=("flash_fsdp_fuse_bk") 
 
 # Output directory
 OUTPUT_DIR="results"
@@ -49,6 +59,15 @@ echo "Model: $MODEL_NAME"
 echo "Batch size per GPU: $BATCH_SIZE"
 echo "Sequence lengths: ${SEQ_LENGTHS[@]}"
 echo "Modes: ${MODES[@]}"
+
+if [ "$ACCURACY_TEST_MODE" = "true" ]; then
+    echo ""
+    echo "🔬 ACCURACY TEST MODE ENABLED"
+    echo "   Sigma: $ACCURACY_TEST_SIGMA (epsilon ≈ 1e-3)"
+    echo "   Max Grad Norm: $ACCURACY_TEST_MAX_GRAD_NORM"
+    echo "   Random Seed: $ACCURACY_TEST_RANDOM_SEED"
+fi
+
 echo ""
 
 # Function to run a single experiment
@@ -67,6 +86,17 @@ run_experiment() {
         source .venv/bin/activate
     fi
     
+    # Determine parameters based on accuracy test mode
+    if [ "$ACCURACY_TEST_MODE" = "true" ]; then
+        CURRENT_SIGMA=$ACCURACY_TEST_SIGMA
+        CURRENT_MAX_GRAD_NORM=$ACCURACY_TEST_MAX_GRAD_NORM
+        ACCURACY_FLAG="--accuracy-test --random-seed $ACCURACY_TEST_RANDOM_SEED"
+    else
+        CURRENT_SIGMA=$SIGMA
+        CURRENT_MAX_GRAD_NORM=$MAX_GRAD_NORM
+        ACCURACY_FLAG=""
+    fi
+    
     # Run experiment in isolated process
     python single_experiment.py \
         --mode "$mode" \
@@ -79,8 +109,9 @@ run_experiment() {
         --token "$HF_TOKEN" \
         --vocab-size $VOCAB_SIZE \
         --learning-rate $LEARNING_RATE \
-        --sigma $SIGMA \
-        --max-grad-norm $MAX_GRAD_NORM
+        --sigma $CURRENT_SIGMA \
+        --max-grad-norm $CURRENT_MAX_GRAD_NORM \
+        $ACCURACY_FLAG
     
     local exit_code=$?
     

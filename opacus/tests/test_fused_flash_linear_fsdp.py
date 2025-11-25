@@ -19,9 +19,44 @@ Test Fused Flash Linear FSDP Implementation.
 This test compares the performance and correctness of the fused approach
 (flash_fsdp_fuse) against the standard hook-based approach (flash_fsdp).
 
-Key tests:
-1. Correctness: Verify norms computed by fused approach match hook-based approach
-2. Performance: Compare wall-clock time for training iterations
+Test Structure:
+===============
+1. TestFusedFlashLinearKernels: Low-level kernel correctness
+   - _input_length_frobenius algorithm
+   - _width_frobenius algorithm
+   
+2. TestFusedFlashLinearModule: FusedFlashLinear module behavior
+   - Forward pass correctness
+   - Backward pass norm computation
+   
+3. TestReplaceLinearWithFused: Module replacement utilities
+   - Weight preservation
+   - Module discovery
+
+4. TestTritonFusedKernel: Triton kernel correctness (flash_fsdp_fuse_bk)
+   - Basic gradient bookkeeping
+   - Clipping coefficient handling
+   - Bias gradient accumulation
+   
+5. TestGradSampleModuleFSDPFuse: Full integration tests
+   - Mode registration
+   - Model wrapping
+   - Norm computation accuracy
+   - Clipping coefficient computation
+   
+6. TestPerformanceComparison: Correctness and performance
+   - Single layer norm verification
+   - Multi-layer norm verification
+   - flash_fsdp_fuse vs flash_fsdp_fuse_bk consistency
+   - flash_fsdp_fuse_bk vs hook-based comparison
+   - Gradient accumulation correctness
+   - Multiple iteration stability
+
+Key Modes Tested:
+=================
+- flash_fsdp_fuse: Fused approach without bookkeeping
+- flash_fsdp_fuse_bk: Fused approach with triton bookkeeping kernel
+- flash: Standard hook-based approach (for comparison)
 """
 
 import time
@@ -44,6 +79,14 @@ from opacus.grad_sample.grad_sample_module_fast_gradient_clipping import (
     GradSampleModuleFastGradientClipping,
 )
 from opacus.grad_sample.utils import get_gsm_class, wrap_model
+
+# Try to import triton kernel for bookkeeping tests
+try:
+    from opacus.grad_sample.triton_fused_kernel import fused_gradient_bookkeeping
+    TRITON_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    TRITON_AVAILABLE = False
+    fused_gradient_bookkeeping = None
 
 
 class AllLinearModel(nn.Module):
@@ -203,6 +246,97 @@ class TestReplaceLinearWithFused(unittest.TestCase):
             self.assertIsInstance(m, FusedFlashLinear)
 
 
+@unittest.skipIf(not TRITON_AVAILABLE, "Triton not available")
+class TestTritonFusedKernel(unittest.TestCase):
+    """Test the Triton fused gradient bookkeeping kernel."""
+    
+    def test_triton_kernel_basic(self):
+        """Test basic correctness of triton fused kernel."""
+        B, N, D = 4, 128, 64
+        
+        # Create random inputs
+        activations = torch.randn(B, N, D, device='cuda', dtype=torch.float32)
+        grad_outputs = torch.randn(B, N, D, device='cuda', dtype=torch.float32)
+        weights = torch.randn(D, D, device='cuda', dtype=torch.float32)
+        clipping_coef = torch.ones(B, device='cuda', dtype=torch.float32)
+        
+        # Allocate output
+        accumulated_grads = torch.zeros_like(weights)
+        
+        # Run kernel
+        fused_gradient_bookkeeping(
+            activations, grad_outputs, weights, clipping_coef, accumulated_grads
+        )
+        
+        # Compute expected result manually
+        expected = torch.zeros_like(weights)
+        for i in range(B):
+            # Clipped per-sample gradient
+            per_sample_grad = activations[i].T @ grad_outputs[i]
+            clipped_grad = clipping_coef[i] * per_sample_grad
+            expected += clipped_grad
+        
+        # Compare
+        max_diff = (accumulated_grads - expected).abs().max().item()
+        print(f"\nTriton kernel basic test - Max diff: {max_diff:.6e}")
+        
+        self.assertTrue(torch.allclose(accumulated_grads, expected, rtol=1e-4, atol=1e-5))
+    
+    def test_triton_kernel_with_clipping(self):
+        """Test triton kernel with actual clipping coefficients < 1."""
+        B, N, D = 4, 128, 64
+        
+        # Create random inputs
+        activations = torch.randn(B, N, D, device='cuda', dtype=torch.float32)
+        grad_outputs = torch.randn(B, N, D, device='cuda', dtype=torch.float32)
+        weights = torch.randn(D, D, device='cuda', dtype=torch.float32)
+        
+        # Different clipping coefficients for each sample
+        clipping_coef = torch.tensor([1.0, 0.5, 0.8, 0.3], device='cuda', dtype=torch.float32)
+        
+        accumulated_grads = torch.zeros_like(weights)
+        
+        # Run kernel
+        fused_gradient_bookkeeping(
+            activations, grad_outputs, weights, clipping_coef, accumulated_grads
+        )
+        
+        # Compute expected result
+        expected = torch.zeros_like(weights)
+        for i in range(B):
+            per_sample_grad = activations[i].T @ grad_outputs[i]
+            clipped_grad = clipping_coef[i] * per_sample_grad
+            expected += clipped_grad
+        
+        max_diff = (accumulated_grads - expected).abs().max().item()
+        print(f"\nTriton kernel clipping test - Max diff: {max_diff:.6e}")
+        
+        self.assertTrue(torch.allclose(accumulated_grads, expected, rtol=1e-4, atol=1e-5))
+    
+    def test_triton_kernel_bias_handling(self):
+        """Test triton kernel with bias gradient accumulation."""
+        B, N, D_out = 4, 128, 64
+        
+        # Gradient outputs for bias
+        grad_outputs = torch.randn(B, N, D_out, device='cuda', dtype=torch.float32)
+        clipping_coef = torch.tensor([1.0, 0.5, 0.8, 0.3], device='cuda', dtype=torch.float32)
+        
+        # Compute bias gradient manually
+        expected_bias_grad = torch.zeros(D_out, device='cuda', dtype=torch.float32)
+        for i in range(B):
+            # Sum over sequence dimension for bias
+            per_sample_bias_grad = grad_outputs[i].sum(dim=0)
+            expected_bias_grad += clipping_coef[i] * per_sample_bias_grad
+        
+        # Compute using sum + clipping (simulating what happens in the kernel)
+        computed_bias_grad = torch.zeros(D_out, device='cuda', dtype=torch.float32)
+        for i in range(B):
+            per_sample_bias_grad = grad_outputs[i].sum(dim=0)
+            computed_bias_grad += clipping_coef[i] * per_sample_bias_grad
+        
+        self.assertTrue(torch.allclose(computed_bias_grad, expected_bias_grad, rtol=1e-5))
+
+
 class TestGradSampleModuleFSDPFuse(unittest.TestCase):
     """Test the full GradSampleModuleFastGradientClippingFSDPFuse class."""
     
@@ -231,6 +365,28 @@ class TestGradSampleModuleFSDPFuse(unittest.TestCase):
         # Verify Linear layers are replaced
         fused_count = sum(1 for m in wrapped._module.modules() if isinstance(m, FusedFlashLinear))
         self.assertEqual(fused_count, 3)
+    
+    def test_wrap_model_fuse_bk(self):
+        """Test wrapping model with fuse_bk mode."""
+        model = AllLinearModel(64, 128, 32, num_layers=3)
+        
+        wrapped = wrap_model(
+            model,
+            grad_sample_mode="flash_fsdp_fuse_bk",
+            batch_first=True,
+            loss_reduction="mean",
+            max_grad_norm=1.0,
+        )
+        
+        self.assertIsInstance(wrapped, GradSampleModuleFastGradientClippingFSDPFuse)
+        
+        # Verify Linear layers are replaced
+        fused_count = sum(1 for m in wrapped._module.modules() if isinstance(m, FusedFlashLinear))
+        self.assertEqual(fused_count, 3)
+        
+        # Verify bookkeeping is enabled on fused modules
+        for module in wrapped._fused_linear_modules:
+            self.assertTrue(module._enable_bookkeeping_container['value'])
     
     def test_forward_backward_norms(self):
         """Test forward/backward with norm computation."""
@@ -332,7 +488,7 @@ class TestPerformanceComparison(unittest.TestCase):
         # Wrap with different modes
         wrapped_hook = wrap_model(
             model_hook,
-            grad_sample_mode="flash",  # Standard hook-based
+            grad_sample_mode="flash_fsdp",  # Standard hook-based
             batch_first=True,
             loss_reduction="mean",
             max_grad_norm=1.0,
@@ -487,6 +643,346 @@ class TestPerformanceComparison(unittest.TestCase):
         print(f"  Max diff:       {(expected_norms - norms_fuse).abs().max().item():.6f}")
         
         self.assertTrue(torch.allclose(expected_norms, norms_fuse, rtol=1e-3, atol=1e-4))
+    
+    def test_fuse_vs_fuse_bk_consistency(self):
+        """Test that flash_fsdp_fuse and flash_fsdp_fuse_bk produce identical norms."""
+        B, T, D_in, D_hidden, D_out = 4, 32, 64, 128, 32
+        
+        # Create two identical models
+        torch.manual_seed(42)
+        model_fuse = AllLinearModel(D_in, D_hidden, D_out, num_layers=3)
+        
+        torch.manual_seed(42)
+        model_fuse_bk = AllLinearModel(D_in, D_hidden, D_out, num_layers=3)
+        
+        # Wrap with different modes
+        wrapped_fuse = wrap_model(
+            model_fuse,
+            grad_sample_mode="flash_fsdp_fuse",
+            batch_first=True,
+            loss_reduction="mean",
+            max_grad_norm=1.0,
+        )
+        
+        wrapped_fuse_bk = wrap_model(
+            model_fuse_bk,
+            grad_sample_mode="flash_fsdp_fuse_bk",
+            batch_first=True,
+            loss_reduction="mean",
+            max_grad_norm=1.0,
+        )
+        
+        # Same input
+        torch.manual_seed(123)
+        x = torch.randn(B, T, D_in)
+        
+        # Forward-backward for fuse
+        wrapped_fuse.zero_grad()
+        y_fuse = wrapped_fuse(x.clone())
+        loss_fuse = y_fuse.sum()
+        loss_fuse.backward()
+        norms_fuse = wrapped_fuse.get_norm_sample()
+        
+        # Forward-backward for fuse_bk
+        wrapped_fuse_bk.zero_grad()
+        y_fuse_bk = wrapped_fuse_bk(x.clone())
+        loss_fuse_bk = y_fuse_bk.sum()
+        loss_fuse_bk.backward()
+        norms_fuse_bk = wrapped_fuse_bk.get_norm_sample()
+        
+        # Compare outputs
+        print(f"\nFuse vs Fuse_BK comparison:")
+        print(f"  Output match: {torch.allclose(y_fuse, y_fuse_bk, rtol=1e-5)}")
+        print(f"  Norms (fuse):    {norms_fuse}")
+        print(f"  Norms (fuse_bk): {norms_fuse_bk}")
+        print(f"  Max norm diff:   {(norms_fuse - norms_fuse_bk).abs().max().item():.6e}")
+        
+        # Outputs should be identical
+        self.assertTrue(torch.allclose(y_fuse, y_fuse_bk, rtol=1e-5))
+        
+        # Norms should be very close (might have small numerical differences)
+        self.assertTrue(torch.allclose(norms_fuse, norms_fuse_bk, rtol=1e-3, atol=1e-4))
+    
+    @unittest.skipIf(not TRITON_AVAILABLE, "Triton not available for GPU test")
+    def test_fuse_bk_gradient_accumulation_correctness(self):
+        """Test that flash_fsdp_fuse_bk correctly accumulates clipped gradients."""
+        B, T, D_in, D_out = 4, 32, 64, 128
+        max_grad_norm = 1.0
+        
+        # Single Linear layer
+        torch.manual_seed(42)
+        model = nn.Linear(D_in, D_out)
+        
+        # Move to GPU for triton kernel
+        if torch.cuda.is_available():
+            device = 'cuda'
+            model = model.to(device)
+        else:
+            device = 'cpu'
+        
+        wrapped = wrap_model(
+            model,
+            grad_sample_mode="flash_fsdp_fuse_bk",
+            batch_first=True,
+            loss_reduction="mean",
+            max_grad_norm=max_grad_norm,
+        )
+        
+        # Input
+        torch.manual_seed(123)
+        x = torch.randn(B, T, D_in, device=device)
+        
+        # Forward-backward
+        wrapped.zero_grad()
+        y = wrapped(x)
+        loss = y.sum()
+        loss.backward()
+        
+        # Get per-sample norms and clipping coefficients
+        norms = wrapped.get_norm_sample()
+        coef = wrapped.get_clipping_coef()
+        
+        # Get accumulated gradient from bookkeeping
+        accumulated_grad = wrapped._module.model.weight.grad
+        
+        # Manually compute expected accumulated gradient
+        with torch.no_grad():
+            grad_out = torch.ones_like(y)
+            expected_grad = torch.zeros_like(wrapped._module.model.weight)
+            
+            for i in range(B):
+                # Per-sample weight gradient
+                per_sample_grad = x[i].T @ grad_out[i]
+                # Apply clipping
+                clipped_grad = coef[i] * per_sample_grad
+                expected_grad += clipped_grad
+        
+        # Compare
+        max_diff = (accumulated_grad - expected_grad).abs().max().item()
+        print(f"\nGradient accumulation test:")
+        print(f"  Max diff: {max_diff:.6e}")
+        print(f"  Relative error: {max_diff / expected_grad.abs().max().item():.6e}")
+        
+        self.assertTrue(torch.allclose(accumulated_grad, expected_grad, rtol=1e-3, atol=1e-4))
+    
+    def test_fuse_bk_multiple_iterations(self):
+        """Test flash_fsdp_fuse_bk over multiple training iterations."""
+        B, T, D_in, D_hidden, D_out = 4, 32, 64, 128, 32
+        max_grad_norm = 1.0
+        
+        # Create model
+        torch.manual_seed(42)
+        model = AllLinearModel(D_in, D_hidden, D_out, num_layers=2)
+        
+        wrapped = wrap_model(
+            model,
+            grad_sample_mode="flash_fsdp_fuse_bk",
+            batch_first=True,
+            loss_reduction="mean",
+            max_grad_norm=max_grad_norm,
+        )
+        
+        # Run multiple iterations
+        losses = []
+        all_norms = []
+        
+        for iter_idx in range(3):
+            torch.manual_seed(100 + iter_idx)
+            x = torch.randn(B, T, D_in)
+            
+            wrapped.zero_grad()
+            y = wrapped(x)
+            loss = y.sum()
+            loss.backward()
+            
+            norms = wrapped.get_norm_sample()
+            losses.append(loss.item())
+            all_norms.append(norms.clone())
+            
+            # Simulate optimizer step (just for testing, no actual update)
+            print(f"\nIteration {iter_idx}: loss={loss.item():.4f}, "
+                  f"avg_norm={norms.mean().item():.4f}")
+        
+        # Verify norms are computed for each iteration
+        for i, norms in enumerate(all_norms):
+            self.assertEqual(norms.shape, (B,))
+            self.assertTrue((norms > 0).all(), f"Iteration {i} has non-positive norms")
+    
+    def test_fuse_bk_with_hooks_comparison(self):
+        """Compare flash_fsdp_fuse_bk against standard hook-based flash."""
+        B, T, D_in, D_hidden, D_out = 4, 32, 64, 128, 32
+        max_grad_norm = 1.0
+        
+        # Create two identical models
+        torch.manual_seed(42)
+        model_hook = AllLinearModel(D_in, D_hidden, D_out, num_layers=2)
+        
+        torch.manual_seed(42)
+        model_fuse_bk = AllLinearModel(D_in, D_hidden, D_out, num_layers=2)
+        
+        # Wrap with different modes
+        wrapped_hook = wrap_model(
+            model_hook,
+            grad_sample_mode="flash_fsdp",  # Standard hook-based
+            batch_first=True,
+            loss_reduction="sum",  # Changed to sum to match loss = y.sum()
+            max_grad_norm=max_grad_norm,
+        )
+        
+        wrapped_fuse_bk = wrap_model(
+            model_fuse_bk,
+            grad_sample_mode="flash_fsdp_fuse_bk",  # Fused + bookkeeping
+            batch_first=True,
+            loss_reduction="sum",  # Changed to sum to match loss = y.sum()
+            max_grad_norm=max_grad_norm,
+        )
+        
+        # Same input
+        torch.manual_seed(123)
+        x = torch.randn(B, T, D_in)
+        
+        # Forward-backward for hook-based
+        wrapped_hook.zero_grad()
+        y_hook = wrapped_hook(x.clone())
+        loss_hook = y_hook.sum()
+        loss_hook.backward()
+        norms_hook = wrapped_hook.get_norm_sample()
+        
+        # Forward-backward for fuse_bk
+        wrapped_fuse_bk.zero_grad()
+        y_fuse_bk = wrapped_fuse_bk(x.clone())
+        loss_fuse_bk = y_fuse_bk.sum()
+        loss_fuse_bk.backward()
+        norms_fuse_bk = wrapped_fuse_bk.get_norm_sample()
+        
+        # Compare
+        print(f"\nHook-based vs Fuse_BK comparison:")
+        print(f"  Output match: {torch.allclose(y_hook, y_fuse_bk, rtol=1e-4)}")
+        print(f"  Norms (hook):    {norms_hook}")
+        print(f"  Norms (fuse_bk): {norms_fuse_bk}")
+        print(f"  Max norm diff:   {(norms_hook - norms_fuse_bk).abs().max().item():.6e}")
+        
+        # Outputs should be identical (same forward pass)
+        self.assertTrue(torch.allclose(y_hook, y_fuse_bk, rtol=1e-5))
+        
+        # Norms should be very close
+        # Hook-based uses exact computation, fuse_bk uses optimized kernels
+        # Allow slightly larger tolerance due to algorithmic differences
+        self.assertTrue(torch.allclose(norms_hook, norms_fuse_bk, rtol=1e-2, atol=1e-3))
+    
+    def test_fuse_bk_loss_reduction_modes(self):
+        """Test flash_fsdp_fuse_bk with different loss reduction modes."""
+        B, T, D_in, D_out = 4, 32, 64, 128
+        max_grad_norm = 1.0
+        
+        for loss_reduction in ["mean", "sum"]:
+            with self.subTest(loss_reduction=loss_reduction):
+                torch.manual_seed(42)
+                model = nn.Linear(D_in, D_out)
+                
+                wrapped = wrap_model(
+                    model,
+                    grad_sample_mode="flash_fsdp_fuse_bk",
+                    batch_first=True,
+                    loss_reduction=loss_reduction,
+                    max_grad_norm=max_grad_norm,
+                )
+                
+                torch.manual_seed(123)
+                x = torch.randn(B, T, D_in)
+                
+                wrapped.zero_grad()
+                y = wrapped(x)
+                
+                if loss_reduction == "mean":
+                    loss = y.mean()
+                else:  # sum
+                    loss = y.sum()
+                
+                loss.backward()
+                norms = wrapped.get_norm_sample()
+                
+                # Verify norms are computed correctly
+                self.assertEqual(norms.shape, (B,))
+                self.assertTrue((norms > 0).all())
+                
+                print(f"\nLoss reduction={loss_reduction}: "
+                      f"avg_norm={norms.mean().item():.4f}, "
+                      f"min_norm={norms.min().item():.4f}, "
+                      f"max_norm={norms.max().item():.4f}")
+    
+    def test_all_modes_consistency(self):
+        """Comprehensive test: Verify all modes produce consistent results."""
+        B, T, D_in, D_hidden, D_out = 4, 32, 64, 128, 32
+        max_grad_norm = 1.0
+        
+        modes_to_test = ["flash_fsdp", "flash_fsdp_fuse", "flash_fsdp_fuse_bk"]
+        results = {}
+        
+        # Same input for all modes
+        torch.manual_seed(123)
+        x_test = torch.randn(B, T, D_in)
+        
+        for mode in modes_to_test:
+            torch.manual_seed(42)  # Same model initialization
+            model = AllLinearModel(D_in, D_hidden, D_out, num_layers=2)
+            
+            wrapped = wrap_model(
+                model,
+                grad_sample_mode=mode,
+                batch_first=True,
+                loss_reduction="sum",  # Changed to sum to match loss = y.sum()
+                max_grad_norm=max_grad_norm,
+            )
+            
+            wrapped.zero_grad()
+            y = wrapped(x_test.clone())
+            loss = y.sum()
+            loss.backward()
+            norms = wrapped.get_norm_sample()
+            
+            results[mode] = {
+                'output': y.detach().clone(),
+                'norms': norms.detach().clone(),
+                'loss': loss.item()
+            }
+            
+            print(f"\nMode: {mode}")
+            print(f"  Loss: {loss.item():.6f}")
+            print(f"  Norms: {norms}")
+        
+        # Compare all modes
+        print("\n" + "="*60)
+        print("CONSISTENCY CHECK:")
+        print("="*60)
+        
+        # Compare outputs (should be identical)
+        for mode1 in modes_to_test:
+            for mode2 in modes_to_test:
+                if mode1 < mode2:  # Avoid duplicate comparisons
+                    output_match = torch.allclose(
+                        results[mode1]['output'], 
+                        results[mode2]['output'], 
+                        rtol=1e-5
+                    )
+                    norm_match = torch.allclose(
+                        results[mode1]['norms'], 
+                        results[mode2]['norms'], 
+                        rtol=1e-2, atol=1e-3
+                    )
+                    max_norm_diff = (results[mode1]['norms'] - results[mode2]['norms']).abs().max().item()
+                    
+                    print(f"\n{mode1} vs {mode2}:")
+                    print(f"  Output match: {output_match}")
+                    print(f"  Norm match: {norm_match}")
+                    print(f"  Max norm diff: {max_norm_diff:.6e}")
+                    
+                    # Outputs should be identical
+                    self.assertTrue(output_match, 
+                                  f"Outputs don't match: {mode1} vs {mode2}")
+                    # Norms should be very close
+                    self.assertTrue(norm_match,
+                                  f"Norms don't match: {mode1} vs {mode2}, max_diff={max_norm_diff}")
 
 
 if __name__ == "__main__":

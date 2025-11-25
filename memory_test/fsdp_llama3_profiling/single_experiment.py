@@ -14,8 +14,43 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from opacus import PrivacyEngine
+from opacus.utils.fast_gradient_clipping_utils import DPTensorFastGradientClipping
 from opacus.utils.fsdp_utils import FSDP2Wrapper
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+
+def compute_linear_layer_norms(model, prefix=""):
+    """Compute L2 norms of all linear layer weights and gradients"""
+    norms = {}
+    for name, module in model.named_modules():
+        # Handle both regular Linear and FusedFlashLinear
+        if hasattr(module, 'weight') and 'linear' in name.lower() or isinstance(module, torch.nn.Linear):
+            full_name = f"{prefix}{name}" if prefix else name
+            if module.weight is not None:
+                weight = module.weight
+                # Handle DTensor for FSDP
+                if hasattr(weight, 'full_tensor'):
+                    weight = weight.full_tensor()
+                norms[f"{full_name}_weight_norm"] = weight.detach().float().norm().item()
+                
+                if module.weight.grad is not None:
+                    grad = module.weight.grad
+                    if hasattr(grad, 'full_tensor'):
+                        grad = grad.full_tensor()
+                    norms[f"{full_name}_grad_norm"] = grad.detach().float().norm().item()
+    return norms
+
+
+def compute_total_grad_norm(model):
+    """Compute total gradient norm across all parameters"""
+    total_norm = 0.0
+    for param in model.parameters():
+        if param.grad is not None:
+            grad = param.grad
+            if hasattr(grad, 'full_tensor'):
+                grad = grad.full_tensor()
+            total_norm += grad.detach().float().norm().item() ** 2
+    return total_norm ** 0.5
 
 
 def aggressive_cleanup():
@@ -63,6 +98,8 @@ def run_experiment_worker(
     sigma,
     max_grad_norm,
     results_dict,
+    accuracy_test=False,
+    random_seed=1337,
 ):
     """Run experiment on a single GPU worker"""
     torch.cuda.set_device(rank)
@@ -75,11 +112,13 @@ def run_experiment_worker(
         setup(rank, world_size)
     
     master_process = rank == 0
-    torch.manual_seed(1337 + rank)
+    torch.manual_seed(random_seed + rank)
     
     if master_process:
         print(f"\n{'='*80}")
         print(f"EXPERIMENT: mode={mode}, seq_length={seq_length}, batch_size={batch_size}")
+        if accuracy_test:
+            print(f"ACCURACY TEST MODE: sigma={sigma}, max_grad_norm={max_grad_norm}")
         print(f"{'='*80}\n")
     
     # Load model and tokenizer
@@ -222,8 +261,18 @@ def run_experiment_worker(
         loss.backward()
         optimizer.step()
         
+        # Synchronize in FSDP mode to avoid deadlocks
+        if is_fsdp_mode:
+            torch.cuda.synchronize()
+            if dist.is_initialized():
+                dist.barrier()
+        
         del batch, outputs, loss
         torch.cuda.empty_cache()
+    
+    # Synchronize all ranks before profiling
+    if is_fsdp_mode and dist.is_initialized():
+        dist.barrier()
     
     # Reset memory stats after warmup
     torch.cuda.reset_peak_memory_stats(device)
@@ -233,6 +282,9 @@ def run_experiment_worker(
         print(f"\nRunning {num_iter} profiling iterations...")
     
     total_time = 0.0
+    loss_values = []
+    grad_norms = []
+    layer_norms_history = []
     
     for i in range(num_iter):
         batch = generate_synthetic_batch(batch_size, seq_length, vocab_size, device)
@@ -262,17 +314,60 @@ def run_experiment_worker(
             )
             loss = outputs.loss
         
+        # Record loss value (average across ranks for FSDP non-DP mode)
+        if isinstance(loss, DPTensorFastGradientClipping):
+            # DPTensor has its own .item() method that handles reduction
+            loss_val = loss.item()
+        elif is_fsdp_mode and not is_dp_mode and dist.is_initialized():
+            # Average loss across all ranks for regular tensor
+            loss_tensor = loss.detach().float()
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
+            loss_val = loss_tensor.item()
+        else:
+            # Regular tensor extraction
+            loss_val = loss.detach().float().item()
+        loss_values.append(loss_val)
+        
         loss.backward()
+        
+        # For accuracy test, compute gradient norms before optimizer step
+        if accuracy_test:
+            # Synchronize before computing norms in FSDP mode
+            if is_fsdp_mode and dist.is_initialized():
+                dist.barrier()
+            
+            if master_process:
+                # Get the underlying model for norm computation
+                if hasattr(model, '_module'):
+                    base_model = model._module
+                else:
+                    base_model = model
+                total_grad_norm = compute_total_grad_norm(base_model)
+                grad_norms.append(total_grad_norm)
+                
+                # Compute layer norms (only first and last iteration to save time)
+                if i == 0 or i == num_iter - 1:
+                    layer_norms = compute_linear_layer_norms(base_model)
+                    layer_norms_history.append({"iter": i, "norms": layer_norms})
+        
         optimizer.step()
         
         end_event.record()
         torch.cuda.synchronize()
         
+        # Synchronize in FSDP mode to avoid deadlocks
+        if is_fsdp_mode and dist.is_initialized():
+            dist.barrier()
+        
         iter_time = start_event.elapsed_time(end_event)
         total_time += iter_time
         
         if master_process:
-            print(f"  Iteration {i+1}/{num_iter}: {iter_time:.2f} ms")
+            if accuracy_test:
+                grad_norm_str = f", grad_norm={grad_norms[-1]:.6f}" if grad_norms else ""
+                print(f"  Iteration {i+1}/{num_iter}: {iter_time:.2f} ms, loss={loss_val:.6f}{grad_norm_str}")
+            else:
+                print(f"  Iteration {i+1}/{num_iter}: {iter_time:.2f} ms")
         
         del batch, outputs, loss
         torch.cuda.empty_cache()
@@ -282,15 +377,41 @@ def run_experiment_worker(
     peak_memory_mb = peak_memory_bytes / (1024 ** 2)
     peak_memory_gb = peak_memory_bytes / (1024 ** 3)
     
+    # Synchronize before printing final results
+    if is_fsdp_mode and dist.is_initialized():
+        dist.barrier()
+    
     if master_process:
         print(f"\n⏱️  Average iteration time: {avg_time_ms:.2f} ms")
         print(f"💾 Peak memory usage: {peak_memory_gb:.2f} GB ({peak_memory_mb:.2f} MB)")
+        
+        if accuracy_test:
+            print(f"\n📊 ACCURACY TEST RESULTS:")
+            print(f"   Loss values: {loss_values}")
+            print(f"   Final loss: {loss_values[-1]:.6f}")
+            if grad_norms:
+                print(f"   Gradient norms: {grad_norms}")
+                print(f"   Avg gradient norm: {sum(grad_norms)/len(grad_norms):.6f}")
+    
+    # Synchronize before storing results
+    if is_fsdp_mode and dist.is_initialized():
+        dist.barrier()
     
     # Store results in shared dict (only from rank 0)
     if master_process:
         results_dict["peak_memory_mb"] = peak_memory_mb
         results_dict["peak_memory_gb"] = peak_memory_gb
         results_dict["avg_time_ms"] = avg_time_ms
+        results_dict["loss_values"] = loss_values
+        results_dict["final_loss"] = loss_values[-1] if loss_values else 0
+        if accuracy_test:
+            results_dict["grad_norms"] = grad_norms
+            results_dict["avg_grad_norm"] = sum(grad_norms)/len(grad_norms) if grad_norms else 0
+            results_dict["layer_norms_history"] = layer_norms_history
+    
+    # Final synchronization before cleanup
+    if is_fsdp_mode and dist.is_initialized():
+        dist.barrier()
     
     # Only cleanup distributed for FSDP modes
     if is_fsdp_mode:
@@ -313,6 +434,9 @@ def run_experiment(config):
         if torch.cuda.device_count() == 0:
             raise RuntimeError("No CUDA devices available")
     
+    accuracy_test = config.get("accuracy_test", False)
+    random_seed = config.get("random_seed", 1337)
+    
     print(f"\n{'#'*80}")
     print(f"Configuration:")
     print(f"  Mode: {config['mode']}")
@@ -323,6 +447,9 @@ def run_experiment(config):
     print(f"  Total Batch Size: {config['batch_size'] * world_size}")
     print(f"  Profiling Iterations: {config['num_iter']}")
     print(f"  Warmup Iterations: {config['warmup_iter']}")
+    if accuracy_test:
+        print(f"  ACCURACY TEST: sigma={config['sigma']}, max_grad_norm={config['max_grad_norm']}")
+        print(f"  Random Seed: {random_seed}")
     print(f"{'#'*80}\n")
     
     # Use multiprocessing manager for sharing results
@@ -347,6 +474,8 @@ def run_experiment(config):
                 config["sigma"],
                 config["max_grad_norm"],
                 results_dict,
+                accuracy_test,
+                random_seed,
             ),
             nprocs=world_size,
             join=True,
@@ -368,6 +497,8 @@ def run_experiment(config):
             sigma=config["sigma"],
             max_grad_norm=config["max_grad_norm"],
             results_dict=results_dict,
+            accuracy_test=accuracy_test,
+            random_seed=random_seed,
         )
     
     # Extract results
@@ -380,14 +511,23 @@ def run_experiment(config):
         "peak_memory_mb": results_dict.get("peak_memory_mb", 0),
         "peak_memory_gb": results_dict.get("peak_memory_gb", 0),
         "avg_time_ms": results_dict.get("avg_time_ms", 0),
+        "loss_values": results_dict.get("loss_values", []),
+        "final_loss": results_dict.get("final_loss", 0),
         "config": {
             "model_name": config["model_name"],
             "vocab_size": config["vocab_size"],
             "learning_rate": config["learning_rate"],
             "sigma": config["sigma"],
             "max_grad_norm": config["max_grad_norm"],
+            "random_seed": config.get("random_seed", 1337),
         }
     }
+    
+    # Add accuracy test data if available
+    if accuracy_test:
+        results["grad_norms"] = results_dict.get("grad_norms", [])
+        results["avg_grad_norm"] = results_dict.get("avg_grad_norm", 0)
+        results["layer_norms_history"] = results_dict.get("layer_norms_history", [])
     
     return results
 
@@ -419,6 +559,10 @@ def main():
                        help="Noise multiplier for DP")
     parser.add_argument("--max-grad-norm", type=float, default=1.0,
                        help="Max gradient norm for DP")
+    parser.add_argument("--accuracy-test", action="store_true",
+                       help="Run accuracy/consistency test (logs loss and gradient norms)")
+    parser.add_argument("--random-seed", type=int, default=1337,
+                       help="Random seed for reproducibility")
     
     args = parser.parse_args()
     
@@ -434,6 +578,8 @@ def main():
         "learning_rate": args.learning_rate,
         "sigma": args.sigma,
         "max_grad_norm": args.max_grad_norm,
+        "accuracy_test": args.accuracy_test,
+        "random_seed": args.random_seed,
     }
     
     # Run experiment

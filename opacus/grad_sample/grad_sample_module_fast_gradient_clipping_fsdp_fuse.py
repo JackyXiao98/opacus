@@ -142,6 +142,12 @@ class GradSampleModuleFastGradientClippingFSDPFuse(GradSampleModuleFastGradientC
         if isinstance(m, FusedFlashLinear) and m not in self._fused_linear_modules:
             self._fused_linear_modules.append(m)
         
+        # Enable bookkeeping mode on fused modules if requested
+        # This makes them cache activations/backprops for clipped gradient computation
+        if enable_fastdp_bookkeeping:
+            for module in self._fused_linear_modules:
+                module.set_bookkeeping_mode(True)
+        
         # Shared norm buffer for all fused linear modules
         self._linear_norm_buf: Optional[torch.Tensor] = None
         self._current_batch_size: int = 0
@@ -550,23 +556,12 @@ class GradSampleModuleFastGradientClippingFSDPFuse(GradSampleModuleFastGradientC
             self._bk_cache.clear()
         
         # --- Part 3: Handle fused Linear layers in BK mode ---
-        # For fused Linear layers in BK mode, we need to recompute clipped gradients
-        # This requires caching activations/backprops during the forward/backward
-        # For now, we handle this by using the standard gradient computation
-        # and then scaling by the average clipping coefficient (approximation)
-        
-        # TODO: Implement proper per-sample clipping for fused Linear in BK mode
-        # This would require modifying FusedFlashLinear to cache activations/backprops
-        # and computing gradients here with per-sample clipping applied.
-        
-        # For now, scale the existing gradients by mean clipping coefficient
-        # This is an approximation that works when clipping is uniform
-        mean_coef = clipping_coef.mean()
+        # Compute exact per-sample clipped gradients using cached activations/backprops
+        # Uses the mathematical property: sum_i(c_i * g_i^T @ x_i) = (c * g)^T @ x
         for module in self._fused_linear_modules:
-            if module.weight.grad is not None:
-                module.weight.grad.mul_(mean_coef)
-            if module.bias is not None and module.bias.grad is not None:
-                module.bias.grad.mul_(mean_coef)
+            if module._bk_cache is not None:
+                module.compute_clipped_gradient(clipping_coef)
+                module.clear_bk_cache()
 
     def disable_hooks(self):
         """Disable hooks and norm computation for second backward pass."""
@@ -582,4 +577,7 @@ class GradSampleModuleFastGradientClippingFSDPFuse(GradSampleModuleFastGradientC
         """Clear the bookkeeping cache to free memory."""
         if self._bk_cache is not None:
             self._bk_cache.clear()
+        # Also clear fused module caches
+        for module in self._fused_linear_modules:
+            module.clear_bk_cache()
 
