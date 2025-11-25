@@ -25,6 +25,18 @@ from .grad_sample_module_fast_gradient_clipping import (  # noqa
 from .grad_sample_module_fast_gradient_clipping_fsdp import (  # noqa
     GradSampleModuleFastGradientClippingFSDP,
 )
+from .grad_sample_module_fast_gradient_clipping_fsdp_fuse import (  # noqa
+    GradSampleModuleFastGradientClippingFSDPFuse,
+)
+from .fused_flash_linear import (  # noqa
+    TRITON_AVAILABLE,
+    FusedFlashLinear,
+    replace_linear_with_fused,
+    get_fused_linear_modules,
+)
+from .triton_fused_kernel import (  # noqa
+    TRITON_AVAILABLE as TRITON_KERNEL_AVAILABLE,
+)
 from .grad_sample_module_fast_gradient_clipping_tp import (  # noqa
     GradSampleModuleFastGradientClippingTP,
 )
@@ -48,6 +60,7 @@ __all__ = [
     "GradSampleModule",
     "GradSampleModuleFastGradientClipping",
     "GradSampleModuleFastGradientClippingFSDP",
+    "GradSampleModuleFastGradientClippingFSDPFuse",
     "GradSampleModuleFastGradientClippingTP",
     "GradSampleModuleExpandedWeights",
     "GradSampleModuleNoOp",
@@ -57,4 +70,9 @@ __all__ = [
     "create_or_accumulate_grad_sample",
     "wrap_model",
     "get_gsm_class",
+    # Fused Flash Linear exports
+    "TRITON_AVAILABLE",
+    "FusedFlashLinear",
+    "replace_linear_with_fused",
+    "get_fused_linear_modules",
 ]

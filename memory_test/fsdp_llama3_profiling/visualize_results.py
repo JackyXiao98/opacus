@@ -19,6 +19,8 @@ MODE_NAMES = {
     "flash_fsdp": "Flash\nFSDP",
     "flash_fsdp_bk": "Flash\nFSDP\n(BK)",
     "ghost_fsdp_bk": "Ghost\nFSDP\n(BK)",
+    "flash_fsdp_fuse": "Flash\nFSDP\n(Fuse)",
+    "flash_fsdp_fuse_bk": "Flash\nFSDP\n(Fuse+BK)",
     # Single-GPU modes
     "no_dp_single": "Non-DP\nSingle",
     "ghost": "Ghost\nSingle",
@@ -35,6 +37,8 @@ MODE_COLORS = {
     "flash_fsdp": "#27ae60",      # Dark Green
     "flash_fsdp_bk": "#d68910",   # Dark Orange
     "ghost_fsdp_bk": "#8e44ad",   # Dark Purple
+    "flash_fsdp_fuse": "#1abc9c", # Teal
+    "flash_fsdp_fuse_bk": "#16a085", # Dark Teal
     # Single-GPU modes (lighter shades)
     "no_dp_single": "#5dade2",    # Light Blue
     "ghost": "#ec7063",           # Light Red
@@ -49,7 +53,8 @@ MODE_ORDER = [
     "ghost_fsdp", "ghost", 
     "flash_fsdp", "flash",
     "flash_fsdp_bk", "flash_bk",
-    "ghost_fsdp_bk", "ghost_bk"
+    "ghost_fsdp_bk", "ghost_bk",
+    "flash_fsdp_fuse", "flash_fsdp_fuse_bk"
 ]
 
 # Markers for sequence lengths
@@ -342,7 +347,7 @@ def plot_overhead_analysis(results, output_dir):
     
     # Plot FSDP overhead
     if has_fsdp_baseline:
-        fsdp_dp_modes = [m for m in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_fsdp_bk"] 
+        fsdp_dp_modes = [m for m in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_fsdp_bk", "flash_fsdp_fuse", "flash_fsdp_fuse_bk"] 
                          if m in results]
         plot_baseline_overhead("no_dp", fsdp_dp_modes, 
                              axes[plot_idx, 0], axes[plot_idx, 1],
@@ -404,7 +409,7 @@ def generate_summary_table(results, output_dir):
         summary_lines.append("OVERHEAD ANALYSIS - FSDP MODES (vs no_dp baseline):")
         summary_lines.append("")
         
-        fsdp_dp_modes = [m for m in modes if m in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_fsdp_bk"]]
+        fsdp_dp_modes = [m for m in modes if m in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_fsdp_bk", "flash_fsdp_fuse", "flash_fsdp_fuse_bk"]]
         
         if fsdp_dp_modes:
             summary_lines.append(f"{'Mode':<25} {'Seq Length':>12} {'Mem Overhead (GB)':>20} {'Time Overhead (%)':>20}")

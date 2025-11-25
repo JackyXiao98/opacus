@@ -25,7 +25,8 @@ def _is_fsdp_model(module) -> bool:
     Check if model is wrapped with FSDP.
     
     Returns True if the module or any of its submodules is wrapped with FSDP,
-    or if it's an instance of GradSampleModuleFastGradientClippingFSDP.
+    or if it's an instance of GradSampleModuleFastGradientClippingFSDP or
+    GradSampleModuleFastGradientClippingFSDPFuse.
     """
     try:
         from torch.distributed.fsdp import FullyShardedDataParallel
@@ -37,7 +38,13 @@ def _is_fsdp_model(module) -> bool:
         from opacus.grad_sample.grad_sample_module_fast_gradient_clipping_fsdp import (
             GradSampleModuleFastGradientClippingFSDP,
         )
-        return isinstance(module, GradSampleModuleFastGradientClippingFSDP)
+        if isinstance(module, GradSampleModuleFastGradientClippingFSDP):
+            return True
+        # Also check for FSDPFuse variant
+        from opacus.grad_sample.grad_sample_module_fast_gradient_clipping_fsdp_fuse import (
+            GradSampleModuleFastGradientClippingFSDPFuse,
+        )
+        return isinstance(module, GradSampleModuleFastGradientClippingFSDPFuse)
     except ImportError:
         return False
 
@@ -48,7 +55,7 @@ def _get_fsdp_root_module(module):
     
     For FSDP2 (fully_shard), returns the module with set_requires_gradient_sync() method.
     For FSDP1, returns the module with no_sync() context manager.
-    For GradSampleModuleFastGradientClippingFSDP, accesses the inner _module.
+    For GradSampleModuleFastGradientClippingFSDP/FSDPFuse, accesses the inner _module.
     
     Args:
         module: The module (potentially a GradSampleModule wrapper)
@@ -63,9 +70,12 @@ def _get_fsdp_root_module(module):
         from opacus.grad_sample.grad_sample_module_fast_gradient_clipping_fsdp import (
             GradSampleModuleFastGradientClippingFSDP,
         )
+        from opacus.grad_sample.grad_sample_module_fast_gradient_clipping_fsdp_fuse import (
+            GradSampleModuleFastGradientClippingFSDPFuse,
+        )
         
-        # If it's a GradSampleModuleFastGradientClippingFSDP, get the inner module
-        if isinstance(module, GradSampleModuleFastGradientClippingFSDP):
+        # If it's a GradSampleModule FSDP variant, get the inner module
+        if isinstance(module, (GradSampleModuleFastGradientClippingFSDP, GradSampleModuleFastGradientClippingFSDPFuse)):
             inner_module = module._module
             
             # FSDP2: Check for set_requires_gradient_sync() method
@@ -214,20 +224,10 @@ class DPTensorFastGradientClipping:
 
         else:
             # Two-pass ghost clipping with FSDP support
-            hook_handles = []
-            
-            if is_fsdp:
-                # FSDP-optimized norm pass: register hooks to prevent gradient storage
-                # All parameters keep requires_grad=True for full backward flow
-                hook_handles = _register_grad_blocking_hooks(self.module)
-            
+
             # First backward: compute per-sample norms via hooks
             # Hooks prevent param.grad creation, reducing memory overhead
             reduced_loss.backward(retain_graph=True)
-
-            if is_fsdp:
-                # Remove hooks after norm pass
-                _remove_grad_blocking_hooks(hook_handles)
 
             # Zero out any gradients (should be none if FSDP, but safe to call)
             self.optimizer.zero_grad()

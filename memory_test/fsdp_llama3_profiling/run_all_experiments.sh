@@ -20,18 +20,20 @@ fi
 MODEL_NAME="meta-llama/Llama-3.2-1B"
 BATCH_SIZE=2
 NUM_ITER=1
-WARMUP_ITER=0
+WARMUP_ITER=1
 VOCAB_SIZE=128256
 LEARNING_RATE=1e-5
 SIGMA=1.0
 MAX_GRAD_NORM=1.0
 
 # Sequence lengths to test
-SEQ_LENGTHS=(8192)
+SEQ_LENGTHS=(16384)
 
 # Modes to test
-# MODES=("no_dp" "ghost_fsdp" "flash_fsdp")
-MODES=("flash_fsdp")
+# Available FSDP modes: no_dp, ghost_fsdp, flash_fsdp, flash_fsdp_bk, ghost_fsdp_bk, flash_fsdp_fuse, flash_fsdp_fuse_bk
+# Available Single-GPU modes: no_dp_single, ghost, flash, flash_bk, ghost_bk
+# MODES=("no_dp" "ghost_fsdp" "flash_fsdp" "flash_fsdp_fuse")
+MODES=("flash_fsdp" "flash_fsdp_fuse")
 
 # Output directory
 OUTPUT_DIR="results"

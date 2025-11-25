@@ -68,7 +68,7 @@ def run_experiment_worker(
     torch.cuda.set_device(rank)
     
     # Determine if this is an FSDP mode
-    is_fsdp_mode = mode in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_fsdp_bk", "no_dp"]
+    is_fsdp_mode = mode in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_fsdp_bk", "flash_fsdp_fuse", "flash_fsdp_fuse_bk", "no_dp"]
     
     # Only setup distributed for FSDP modes
     if is_fsdp_mode:
@@ -106,6 +106,18 @@ def run_experiment_worker(
     
     # Set pad_token_id in model config
     model.config.pad_token_id = tokenizer.pad_token_id
+    
+    # Determine if this is a fuse mode (needs special handling)
+    is_fuse_mode = mode in ["flash_fsdp_fuse", "flash_fsdp_fuse_bk"]
+    
+    # For fuse modes: Replace Linear with FusedFlashLinear BEFORE FSDP wrapping
+    # This is required because FusedFlashLinear cannot be created after FSDP
+    # wrapping (DTensor weights cannot be copied to regular Tensors)
+    if is_fuse_mode:
+        if master_process:
+            print("Replacing Linear layers with FusedFlashLinear (pre-FSDP)")
+        from opacus.grad_sample.fused_flash_linear import replace_linear_with_fused
+        model = replace_linear_with_fused(model, algorithm="input_length", tile_size=256)
     
     # Wrap with FSDP2 only for FSDP modes
     if is_fsdp_mode:
@@ -288,7 +300,7 @@ def run_experiment_worker(
 def run_experiment(config):
     """Run the experiment with the given configuration"""
     # Determine if this is an FSDP mode (multi-GPU)
-    is_fsdp_mode = config["mode"] in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_fsdp_bk", "no_dp"]
+    is_fsdp_mode = config["mode"] in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_fsdp_bk", "flash_fsdp_fuse", "flash_fsdp_fuse_bk", "no_dp"]
     
     if is_fsdp_mode:
         # FSDP mode: use all available GPUs
@@ -383,7 +395,7 @@ def run_experiment(config):
 def main():
     parser = argparse.ArgumentParser(description="Run single FSDP/Single-GPU Llama3 profiling experiment")
     parser.add_argument("--mode", type=str, required=True,
-                       choices=["no_dp", "no_dp_single", "ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_fsdp_bk", "flash", "flash_bk", "ghost", "ghost_bk"],
+                       choices=["no_dp", "no_dp_single", "ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_fsdp_bk", "flash_fsdp_fuse", "flash_fsdp_fuse_bk", "flash", "flash_bk", "ghost", "ghost_bk"],
                        help="Training mode: no_dp (multi-GPU no DP), no_dp_single (single-GPU no DP), *_fsdp (multi-GPU with DP), others (single-GPU with DP)")
     parser.add_argument("--seq-length", type=int, required=True,
                        help="Sequence length")

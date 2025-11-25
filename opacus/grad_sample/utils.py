@@ -27,6 +27,9 @@ from .grad_sample_module_fast_gradient_clipping_fsdp import (
 from .grad_sample_module_fast_gradient_clipping_fsdp_async import (
     GradSampleModuleFastGradientClippingFSDPAsync,
 )
+from .grad_sample_module_fast_gradient_clipping_fsdp_fuse import (
+    GradSampleModuleFastGradientClippingFSDPFuse,
+)
 from .gsm_base import AbstractGradSampleModule
 from .gsm_exp_weights import GradSampleModuleExpandedWeights
 from .gsm_no_op import GradSampleModuleNoOp
@@ -122,6 +125,13 @@ def wrap_model(model: nn.Module, grad_sample_mode: str, *args, **kwargs):
         kwargs["use_flash_clipping"] = True
         kwargs["use_ghost_clipping"] = True
         kwargs["enable_fastdp_bookkeeping"] = True
+    elif grad_sample_mode == "flash_fsdp_fuse":
+        kwargs["use_flash_clipping"] = True
+        kwargs["use_ghost_clipping"] = True
+    elif grad_sample_mode == "flash_fsdp_fuse_bk":
+        kwargs["use_flash_clipping"] = True
+        kwargs["use_ghost_clipping"] = True
+        kwargs["enable_fastdp_bookkeeping"] = True
     return cls(model, *args, **kwargs)
 
 
@@ -150,13 +160,17 @@ def get_gsm_class(grad_sample_mode: str) -> Type[AbstractGradSampleModule]:
     elif grad_sample_mode == "ghost_fsdp_bk":
         return GradSampleModuleFastGradientClippingFSDP
     elif grad_sample_mode == "flash_fsdp":
-        return GradSampleModuleFastGradientClippingFSDPAsync
+        return GradSampleModuleFastGradientClippingFSDP
     elif grad_sample_mode == "flash_fsdp_bk":
-        return GradSampleModuleFastGradientClippingFSDPAsync
+        return GradSampleModuleFastGradientClippingFSDP
+    elif grad_sample_mode == "flash_fsdp_fuse":
+        return GradSampleModuleFastGradientClippingFSDPFuse
+    elif grad_sample_mode == "flash_fsdp_fuse_bk":
+        return GradSampleModuleFastGradientClippingFSDPFuse
     elif grad_sample_mode == "no_op":
         return GradSampleModuleNoOp
     else:
         raise ValueError(
             f"Unexpected grad_sample_mode: {grad_sample_mode}. "
-            f"Allowed values: hooks, ew, ghost, flash, flash_bk, ghost_bk, ghost_fsdp, ghost_fsdp_bk, flash_fsdp, flash_fsdp_bk, no_op"
+            f"Allowed values: hooks, ew, ghost, flash, flash_bk, ghost_bk, ghost_fsdp, ghost_fsdp_bk, flash_fsdp, flash_fsdp_bk, flash_fsdp_fuse, flash_fsdp_fuse_bk, no_op"
         )
