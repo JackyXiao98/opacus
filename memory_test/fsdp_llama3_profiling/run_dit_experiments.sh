@@ -1,44 +1,40 @@
 #!/bin/bash
-# Run all FSDP LLM memory profiling experiments in isolated Python processes
+# Run all FSDP DiT memory profiling experiments in isolated Python processes
 # This prevents memory pool contamination between experiments
 
 echo "========================================================================"
-echo "FSDP LLM Memory Profiling Experiment Suite"
+echo "FSDP DiT Memory Profiling Experiment Suite"
 echo "Each experiment runs in a fresh Python process to avoid contamination"
 echo "========================================================================"
 echo ""
 
-# Check for HuggingFace token
-if [ -z "$HF_TOKEN" ]; then
-    echo "❌ Error: HF_TOKEN environment variable is not set"
-    echo "Please set it with: export HF_TOKEN=your_token_here"
-    return 1
-fi
+# DiT Model Configuration
+IMAGE_SIZE=256
+PATCH_SIZE=8
+IN_CHANNELS=3
+NUM_CLASSES=1000
+HIDDEN_DIM=1152
+NUM_LAYERS=28
+NUM_HEADS=16
 
-# Configuration
-# MODEL_NAME="meta-llama/Llama-3.1-8B-Instruct"
-MODEL_NAME="meta-llama/Llama-3.2-1B"
-BATCH_SIZE=2
-NUM_ITER=1
+# Training Configuration
+BATCH_SIZE=1
+NUM_ITER=3
 WARMUP_ITER=1
-VOCAB_SIZE=128256
-# VOCAB_SIZE=32000
-LEARNING_RATE=1e-5
+LEARNING_RATE=1e-4
 SIGMA=1.0
 MAX_GRAD_NORM=1.0
 
-# Sequence lengths to test
-SEQ_LENGTHS=(1024)
+# Compute number of tokens (sequence length for DiT)
+NUM_TOKENS=$(( (IMAGE_SIZE / PATCH_SIZE) * (IMAGE_SIZE / PATCH_SIZE) ))
 
 # Modes to test
 # Available FSDP modes: no_dp, ghost_fsdp, flash_fsdp, flash_fsdp_bk, ghost_fsdp_bk, flash_fsdp_fuse, flash_fsdp_fuse_bk
 # Available Single-GPU modes: no_dp_single, ghost, flash, flash_bk, ghost_bk, flash_fuse, flash_fuse_bk
-# MODES=("no_dp" "ghost_fsdp" "flash_fsdp" "flash_fsdp_fuse")
-MODES=("flash_fsdp_fuse" "flash_fsdp_fuse_bk" "flash_fsdp_bk" "flash_fsdp" "no_dp") 
-# MODES=("flash_fsdp_fuse_bk") 
+MODES=("no_dp" "ghost_fsdp" "flash_fsdp" "flash_fsdp_bk" "flash_fsdp_fuse")
 
 # Output directory
-OUTPUT_DIR="results"
+OUTPUT_DIR="results_dit"
 mkdir -p "$OUTPUT_DIR"
 
 # Timestamp for this run
@@ -46,21 +42,26 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RUN_DIR="$OUTPUT_DIR/run_$TIMESTAMP"
 mkdir -p "$RUN_DIR"
 
+echo "Model Configuration:"
+echo "  - Image Size: ${IMAGE_SIZE}x${IMAGE_SIZE}"
+echo "  - Patch Size: ${PATCH_SIZE}x${PATCH_SIZE}"
+echo "  - Number of Tokens: ${NUM_TOKENS}"
+echo "  - Hidden Dim: ${HIDDEN_DIM}"
+echo "  - Number of Layers: ${NUM_LAYERS}"
+echo "  - Number of Heads: ${NUM_HEADS}"
+echo "  - Batch Size: ${BATCH_SIZE}"
+echo ""
 echo "Output directory: $RUN_DIR"
-echo "Model: $MODEL_NAME"
-echo "Batch size per GPU: $BATCH_SIZE"
-echo "Sequence lengths: ${SEQ_LENGTHS[@]}"
 echo "Modes: ${MODES[@]}"
 echo ""
 
 # Function to run a single experiment
 run_experiment() {
     local mode=$1
-    local seq_len=$2
-    local output_file="$RUN_DIR/${mode}_seq${seq_len}_result.json"
+    local output_file="$RUN_DIR/${mode}_seq${NUM_TOKENS}_result.json"
     
     echo "========================================================================"
-    echo "Running: mode=$mode, seq_length=$seq_len"
+    echo "Running: mode=$mode, num_tokens=$NUM_TOKENS"
     echo "Output: $output_file"
     echo "========================================================================"
     
@@ -71,16 +72,19 @@ run_experiment() {
     
     # Run experiment in isolated process
     python single_experiment.py \
-        --model-type llm \
+        --model-type dit \
         --mode "$mode" \
-        --seq-length $seq_len \
         --batch-size $BATCH_SIZE \
         --num-iter $NUM_ITER \
         --warmup-iter $WARMUP_ITER \
         --output "$output_file" \
-        --model-name "$MODEL_NAME" \
-        --token "$HF_TOKEN" \
-        --vocab-size $VOCAB_SIZE \
+        --image-size $IMAGE_SIZE \
+        --patch-size $PATCH_SIZE \
+        --in-channels $IN_CHANNELS \
+        --hidden-dim $HIDDEN_DIM \
+        --num-layers $NUM_LAYERS \
+        --num-heads $NUM_HEADS \
+        --num-classes $NUM_CLASSES \
         --learning-rate $LEARNING_RATE \
         --sigma $SIGMA \
         --max-grad-norm $MAX_GRAD_NORM
@@ -91,7 +95,7 @@ run_experiment() {
         echo "❌ Experiment failed with exit code $exit_code"
         echo "Continuing with remaining experiments..."
     else
-        echo "✓ Completed: mode=$mode, seq_length=$seq_len"
+        echo "✓ Completed: mode=$mode, num_tokens=$NUM_TOKENS"
     fi
     
     # Wait between experiments to ensure full cleanup
@@ -105,18 +109,16 @@ run_experiment() {
 echo "Starting experiment sequence..."
 echo ""
 
-total_experiments=$((${#MODES[@]} * ${#SEQ_LENGTHS[@]}))
+total_experiments=${#MODES[@]}
 current_experiment=0
 
-for seq_len in "${SEQ_LENGTHS[@]}"; do
-    for mode in "${MODES[@]}"; do
-        current_experiment=$((current_experiment + 1))
-        echo ""
-        echo "════════════════════════════════════════════════════════════════════"
-        echo "Progress: Experiment $current_experiment / $total_experiments"
-        echo "════════════════════════════════════════════════════════════════════"
-        run_experiment "$mode" "$seq_len"
-    done
+for mode in "${MODES[@]}"; do
+    current_experiment=$((current_experiment + 1))
+    echo ""
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "Progress: Experiment $current_experiment / $total_experiments"
+    echo "════════════════════════════════════════════════════════════════════"
+    run_experiment "$mode"
 done
 
 echo "========================================================================"
@@ -148,23 +150,21 @@ echo "SUMMARY"
 echo "========================================================================"
 
 # Print summary table header
-printf "%-15s %-12s %15s %15s\n" "Mode" "Seq Length" "Peak Mem (GB)" "Avg Time (ms)"
+printf "%-20s %-12s %15s %15s\n" "Mode" "Num Tokens" "Peak Mem (GB)" "Avg Time (ms)"
 echo "------------------------------------------------------------------------"
 
 # Print results for each experiment
-for seq_len in "${SEQ_LENGTHS[@]}"; do
-    for mode in "${MODES[@]}"; do
-        result_file="$RUN_DIR/${mode}_seq${seq_len}_result.json"
-        if [ -f "$result_file" ]; then
-            peak_mem=$(python -c "import json; data=json.load(open('$result_file')); print(f\"{data['peak_memory_gb']:.2f}\")" 2>/dev/null || echo "N/A")
-            avg_time=$(python -c "import json; data=json.load(open('$result_file')); print(f\"{data['avg_time_ms']:.2f}\")" 2>/dev/null || echo "N/A")
-            printf "%-15s %-12s %15s %15s\n" "$mode" "$seq_len" "$peak_mem" "$avg_time"
-        else
-            printf "%-15s %-12s %15s %15s\n" "$mode" "$seq_len" "FAILED" "FAILED"
-        fi
-    done
-    echo "------------------------------------------------------------------------"
+for mode in "${MODES[@]}"; do
+    result_file="$RUN_DIR/${mode}_seq${NUM_TOKENS}_result.json"
+    if [ -f "$result_file" ]; then
+        peak_mem=$(python -c "import json; data=json.load(open('$result_file')); print(f\"{data['peak_memory_gb']:.2f}\")" 2>/dev/null || echo "N/A")
+        avg_time=$(python -c "import json; data=json.load(open('$result_file')); print(f\"{data['avg_time_ms']:.2f}\")" 2>/dev/null || echo "N/A")
+        printf "%-20s %-12s %15s %15s\n" "$mode" "$NUM_TOKENS" "$peak_mem" "$avg_time"
+    else
+        printf "%-20s %-12s %15s %15s\n" "$mode" "$NUM_TOKENS" "FAILED" "FAILED"
+    fi
 done
+echo "------------------------------------------------------------------------"
 
 echo ""
 echo "✅ Complete pipeline finished!"
@@ -173,3 +173,4 @@ if [ -d "$RUN_DIR/visualizations" ]; then
     echo "✅ Visualizations: $RUN_DIR/visualizations"
 fi
 echo ""
+

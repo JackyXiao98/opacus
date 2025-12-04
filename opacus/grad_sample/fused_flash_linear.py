@@ -24,11 +24,8 @@ The key insight is that for Linear layers, the per-sample gradient norm can be
 computed efficiently during the backward pass using the input activations and
 output gradients, without materializing the full per-sample gradients.
 
-Supported algorithms:
-- 'triton': Fused Triton kernel (fastest, requires CUDA + Triton)
-- 'input_length': O(T * d^2) PyTorch implementation
-- 'width': O(T^2 * d) PyTorch implementation
-- 'auto': Use 'triton' if available on CUDA, else 'input_length'
+Uses Triton fused kernel for optimal performance on CUDA GPUs.
+Supports inputs of any dimension >= 2 by reshaping to [B, T, D] format.
 """
 
 from typing import Optional, Tuple
@@ -54,115 +51,35 @@ except ImportError:
 
 
 # ============================================================================
-# Flash Clipping Kernels
+# Utility Functions
 # ============================================================================
 
-@torch.no_grad()
-def _input_length_frobenius(
-    A: torch.Tensor,  # [B, T, d_a]
-    G: torch.Tensor,  # [B, T, d_g]
-    dtype_acc=torch.float32,
-) -> torch.Tensor:
+def _reshape_to_3d(x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, ...]]:
     """
-    Input-Length-Linear Algorithm: O(T * d^2)
-    Compute ||A^T @ G||_F^2 per sample efficiently.
-    
-    This computes the squared Frobenius norm of the per-sample gradient
-    for a Linear layer: ||x_i^T @ g_i||_F^2
+    Reshape tensor to 3D [B, T, D] format for Triton kernel.
     
     Args:
-        A: Activations tensor [B, T, d_a] or [B, d_a]
-        G: Gradient tensor [B, T, d_g] or [B, d_g]
-        dtype_acc: Accumulation dtype for numerical stability
+        x: Input tensor of shape [B, ...dims..., D]
         
     Returns:
-        Per-sample squared gradient norms [B]
+        Tuple of (reshaped tensor [B, T, D], original middle dims)
+        where T = product of middle dimensions
     """
-    # Convert to accumulation dtype
-    if A.dtype != dtype_acc:
-        A = A.to(dtype_acc)
-    if G.dtype != dtype_acc:
-        G = G.to(dtype_acc)
-
-    # Handle 2D case: [B, d] -> [B, 1, d]
-    if A.dim() == 2:
-        A = A.unsqueeze(1)
-        G = G.unsqueeze(1)
-
-    # Step 1: Transpose A: [B, d_a, T]
-    A_t = A.transpose(1, 2)
-    
-    # Step 2: Batch matrix multiply: [B, d_a, T] @ [B, T, d_g] -> [B, d_a, d_g]
-    # This matrix S represents the per-sample gradient dL/dW
-    S = torch.bmm(A_t, G)
-    
-    # Step 3: Element-wise square and sum to get Frobenius norm squared
-    return torch.sum(S * S, dim=(1, 2))  # [B]
-
-
-@torch.no_grad()
-def _width_frobenius(
-    A: torch.Tensor,  # [B, T, d_a]
-    G: torch.Tensor,  # [B, T, d_g]
-    tile_size: int = 256,
-    dtype_acc=torch.float32,
-) -> torch.Tensor:
-    """
-    Width-Linear Algorithm: O(T^2 * d) using tiling.
-    Optimal when d is very large and T is relatively small.
-    
-    Args:
-        A: Activations tensor [B, T, d_a]
-        G: Gradient tensor [B, T, d_g]
-        tile_size: Block size for tiling
-        dtype_acc: Accumulation dtype for numerical stability
-        
-    Returns:
-        Per-sample squared gradient norms [B]
-    """
-    # Handle 2D case: [B, d] -> [B, 1, d]
-    if A.dim() == 2:
-        A = A.unsqueeze(1)
-        G = G.unsqueeze(1)
-        
-    B, T, d_a = A.shape
-    _, _, d_g = G.shape
-    
-    if A.dtype != dtype_acc:
-        A = A.to(dtype_acc)
-    if G.dtype != dtype_acc:
-        G = G.to(dtype_acc)
-    
-    total_norm_squared = torch.zeros(B, dtype=dtype_acc, device=A.device)
-    num_tiles = (T + tile_size - 1) // tile_size
-    
-    for j in range(num_tiles):
-        j_start = j * tile_size
-        j_end = min((j + 1) * tile_size, T)
-        
-        a_j = A[:, j_start:j_end, :]
-        g_j = G[:, j_start:j_end, :]
-        
-        for k in range(j, num_tiles):
-            k_start = k * tile_size
-            k_end = min((k + 1) * tile_size, T)
-            
-            a_k = A[:, k_start:k_end, :]
-            g_k = G[:, k_start:k_end, :]
-            
-            # Score_a = a_j @ a_k^T: [B, tau_j, tau_k]
-            Score_a = torch.bmm(a_j, a_k.transpose(1, 2))
-            # Score_g = g_j @ g_k^T: [B, tau_j, tau_k]
-            Score_g = torch.bmm(g_j, g_k.transpose(1, 2))
-            
-            block_sum = torch.sum(Score_a * Score_g, dim=(1, 2))
-            
-            if j == k:
-                total_norm_squared.add_(block_sum)
-            else:
-                total_norm_squared.add_(block_sum, alpha=2.0)
-    
-    return total_norm_squared
+    if x.dim() == 2:
+        # [B, D] -> [B, 1, D]
+        return x.unsqueeze(1), (1,)
+    elif x.dim() == 3:
+        # Already 3D
+        return x, (x.shape[1],)
+    else:
+        # [B, d1, d2, ..., D] -> [B, d1*d2*..., D]
+        B = x.shape[0]
+        D = x.shape[-1]
+        middle_dims = x.shape[1:-1]
+        T = 1
+        for d in middle_dims:
+            T *= d
+        return x.view(B, T, D), middle_dims
 
 
 # ============================================================================
@@ -181,6 +98,8 @@ class FusedFlashLinearFn(torch.autograd.Function):
     - Normal mode: Computes grad_w, grad_b, and norms in backward
     - Bookkeeping mode: Computes norms only, caches x and grad_out for later
                         clipped gradient computation
+    
+    Handles inputs of any dimension >= 2 by reshaping to [B, T, D] format.
     """
     
     @staticmethod
@@ -190,31 +109,24 @@ class FusedFlashLinearFn(torch.autograd.Function):
         weight: torch.Tensor, 
         bias: Optional[torch.Tensor], 
         norm_buf: torch.Tensor,
-        algorithm: str,
-        tile_size: int,
         compute_norms_container: dict,
         enable_bookkeeping_container: dict,
         module_ref,
     ) -> torch.Tensor:
         """
         Args:
-            x: [Batch, ..., In_Dim]
+            x: [Batch, ..., In_Dim] - supports 2D, 3D, 4D+ inputs
             weight: [Out_Dim, In_Dim]
             bias: [Out_Dim] or None
             norm_buf: [Batch] - buffer to accumulate squared norms
-            algorithm: 'input_length' or 'width'
-            tile_size: block size for width algorithm
             compute_norms_container: mutable dict with 'value' key for live compute_norms state
-                                     Using a container allows backward to see updated state
-                                     (e.g., after disable_hooks() is called between two backward passes)
             enable_bookkeeping_container: mutable dict for bookkeeping mode flag
             module_ref: reference to FusedFlashLinear module for caching in BK mode
         """
         ctx.save_for_backward(x, weight)
         ctx.has_bias = bias is not None
         ctx.norm_buf = norm_buf
-        ctx.algorithm = algorithm
-        ctx.tile_size = tile_size
+        ctx.original_shape = x.shape
         # Store the container reference, not the value - this allows backward
         # to see the current state even if it changes after forward
         ctx.compute_norms_container = compute_norms_container
@@ -229,23 +141,32 @@ class FusedFlashLinearFn(torch.autograd.Function):
     def backward(ctx, grad_out: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         x, weight = ctx.saved_tensors
         norm_buf = ctx.norm_buf
-        algorithm = ctx.algorithm
+        original_shape = ctx.original_shape
         # Read current states from containers (may have changed since forward)
         compute_norms = ctx.compute_norms_container['value']
         enable_bookkeeping = ctx.enable_bookkeeping_container['value']
         
-        # --- Determine effective algorithm ---
-        # 'auto' resolves to 'triton' if available on CUDA, else 'input_length'
-        if algorithm == 'auto':
-            if TRITON_AVAILABLE and x.is_cuda and x.dim() == 3:
-                algorithm = 'triton'
-            else:
-                algorithm = 'input_length'
-        
         # --- 1. Compute grad_x (always needed for gradient flow) ---
         grad_x = grad_out.matmul(weight)
         
-        # --- 2. Bookkeeping mode: cache and compute norms only ---
+        # --- 2. Reshape to 3D for Triton kernel ---
+        # Handle 2D, 3D, and 4D+ cases uniformly
+        original_dim = x.dim()
+        if original_dim == 2:
+            x_3d = x.unsqueeze(1)  # [B, D] -> [B, 1, D]
+            g_3d = grad_out.unsqueeze(1)  # [B, D] -> [B, 1, D]
+        elif original_dim == 3:
+            x_3d = x
+            g_3d = grad_out
+        else:
+            # 4D+ case: [B, d1, d2, ..., D] -> [B, T, D] where T = d1*d2*...
+            B = x.shape[0]
+            Din = x.shape[-1]
+            Dout = grad_out.shape[-1]
+            x_3d = x.view(B, -1, Din)
+            g_3d = grad_out.view(B, -1, Dout)
+        
+        # --- 3. Bookkeeping mode: cache and compute norms only ---
         if enable_bookkeeping:
             # Cache x and grad_out for later clipped gradient computation
             ctx.module_ref._bk_cache = {
@@ -253,121 +174,108 @@ class FusedFlashLinearFn(torch.autograd.Function):
                 'grad_out': grad_out.detach(),
             }
             
-            # Compute norms (still needed for clipping coefficient)
-            # Use Triton if available for 3D CUDA tensors
-            use_triton_for_norms = (
-                TRITON_AVAILABLE
-                and x.is_cuda
-                and x.dim() == 3
-            )
-            
             if compute_norms and norm_buf is not None:
-                if use_triton_for_norms:
-                    # Use Triton fused kernel for norm computation (discard grad_w)
-                    x_c = x if x.is_contiguous() else x.contiguous()
-                    g_c = grad_out if grad_out.is_contiguous() else grad_out.contiguous()
-                    # fused_backward_weight computes grad_w AND accumulates norms
-                    # We discard grad_w since we'll compute clipped gradients later
+                # Use Triton fused kernel for norm computation (discard grad_w)
+                if TRITON_AVAILABLE and x.is_cuda:
+                    x_c = x_3d if x_3d.is_contiguous() else x_3d.contiguous()
+                    g_c = g_3d if g_3d.is_contiguous() else g_3d.contiguous()
                     _ = fused_backward_weight(x_c, g_c, norm_buf)
                     
                     # Add bias norm contribution
                     if ctx.has_bias:
-                        bias_sums = grad_out.sum(dim=1)  # [B, Dout]
-                        bias_norm_sq = bias_sums.pow(2).sum(dim=1)  # [B]
+                        # Sum over all dims except batch and last
+                        if original_dim == 2:
+                            bias_norm_sq = grad_out.pow(2).sum(dim=1)
+                        else:
+                            bias_sums = grad_out.sum(dim=tuple(range(1, original_dim - 1)))  # [B, Dout]
+                            bias_norm_sq = bias_sums.pow(2).sum(dim=1)  # [B]
                         norm_buf.add_(bias_norm_sq)
-                elif x.dim() == 2:
-                    # 2D Case: ||g_i @ x_i^T||_F^2 = ||g_i||^2 * ||x_i||^2
-                    g_sq = grad_out.pow(2).sum(dim=1)
-                    x_sq = x.pow(2).sum(dim=1)
-                    weight_contrib = g_sq * x_sq
-                    
-                    # Add bias norm contribution
-                    if ctx.has_bias:
-                        bias_contrib = grad_out.pow(2).sum(dim=1)
-                        weight_contrib = weight_contrib + bias_contrib
-                    
-                    norm_buf.add_(weight_contrib)
                 else:
-                    # 3D Case: PyTorch fallback
-                    if algorithm == 'width':
-                        weight_contrib = _width_frobenius(x, grad_out, tile_size=ctx.tile_size)
+                    # CPU fallback: use 2D efficient formula
+                    if original_dim == 2:
+                        g_sq = grad_out.pow(2).sum(dim=1)
+                        x_sq = x.pow(2).sum(dim=1)
+                        weight_contrib = g_sq * x_sq
+                        
+                        if ctx.has_bias:
+                            weight_contrib = weight_contrib + grad_out.pow(2).sum(dim=1)
+                        norm_buf.add_(weight_contrib)
                     else:
-                        weight_contrib = _input_length_frobenius(x, grad_out)
-                    
-                    # Add bias norm contribution
-                    if ctx.has_bias:
-                        sum_over_time = grad_out.sum(dim=1)
-                        bias_contrib = sum_over_time.pow(2).sum(dim=1)
-                        weight_contrib = weight_contrib + bias_contrib
-                    
-                    norm_buf.add_(weight_contrib)
+                        # Use fused_backward_weight_2d equivalent logic for 3D+
+                        # Materialize per-sample gradients for norm computation
+                        # grad_w_i = g_i^T @ x_i, norm = ||grad_w_i||_F^2
+                        x_c = x_3d if x_3d.is_contiguous() else x_3d.contiguous()
+                        g_c = g_3d if g_3d.is_contiguous() else g_3d.contiguous()
+                        # [B, T, Din].transpose(1,2) @ [B, T, Dout] -> [B, Din, Dout]
+                        per_sample_grad = torch.bmm(x_c.transpose(1, 2), g_c)
+                        weight_contrib = per_sample_grad.pow(2).sum(dim=(1, 2))
+                        
+                        if ctx.has_bias:
+                            bias_sums = g_c.sum(dim=1)  # [B, Dout]
+                            weight_contrib = weight_contrib + bias_sums.pow(2).sum(dim=1)
+                        norm_buf.add_(weight_contrib)
             
             # Return None for grad_w and grad_b - we'll compute clipped gradients later
-            return grad_x, None, None, None, None, None, None, None, None
+            return grad_x, None, None, None, None, None, None
         
-        # --- 3. Normal mode: Compute grad_w and norms ---
-        # Check if we can use Triton (only for 3D CUDA tensors)
-        use_triton = (
-            TRITON_AVAILABLE 
-            and x.is_cuda 
-            and x.dim() == 3
-            and compute_norms 
-            and norm_buf is not None
-        )
+        # --- 4. Normal mode: Compute grad_w and norms ---
+        use_triton = TRITON_AVAILABLE and x.is_cuda and compute_norms and norm_buf is not None
         
         if use_triton:
             # FUSED PATH: Triton kernel computes grad_w AND norms in one pass
-            x_c = x if x.is_contiguous() else x.contiguous()
-            g_c = grad_out if grad_out.is_contiguous() else grad_out.contiguous()
+            x_c = x_3d if x_3d.is_contiguous() else x_3d.contiguous()
+            g_c = g_3d if g_3d.is_contiguous() else g_3d.contiguous()
             
             grad_w = fused_backward_weight(x_c, g_c, norm_buf)
             
             if ctx.has_bias:
-                grad_b = grad_out.sum(dim=(0, 1))
-                bias_sums = grad_out.sum(dim=1)
-                bias_norm_sq = bias_sums.pow(2).sum(dim=1)
+                # Sum over all dims except last
+                grad_b = grad_out.sum(dim=tuple(range(original_dim - 1)))
+                # Bias norm: sum over sequence dims first, then compute per-sample norm
+                if original_dim == 2:
+                    bias_norm_sq = grad_out.pow(2).sum(dim=1)
+                else:
+                    bias_sums = grad_out.sum(dim=tuple(range(1, original_dim - 1)))
+                    bias_norm_sq = bias_sums.pow(2).sum(dim=1)
                 norm_buf.add_(bias_norm_sq)
             else:
                 grad_b = None
         else:
-            # SEPARATE PATH: Standard PyTorch computation
-            if grad_out.dim() == 2:
-                grad_w = grad_out.t().matmul(x)
-            else:
-                grad_w = torch.matmul(
-                    grad_out.view(-1, grad_out.shape[-1]).t(), 
-                    x.view(-1, x.shape[-1])
-                )
+            # STANDARD PATH: PyTorch computation
+            # grad_w = g^T @ x (reshape appropriately)
+            grad_w = torch.matmul(
+                g_3d.view(-1, g_3d.shape[-1]).t(),
+                x_3d.view(-1, x_3d.shape[-1])
+            )
             
-            grad_b = grad_out.sum(dim=list(range(grad_out.dim() - 1))) if ctx.has_bias else None
-
-            # Compute norms separately
+            grad_b = grad_out.sum(dim=tuple(range(original_dim - 1))) if ctx.has_bias else None
+            
+            # Compute norms if needed
             if compute_norms and norm_buf is not None:
-                if x.dim() == 2:
+                if original_dim == 2:
+                    # 2D efficient: ||g_i @ x_i^T||_F^2 = ||g_i||^2 * ||x_i||^2
                     g_sq = grad_out.pow(2).sum(dim=1)
                     x_sq = x.pow(2).sum(dim=1)
                     weight_contrib = g_sq * x_sq
                 else:
-                    if algorithm == 'width':
-                        weight_contrib = _width_frobenius(x, grad_out, tile_size=ctx.tile_size)
-                    else:
-                        weight_contrib = _input_length_frobenius(x, grad_out)
-
+                    # Materialize per-sample gradients
+                    x_c = x_3d if x_3d.is_contiguous() else x_3d.contiguous()
+                    g_c = g_3d if g_3d.is_contiguous() else g_3d.contiguous()
+                    per_sample_grad = torch.bmm(x_c.transpose(1, 2), g_c)
+                    weight_contrib = per_sample_grad.pow(2).sum(dim=(1, 2))
+                
                 if ctx.has_bias:
-                    if grad_out.dim() == 2:
+                    if original_dim == 2:
                         bias_contrib = grad_out.pow(2).sum(dim=1)
                     else:
-                        sum_over_time = grad_out.sum(dim=1)
-                        bias_contrib = sum_over_time.pow(2).sum(dim=1)
+                        bias_sums = g_3d.sum(dim=1)
+                        bias_contrib = bias_sums.pow(2).sum(dim=1)
                     weight_contrib = weight_contrib + bias_contrib
-
-                if norm_buf.shape[0] != weight_contrib.shape[0]:
-                    raise ValueError(f"norm_buf batch {norm_buf.shape[0]} != input batch {weight_contrib.shape[0]}")
+                
                 norm_buf.add_(weight_contrib)
 
-        # Return None for non-tensor inputs (9 total: norm_buf, algorithm, tile_size, 
-        # compute_norms_container, enable_bookkeeping_container, module_ref)
-        return grad_x, grad_w, grad_b, None, None, None, None, None, None
+        # Return gradients (7 inputs: x, weight, bias, norm_buf, 3 containers)
+        return grad_x, grad_w, grad_b, None, None, None, None
 
 
 # ============================================================================
@@ -382,16 +290,13 @@ class FusedFlashLinear(nn.Module):
     This is a drop-in replacement for nn.Linear that can be used for
     differential privacy training with FSDP without serialization issues.
     
+    Uses Triton fused kernel for optimal performance. Supports inputs of
+    any dimension >= 2 (2D: [B, D], 3D: [B, T, D], 4D+: [B, d1, d2, ..., D]).
+    
     Usage:
         1. Replace nn.Linear with FusedFlashLinear
         2. Before forward pass, call set_norm_buffer(norm_buf) with a shared buffer
         3. After backward, the norm_buf contains accumulated squared norms
-        
-    Algorithm options:
-        - 'auto': Use 'triton' if available on CUDA, else 'input_length' (default)
-        - 'triton': Fused Triton kernel - fastest, computes grad_w and norms in 1 pass
-        - 'input_length': O(T * d^2) PyTorch implementation
-        - 'width': O(T^2 * d) PyTorch implementation
     """
     
     def __init__(
@@ -399,8 +304,6 @@ class FusedFlashLinear(nn.Module):
         in_features: int, 
         out_features: int, 
         bias: bool = True,
-        algorithm: str = "auto",
-        tile_size: int = 256,
         device=None,
         dtype=None,
     ):
@@ -409,17 +312,12 @@ class FusedFlashLinear(nn.Module):
             in_features: Size of each input sample
             out_features: Size of each output sample
             bias: If set to False, the layer will not learn an additive bias
-            algorithm: 'auto', 'triton', 'input_length', or 'width'
-                       'auto' uses 'triton' if available on CUDA, else 'input_length'
-            tile_size: Block size for width algorithm
             device: Device for parameters
             dtype: Dtype for parameters
         """
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.algorithm = algorithm
-        self.tile_size = tile_size
         
         factory_kwargs = {'device': device, 'dtype': dtype}
         self.weight = nn.Parameter(torch.empty(out_features, in_features, **factory_kwargs))
@@ -474,7 +372,7 @@ class FusedFlashLinear(nn.Module):
         """
         self._enable_bookkeeping_container['value'] = enable
 
-    def compute_clipped_gradient(self, clipping_coef: torch.Tensor):
+    def compute_clipped_gradient(self, clipping_coef: torch.Tensor, grad_scale: float = 1.0):
         """
         Compute clipped gradients from cached activations and backprops.
         
@@ -484,8 +382,13 @@ class FusedFlashLinear(nn.Module):
         This computes exact per-sample clipped gradients without materializing
         per-sample gradient matrices.
         
+        Handles inputs of any dimension >= 2.
+        
         Args:
             clipping_coef: Per-sample clipping coefficients [batch_size]
+            grad_scale: Scale factor for gradients (e.g., batch_size for loss_reduction="mean")
+                       When loss_reduction="mean", grad_out is divided by batch_size,
+                       so we need to multiply by batch_size to get correct gradient magnitude.
         """
         if self._bk_cache is None:
             raise RuntimeError(
@@ -495,35 +398,43 @@ class FusedFlashLinear(nn.Module):
         
         x = self._bk_cache['x']
         grad_out = self._bk_cache['grad_out']
+        original_dim = x.dim()
         
-        # Scale grad_out by per-sample clipping coefficients
-        # x: [B, T, Din] or [B, Din], grad_out: [B, T, Dout] or [B, Dout]
-        if grad_out.dim() == 2:
-            # 2D case: [B, Dout]
-            scaled_g = grad_out * clipping_coef.view(-1, 1).to(device=grad_out.device, dtype=grad_out.dtype)
-            # grad_w = scaled_g.T @ x -> [Dout, B] @ [B, Din] -> [Dout, Din]
+        # Scale grad_out by per-sample clipping coefficients and grad_scale
+        coef_with_scale = clipping_coef * grad_scale
+        
+        if original_dim == 2:
+            # 2D case: [B, Din], [B, Dout]
+            scaled_g = grad_out * coef_with_scale.view(-1, 1).to(device=grad_out.device, dtype=grad_out.dtype)
             grad_w = scaled_g.t().matmul(x)
-            # grad_b = scaled_g.sum(dim=0) -> [Dout]
             grad_b = scaled_g.sum(dim=0) if self.bias is not None else None
         else:
-            # 3D case: [B, T, Dout]
-            scaled_g = grad_out * clipping_coef.view(-1, 1, 1).to(device=grad_out.device, dtype=grad_out.dtype)
-            # Reshape for matmul: [B*T, Dout].T @ [B*T, Din] -> [Dout, Din]
+            # 3D+ case: reshape to [B, T, D] format
+            B = x.shape[0]
+            Din = x.shape[-1]
+            Dout = grad_out.shape[-1]
+            
+            # Reshape to 3D
+            x_3d = x.view(B, -1, Din)
+            g_3d = grad_out.view(B, -1, Dout)
+            
+            # Apply per-sample scaling
+            scaled_g = g_3d * coef_with_scale.view(-1, 1, 1).to(device=g_3d.device, dtype=g_3d.dtype)
+            
+            # grad_w = scaled_g^T @ x (flattened)
             grad_w = torch.matmul(
-                scaled_g.view(-1, scaled_g.shape[-1]).t(),
-                x.view(-1, x.shape[-1])
+                scaled_g.view(-1, Dout).t(),
+                x_3d.view(-1, Din)
             )
-            # grad_b = scaled_g.sum(dim=(0, 1)) -> [Dout]
+            
+            # grad_b = sum over all dims except last
             grad_b = scaled_g.sum(dim=(0, 1)) if self.bias is not None else None
         
         # Set gradients on parameters (ensure dtype matches parameter dtype)
-        # Handle DTensor case for FSDP compatibility
         grad_w = grad_w.to(dtype=self.weight.dtype)
         
-        # Check if weight is a DTensor (FSDP sharded)
+        # Handle DTensor case for FSDP compatibility
         if DTENSOR_AVAILABLE and isinstance(self.weight, DTensor):
-            # Convert gradient to DTensor with same spec as parameter
-            # The gradient is computed on the full (replicated) tensor, so we use Replicate placement
             from torch.distributed._tensor import Replicate
             grad_w = DTensor.from_local(
                 grad_w, 
@@ -539,7 +450,6 @@ class FusedFlashLinear(nn.Module):
         if self.bias is not None and grad_b is not None:
             grad_b = grad_b.to(dtype=self.bias.dtype)
             
-            # Check if bias is a DTensor (FSDP sharded)
             if DTENSOR_AVAILABLE and isinstance(self.bias, DTensor):
                 from torch.distributed._tensor import Replicate
                 grad_b = DTensor.from_local(
@@ -569,30 +479,21 @@ class FusedFlashLinear(nn.Module):
             self.weight, 
             self.bias, 
             self._norm_buf,
-            self.algorithm,
-            self.tile_size,
             self._compute_norms_container,
             self._enable_bookkeeping_container,
             self,  # Pass module reference for caching in BK mode
         )
     
     def extra_repr(self) -> str:
-        return f'in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}, algorithm={self.algorithm}'
+        return f'in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}'
 
 
-def replace_linear_with_fused(
-    module: nn.Module,
-    algorithm: str = "auto",
-    tile_size: int = 256,
-) -> nn.Module:
+def replace_linear_with_fused(module: nn.Module) -> nn.Module:
     """
     Recursively replace all nn.Linear modules with FusedFlashLinear.
     
     Args:
         module: The module to process
-        algorithm: Algorithm for norm computation
-                   'auto' (default), 'triton', 'input_length', or 'width'
-        tile_size: Tile size for width algorithm
         
     Returns:
         The modified module with Linear layers replaced.
@@ -604,8 +505,6 @@ def replace_linear_with_fused(
             in_features=module.in_features,
             out_features=module.out_features,
             bias=module.bias is not None,
-            algorithm=algorithm,
-            tile_size=tile_size,
             device=module.weight.device,
             dtype=module.weight.dtype,
         )
@@ -617,25 +516,19 @@ def replace_linear_with_fused(
     # Recurse into children
     for name, child in list(module.named_children()):
         if isinstance(child, nn.Linear) and not isinstance(child, FusedFlashLinear):
-            # Create FusedFlashLinear with same configuration
             fused = FusedFlashLinear(
                 in_features=child.in_features,
                 out_features=child.out_features,
                 bias=child.bias is not None,
-                algorithm=algorithm,
-                tile_size=tile_size,
                 device=child.weight.device,
                 dtype=child.weight.dtype,
             )
-            # Copy weights
             fused.weight.data.copy_(child.weight.data)
             if child.bias is not None:
                 fused.bias.data.copy_(child.bias.data)
-            # Replace the module
             setattr(module, name, fused)
         else:
-            # Recurse into children
-            replace_linear_with_fused(child, algorithm, tile_size)
+            replace_linear_with_fused(child)
     
     return module
 
@@ -664,4 +557,3 @@ __all__ = [
     "replace_linear_with_fused",
     "get_fused_linear_modules",
 ]
-

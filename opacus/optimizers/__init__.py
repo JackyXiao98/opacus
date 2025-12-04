@@ -37,7 +37,7 @@ __all__ = [
 
 
 def get_optimizer_class(clipping: str, distributed: bool, grad_sample_mode: str = None):
-    if grad_sample_mode in ["ghost", "flash", "flash_bk", "ghost_bk"]:
+    if grad_sample_mode in ["ghost", "flash", "flash_bk", "ghost_bk", "flash_fuse", "flash_fuse_bk"]:
         if clipping == "flat" and distributed is False:
             return DPOptimizerFastGradientClipping
         elif clipping == "flat" and distributed is True:

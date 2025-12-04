@@ -349,14 +349,9 @@ class GradSampleModuleFastGradientClippingFSDP(GradSampleModuleFastGradientClipp
             # Apply per-sample clipping coefficients to backprops
             # backprops shape: [batch_size, ...], clipping_coef shape: [batch_size]
             # We need to reshape clipping_coef to broadcast properly and match dtype
-            if backprops.dim() == 2:
-                # [B, d] -> multiply by [B, 1]
-                clipped_backprops = backprops * clipping_coef.view(-1, 1).to(device=backprops.device, dtype=backprops.dtype)
-            elif backprops.dim() == 3:
-                # [B, T, d] -> multiply by [B, 1, 1]
-                clipped_backprops = backprops * clipping_coef.view(-1, 1, 1).to(device=backprops.device, dtype=backprops.dtype)
-            else:
-                raise ValueError(f"Unsupported backprops dimension: {backprops.dim()}")
+            # Support arbitrary dimensions: 2D [B, d], 3D [B, T, d], 4D [B, C, H, W], etc.
+            coef_shape = [-1] + [1] * (backprops.dim() - 1)
+            clipped_backprops = backprops * clipping_coef.view(*coef_shape).to(device=backprops.device, dtype=backprops.dtype)
             
             module_type = self._get_module_type(module)
             

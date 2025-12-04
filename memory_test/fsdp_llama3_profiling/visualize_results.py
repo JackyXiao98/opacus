@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Visualize FSDP Llama3 profiling results with detailed comparison plots.
+Visualize FSDP profiling results with detailed comparison plots.
+Supports both LLM and DiT models.
 """
 
 import argparse
@@ -27,6 +28,8 @@ MODE_NAMES = {
     "flash": "Flash\nSingle",
     "flash_bk": "Flash\nSingle\n(BK)",
     "ghost_bk": "Ghost\nSingle\n(BK)",
+    "flash_fuse": "Flash\nSingle\n(Fuse)",
+    "flash_fuse_bk": "Flash\nSingle\n(Fuse+BK)",
 }
 
 # Colors for modes
@@ -45,6 +48,8 @@ MODE_COLORS = {
     "flash": "#58d68d",           # Light Green
     "flash_bk": "#f8c471",        # Light Orange
     "ghost_bk": "#bb8fce",        # Light Purple
+    "flash_fuse": "#48c9b0",      # Light Teal
+    "flash_fuse_bk": "#45b39d",   # Medium Teal
 }
 
 # Mode ordering for plots
@@ -54,10 +59,29 @@ MODE_ORDER = [
     "flash_fsdp", "flash",
     "flash_fsdp_bk", "flash_bk",
     "ghost_fsdp_bk", "ghost_bk",
-    "flash_fsdp_fuse", "flash_fsdp_fuse_bk"
+    "flash_fsdp_fuse", "flash_fuse",
+    "flash_fsdp_fuse_bk", "flash_fuse_bk"
 ]
 
-# Markers for sequence lengths
+# Markers for different modes in line charts
+MODE_MARKERS = {
+    "no_dp": "o",
+    "no_dp_single": "o",
+    "ghost_fsdp": "s",
+    "ghost": "s",
+    "flash_fsdp": "^",
+    "flash": "^",
+    "flash_fsdp_bk": "D",
+    "flash_bk": "D",
+    "ghost_fsdp_bk": "P",
+    "ghost_bk": "P",
+    "flash_fsdp_fuse": "H",
+    "flash_fuse": "H",
+    "flash_fsdp_fuse_bk": "*",
+    "flash_fuse_bk": "*",
+}
+
+# Markers for sequence lengths (for scatter plots)
 SEQ_MARKERS = {
     1024: "o",
     2048: "s",
@@ -193,6 +217,62 @@ def plot_time_comparison(results, output_dir):
     print(f"✓ Saved: {output_path}")
 
 
+def plot_time_vs_seq_length(results, output_dir):
+    """Plot time vs sequence length as a line chart (one line per mode)"""
+    # Get all sequence lengths across all modes
+    seq_lengths = sorted(set(
+        seq_len for mode_data in results.values() for seq_len in mode_data.keys()
+    ))
+    
+    # Need at least 2 sequence lengths to make a meaningful line chart
+    if len(seq_lengths) < 2:
+        print("⚠️  Need at least 2 sequence lengths to plot time vs sequence length, skipping")
+        return
+    
+    # Sort modes by defined order, only include modes present in results
+    modes = [m for m in MODE_ORDER if m in results]
+    
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    for mode in modes:
+        mode_seq_lengths = []
+        mode_times = []
+        
+        for seq_len in seq_lengths:
+            if seq_len in results[mode]:
+                mode_seq_lengths.append(seq_len)
+                mode_times.append(results[mode][seq_len]["avg_time_ms"])
+        
+        if mode_seq_lengths:
+            marker = MODE_MARKERS.get(mode, 'o')
+            ax.plot(mode_seq_lengths, mode_times,
+                   marker=marker,
+                   color=MODE_COLORS[mode],
+                   linewidth=2.5,
+                   markersize=10,
+                   label=MODE_NAMES[mode].replace('\n', ' '),
+                   alpha=0.8)
+    
+    ax.set_xlabel('Sequence Length', fontsize=16, fontweight='bold')
+    ax.set_ylabel('Avg Time per Iteration (ms)', fontsize=16, fontweight='bold')
+    ax.set_title('Time vs Sequence Length', fontsize=18, fontweight='bold')
+    ax.legend(fontsize=11, loc='best', framealpha=0.9)
+    ax.grid(True, alpha=0.4, linestyle='--')
+    
+    # Set x-axis to show all sequence lengths
+    ax.set_xticks(seq_lengths)
+    ax.set_xticklabels(seq_lengths, fontsize=12)
+    
+    # Set y-axis to start from 0
+    ax.set_ylim(bottom=0)
+    
+    plt.tight_layout()
+    output_path = Path(output_dir) / "time_vs_seq_length.png"
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✓ Saved: {output_path}")
+
+
 def plot_memory_vs_time_tradeoff(results, output_dir):
     """Plot memory vs time tradeoff"""
     fig, ax = plt.subplots(figsize=(14, 10))
@@ -205,10 +285,11 @@ def plot_memory_vs_time_tradeoff(results, output_dir):
             memory_gb = data["peak_memory_gb"]
             time_ms = data["avg_time_ms"]
             
+            marker = SEQ_MARKERS.get(seq_len, 'o')
             ax.scatter(memory_gb, time_ms, 
                       s=400,
                       color=MODE_COLORS[mode],
-                      marker=SEQ_MARKERS[seq_len],
+                      marker=marker,
                       edgecolors='black',
                       linewidth=2,
                       alpha=0.8,
@@ -349,178 +430,24 @@ def plot_overhead_analysis(results, output_dir):
     if has_fsdp_baseline:
         fsdp_dp_modes = [m for m in ["ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", "ghost_fsdp_bk", "flash_fsdp_fuse", "flash_fsdp_fuse_bk"] 
                          if m in results]
-        plot_baseline_overhead("no_dp", fsdp_dp_modes, 
-                             axes[plot_idx, 0], axes[plot_idx, 1],
-                             "FSDP Modes (vs no_dp)")
-        plot_idx += 1
+        if fsdp_dp_modes:
+            plot_baseline_overhead("no_dp", fsdp_dp_modes, 
+                                 axes[plot_idx, 0], axes[plot_idx, 1],
+                                 "FSDP Modes (vs no_dp)")
+            plot_idx += 1
     
     # Plot Single-GPU overhead
     if has_single_baseline:
-        single_dp_modes = [m for m in ["ghost", "flash", "flash_bk", "ghost_bk"] 
+        single_dp_modes = [m for m in ["ghost", "flash", "flash_bk", "ghost_bk", "flash_fuse", "flash_fuse_bk"] 
                           if m in results]
-        plot_baseline_overhead("no_dp_single", single_dp_modes,
-                             axes[plot_idx, 0], axes[plot_idx, 1],
-                             "Single-GPU Modes (vs no_dp_single)")
-        plot_idx += 1
+        if single_dp_modes:
+            plot_baseline_overhead("no_dp_single", single_dp_modes,
+                                 axes[plot_idx, 0], axes[plot_idx, 1],
+                                 "Single-GPU Modes (vs no_dp_single)")
+            plot_idx += 1
     
     plt.tight_layout()
     output_path = Path(output_dir) / "overhead_analysis.png"
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"✓ Saved: {output_path}")
-
-
-def plot_loss_trajectory(results, output_dir):
-    """Plot loss trajectory comparison for accuracy tests"""
-    # Check if any results have loss values
-    has_loss_data = any(
-        'loss_values' in data and len(data['loss_values']) > 0
-        for mode_data in results.values()
-        for data in mode_data.values()
-    )
-    
-    if not has_loss_data:
-        print("⚠️  No loss data available, skipping loss trajectory plot")
-        return
-    
-    fig, ax = plt.subplots(figsize=(14, 8))
-    
-    # Sort modes by defined order, only include modes present in results
-    modes = [m for m in MODE_ORDER if m in results]
-    
-    for mode in modes:
-        for seq_len, data in results[mode].items():
-            if 'loss_values' in data and len(data['loss_values']) > 0:
-                loss_values = data['loss_values']
-                iterations = list(range(1, len(loss_values) + 1))
-                
-                ax.plot(iterations, loss_values,
-                       marker=SEQ_MARKERS.get(seq_len, 'o'),
-                       color=MODE_COLORS[mode],
-                       linewidth=2.5,
-                       markersize=10,
-                       label=f"{MODE_NAMES[mode].replace(chr(10), ' ')} (seq={seq_len})",
-                       alpha=0.8)
-    
-    ax.set_xlabel('Iteration', fontsize=16, fontweight='bold')
-    ax.set_ylabel('Loss', fontsize=16, fontweight='bold')
-    ax.set_title('Loss Trajectory Comparison (Accuracy Test)', fontsize=18, fontweight='bold')
-    ax.legend(fontsize=11, loc='best', framealpha=0.9)
-    ax.grid(True, alpha=0.4, linestyle='--')
-    
-    plt.tight_layout()
-    output_path = Path(output_dir) / "loss_trajectory.png"
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"✓ Saved: {output_path}")
-
-
-def plot_gradient_norm_comparison(results, output_dir):
-    """Plot gradient norm comparison for accuracy tests"""
-    # Check if any results have gradient norm data
-    has_grad_data = any(
-        'grad_norms' in data and len(data['grad_norms']) > 0
-        for mode_data in results.values()
-        for data in mode_data.values()
-    )
-    
-    if not has_grad_data:
-        print("⚠️  No gradient norm data available, skipping gradient norm plot")
-        return
-    
-    fig, ax = plt.subplots(figsize=(14, 8))
-    
-    # Sort modes by defined order, only include modes present in results
-    modes = [m for m in MODE_ORDER if m in results]
-    
-    for mode in modes:
-        for seq_len, data in results[mode].items():
-            if 'grad_norms' in data and len(data['grad_norms']) > 0:
-                grad_norms = data['grad_norms']
-                iterations = list(range(1, len(grad_norms) + 1))
-                
-                ax.plot(iterations, grad_norms,
-                       marker=SEQ_MARKERS.get(seq_len, 'o'),
-                       color=MODE_COLORS[mode],
-                       linewidth=2.5,
-                       markersize=10,
-                       label=f"{MODE_NAMES[mode].replace(chr(10), ' ')} (seq={seq_len})",
-                       alpha=0.8)
-    
-    ax.set_xlabel('Iteration', fontsize=16, fontweight='bold')
-    ax.set_ylabel('Gradient Norm', fontsize=16, fontweight='bold')
-    ax.set_title('Gradient Norm Comparison (Accuracy Test)', fontsize=18, fontweight='bold')
-    ax.legend(fontsize=11, loc='best', framealpha=0.9)
-    ax.grid(True, alpha=0.4, linestyle='--')
-    
-    plt.tight_layout()
-    output_path = Path(output_dir) / "gradient_norm_comparison.png"
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"✓ Saved: {output_path}")
-
-
-def plot_final_loss_comparison(results, output_dir):
-    """Plot final loss comparison across modes"""
-    # Check if any results have loss values
-    has_loss_data = any(
-        'final_loss' in data
-        for mode_data in results.values()
-        for data in mode_data.values()
-    )
-    
-    if not has_loss_data:
-        print("⚠️  No final loss data available, skipping final loss plot")
-        return
-    
-    seq_lengths = sorted(set(
-        seq_len for mode_data in results.values() for seq_len in mode_data.keys()
-    ))
-    modes = [m for m in MODE_ORDER if m in results]
-    
-    fig, axes = plt.subplots(1, len(seq_lengths), figsize=(6 * len(seq_lengths), 6))
-    
-    if len(seq_lengths) == 1:
-        axes = [axes]
-    
-    for idx, seq_len in enumerate(seq_lengths):
-        ax = axes[idx]
-        
-        x = np.arange(len(modes))
-        final_losses = []
-        
-        for mode in modes:
-            if mode in results and seq_len in results[mode]:
-                final_losses.append(results[mode][seq_len].get("final_loss", 0))
-            else:
-                final_losses.append(0)
-        
-        bars = ax.bar(x, final_losses, color=[MODE_COLORS[mode] for mode in modes],
-                     edgecolor='black', linewidth=2, width=0.6)
-        
-        # Add value labels on bars
-        for i, (bar, loss) in enumerate(zip(bars, final_losses)):
-            if loss > 0:
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + max(final_losses) * 0.01,
-                       f'{loss:.4f}', ha='center', va='bottom',
-                       fontsize=11, fontweight='bold')
-        
-        ax.set_xlabel('Training Mode', fontsize=14, fontweight='bold')
-        ax.set_ylabel('Final Loss', fontsize=14, fontweight='bold')
-        ax.set_title(f'Final Loss Comparison (seq={seq_len})', fontsize=16, fontweight='bold')
-        ax.set_xticks(x)
-        ax.set_xticklabels([MODE_NAMES[mode] for mode in modes], fontsize=11)
-        ax.grid(axis='y', alpha=0.3, linestyle='--')
-        
-        # Set y-axis to start from minimum loss with some margin
-        if final_losses:
-            min_loss = min([l for l in final_losses if l > 0])
-            max_loss = max(final_losses)
-            margin = (max_loss - min_loss) * 0.1
-            ax.set_ylim(bottom=max(0, min_loss - margin))
-    
-    plt.tight_layout()
-    output_path = Path(output_dir) / "final_loss_comparison.png"
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"✓ Saved: {output_path}")
@@ -530,7 +457,7 @@ def generate_summary_table(results, output_dir):
     """Generate summary table"""
     summary_lines = []
     summary_lines.append("=" * 110)
-    summary_lines.append("LLAMA3 PROFILING SUMMARY (FSDP + Single-GPU)")
+    summary_lines.append("PROFILING SUMMARY (FSDP + Single-GPU)")
     summary_lines.append("=" * 110)
     summary_lines.append("")
     
@@ -595,7 +522,7 @@ def generate_summary_table(results, output_dir):
         summary_lines.append("OVERHEAD ANALYSIS - SINGLE-GPU MODES (vs no_dp_single baseline):")
         summary_lines.append("")
         
-        single_dp_modes = [m for m in modes if m in ["ghost", "flash", "flash_bk", "ghost_bk"]]
+        single_dp_modes = [m for m in modes if m in ["ghost", "flash", "flash_bk", "ghost_bk", "flash_fuse", "flash_fuse_bk"]]
         
         if single_dp_modes:
             summary_lines.append(f"{'Mode':<25} {'Seq Length':>12} {'Mem Overhead (GB)':>20} {'Time Overhead (%)':>20}")
@@ -619,69 +546,6 @@ def generate_summary_table(results, output_dir):
                 summary_lines.append("-" * 110)
     
     summary_lines.append("")
-    
-    # Accuracy test summary (if data available)
-    has_accuracy_data = any(
-        'grad_norms' in data or 'loss_values' in data
-        for mode_data in results.values()
-        for data in mode_data.values()
-    )
-    
-    if has_accuracy_data:
-        summary_lines.append("ACCURACY TEST RESULTS:")
-        summary_lines.append("")
-        summary_lines.append(f"{'Mode':<25} {'Seq Length':>12} {'Final Loss':>15} {'Avg Grad Norm':>18}")
-        summary_lines.append("-" * 110)
-        
-        for mode in modes:
-            for seq_len in seq_lengths:
-                if seq_len in results[mode]:
-                    data = results[mode][seq_len]
-                    mode_name = MODE_NAMES[mode].replace('\n', ' ')
-                    final_loss = data.get('final_loss', 0)
-                    avg_grad_norm = data.get('avg_grad_norm', 0)
-                    
-                    if final_loss > 0 or avg_grad_norm > 0:
-                        final_loss_str = f"{final_loss:.6f}" if final_loss > 0 else "N/A"
-                        grad_norm_str = f"{avg_grad_norm:.6f}" if avg_grad_norm > 0 else "N/A"
-                        summary_lines.append(
-                            f"{mode_name:<25} {seq_len:>12} {final_loss_str:>15} {grad_norm_str:>18}"
-                        )
-            summary_lines.append("-" * 110)
-        
-        # Consistency metrics
-        summary_lines.append("")
-        summary_lines.append("CONSISTENCY METRICS:")
-        summary_lines.append("")
-        
-        for seq_len in seq_lengths:
-            final_losses = []
-            grad_norms = []
-            
-            for mode in modes:
-                if seq_len in results[mode]:
-                    data = results[mode][seq_len]
-                    if 'final_loss' in data and data['final_loss'] > 0:
-                        final_losses.append(data['final_loss'])
-                    if 'avg_grad_norm' in data and data['avg_grad_norm'] > 0:
-                        grad_norms.append(data['avg_grad_norm'])
-            
-            if len(final_losses) > 1:
-                avg_loss = sum(final_losses) / len(final_losses)
-                max_diff = max(final_losses) - min(final_losses)
-                std_dev = (sum([(l - avg_loss)**2 for l in final_losses]) / len(final_losses)) ** 0.5
-                summary_lines.append(f"  Seq Length {seq_len} - Final Loss:")
-                summary_lines.append(f"    Mean: {avg_loss:.6f}, Std Dev: {std_dev:.6f}, Max Diff: {max_diff:.6f}")
-            
-            if len(grad_norms) > 1:
-                avg_norm = sum(grad_norms) / len(grad_norms)
-                max_diff = max(grad_norms) - min(grad_norms)
-                std_dev = (sum([(g - avg_norm)**2 for g in grad_norms]) / len(grad_norms)) ** 0.5
-                summary_lines.append(f"  Seq Length {seq_len} - Avg Gradient Norm:")
-                summary_lines.append(f"    Mean: {avg_norm:.6f}, Std Dev: {std_dev:.6f}, Max Diff: {max_diff:.6f}")
-            
-            summary_lines.append("")
-    
     summary_lines.append("=" * 110)
     
     # Save to file
@@ -696,7 +560,7 @@ def generate_summary_table(results, output_dir):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Visualize FSDP Llama3 profiling results")
+    parser = argparse.ArgumentParser(description="Visualize FSDP profiling results")
     parser.add_argument("--input-dir", type=str, required=True,
                        help="Directory containing experiment JSON files")
     parser.add_argument("--output-dir", type=str, required=True,
@@ -726,13 +590,9 @@ def main():
     # Generate plots
     plot_memory_comparison(results, output_path)
     plot_time_comparison(results, output_path)
+    plot_time_vs_seq_length(results, output_path)
     plot_memory_vs_time_tradeoff(results, output_path)
     plot_overhead_analysis(results, output_path)
-    
-    # Accuracy test plots (only if data is available)
-    plot_loss_trajectory(results, output_path)
-    plot_gradient_norm_comparison(results, output_path)
-    plot_final_loss_comparison(results, output_path)
     
     generate_summary_table(results, output_path)
     
@@ -744,4 +604,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

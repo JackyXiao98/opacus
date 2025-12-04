@@ -14,16 +14,18 @@
 # limitations under the License.
 
 """
-Fused Flash Linear FSDP GradSampleModule.
+Fused Flash Linear GradSampleModule (non-FSDP version).
 
 This module provides a GradSampleModule that fuses per-sample gradient norm
 computation directly into Linear layer backward passes, avoiding hooks for
-Linear layers and eliminating FSDP serialization overhead.
+Linear layers.
 
 Key features:
 - Linear layers: Norm computed via FusedFlashLinear (no hooks)
 - Non-Linear layers: Norm computed via hooks (standard approach)
 - Supports both two-pass and bookkeeping (single-pass) modes
+
+For FSDP usage, see GradSampleModuleFastGradientClippingFSDPFuse.
 """
 
 from __future__ import annotations
@@ -33,11 +35,9 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
-from torch.distributed._tensor.experimental import implicit_replication
 
 from opacus.grad_sample.functorch import ft_compute_per_sample_gradient
 from opacus.grad_sample.fused_flash_linear import (
-    TRITON_AVAILABLE,
     FusedFlashLinear,
     get_fused_linear_modules,
     replace_linear_with_fused,
@@ -52,23 +52,23 @@ logger = logging.getLogger(__name__)
 logger.disabled = True
 
 
-class GradSampleModuleFastGradientClippingFSDPFuse(GradSampleModuleFastGradientClipping):
+class GradSampleModuleFastGradientClippingFuse(GradSampleModuleFastGradientClipping):
     """
-    Fused implementation of GradSampleModule for FSDP with Fast Gradient Clipping.
+    Fused implementation of GradSampleModule with Fast Gradient Clipping.
     
     This class replaces nn.Linear modules with FusedFlashLinear modules that
     compute per-sample gradient norms directly in the backward pass, avoiding
     the need for hooks on Linear layers.
     
     Benefits:
-    - Eliminates FSDP serialization during norm computation for Linear layers
     - Reduces hook overhead for models with many Linear layers
     - Compatible with standard two-pass and bookkeeping (single-pass) modes
     - With Triton: Fuses grad_w and norm computation in single kernel pass (2x IO reduction)
     
     Note: Non-Linear layers (LayerNorm, Embedding, etc.) still use hooks.
+    
+    For FSDP usage, see GradSampleModuleFastGradientClippingFSDPFuse.
     """
-    # Note: FLASH_NORM_SAMPLERS is inherited from parent class
 
     def __init__(
         self,
@@ -102,28 +102,14 @@ class GradSampleModuleFastGradientClippingFSDPFuse(GradSampleModuleFastGradientC
                 "Bookkeeping optimization only works with Ghost Clipping."
             )
         
-        # Replace nn.Linear with FusedFlashLinear BEFORE calling super().__init__
-        # This ensures hooks are not registered for Linear layers
-        
         # Check if model already has FusedFlashLinear modules (pre-replaced)
-        # or if it's FSDP-wrapped (has DTensor weights - cannot replace)
         already_has_fused = any(isinstance(mod, FusedFlashLinear) for mod in m.modules())
-        is_fsdp_wrapped = self._check_fsdp_wrapped(m)
         
         if already_has_fused:
             # Model was pre-processed - skip replacement
             logger.info("Model already has FusedFlashLinear modules, skipping replacement")
-        elif is_fsdp_wrapped:
-            # Model is FSDP-wrapped - cannot replace safely, warn user
-            import warnings
-            warnings.warn(
-                "Model appears to be FSDP-wrapped (has DTensor weights). "
-                "Cannot replace Linear modules after FSDP wrapping. "
-                "For flash_fsdp_fuse mode, replace Linear modules BEFORE FSDP wrapping. "
-                "Falling back to standard hook-based norm computation for Linear layers."
-            )
         else:
-            # Safe to replace - model is not FSDP-wrapped and not pre-processed
+            # Replace nn.Linear with FusedFlashLinear
             m = replace_linear_with_fused(m)
         
         # Get list of fused linear modules
@@ -133,7 +119,6 @@ class GradSampleModuleFastGradientClippingFSDPFuse(GradSampleModuleFastGradientC
             self._fused_linear_modules.append(m)
         
         # Enable bookkeeping mode on fused modules if requested
-        # This makes them cache activations/backprops for clipped gradient computation
         if enable_fastdp_bookkeeping:
             for module in self._fused_linear_modules:
                 module.set_bookkeeping_mode(True)
@@ -157,29 +142,6 @@ class GradSampleModuleFastGradientClippingFSDPFuse(GradSampleModuleFastGradientC
             enable_fastdp_bookkeeping=enable_fastdp_bookkeeping,
         )
 
-    @staticmethod
-    def _check_fsdp_wrapped(module: nn.Module) -> bool:
-        """Check if model is FSDP-wrapped (has DTensor weights)."""
-        for m in module.modules():
-            if isinstance(m, nn.Linear):
-                # Check if weight is a DTensor (FSDP-sharded)
-                weight = m.weight
-                if hasattr(weight, 'to_local') or hasattr(weight, 'full_tensor'):
-                    return True
-                # Also check type name for DTensor
-                if 'DTensor' in str(type(weight)):
-                    return True
-        return False
-
-    def _get_module_type(self, module: nn.Module) -> type:
-        """Get the actual module type, handling FSDP wrapped modules."""
-        module_type = (
-            module.__class__.__bases__[1]
-            if isinstance(module, torch.distributed.fsdp.FSDPModule)
-            else type(module)
-        )
-        return module_type
-
     def _setup_norm_buffer(self, batch_size: int, device: torch.device, dtype: torch.dtype):
         """
         Set up the shared norm buffer for fused Linear modules.
@@ -192,7 +154,6 @@ class GradSampleModuleFastGradientClippingFSDPFuse(GradSampleModuleFastGradientC
             dtype: Data type for the buffer (will be converted to float if integer)
         """
         # Norm buffer must be floating point for accumulating squared norms
-        # Input dtype might be integer (e.g., input_ids), so we need to convert
         if not dtype.is_floating_point:
             dtype = torch.float32
         
@@ -207,6 +168,17 @@ class GradSampleModuleFastGradientClippingFSDPFuse(GradSampleModuleFastGradientC
         # Set buffer on all fused linear modules
         for module in self._fused_linear_modules:
             module.set_norm_buffer(self._linear_norm_buf)
+    
+    def _get_loss_reduction_scale(self) -> float:
+        """
+        Get the scaling factor for loss_reduction.
+        
+        When loss_reduction="mean", gradients are divided by batch_size, so we need
+        to multiply squared norms by batch_size^2 to get the correct per-sample norms.
+        """
+        if self.loss_reduction == "mean":
+            return float(self._current_batch_size ** 2)
+        return 1.0
 
     def _enable_fused_norm_computation(self, enable: bool = True):
         """Enable or disable norm computation in fused Linear modules."""
@@ -271,17 +243,16 @@ class GradSampleModuleFastGradientClippingFSDPFuse(GradSampleModuleFastGradientC
             )
         
         # Get squared norms from fused Linear layers (already accumulated in buffer)
+        # Apply loss_reduction scaling: when loss_reduction="mean", gradients are divided
+        # by batch_size, so squared norms need to be multiplied by batch_size^2
         if self._linear_norm_buf is not None:
-            linear_norm_squared = self._linear_norm_buf
+            scale = self._get_loss_reduction_scale()
+            linear_norm_squared = self._linear_norm_buf * scale
         else:
             linear_norm_squared = torch.zeros_like(hooked_norm_squared)
         
         # Combine: total_norm^2 = linear_norm^2 + hooked_norm^2
         total_norm_squared = linear_norm_squared + hooked_norm_squared.squeeze(-1)
-        
-        # All-reduce for FSDP (sum squared norms across ranks)
-        if torch.distributed.is_initialized():
-            torch.distributed.all_reduce(total_norm_squared, op=torch.distributed.ReduceOp.SUM)
         
         # Take sqrt to get final norms
         norm_sample = torch.sqrt(total_norm_squared + 1e-12)
@@ -322,7 +293,7 @@ class GradSampleModuleFastGradientClippingFSDPFuse(GradSampleModuleFastGradientC
 
         module._forward_counter += 1
         if self.use_ghost_clipping and module._forward_counter > 1:
-            raise NotImplementedError("Parameter tying is not supported with FSDP Fuse")
+            raise NotImplementedError("Parameter tying is not supported with Fuse mode")
 
     def capture_backprops_hook(
         self,
@@ -354,7 +325,6 @@ class GradSampleModuleFastGradientClippingFSDPFuse(GradSampleModuleFastGradientC
             batch_first=batch_first,
         )
         
-        module_type = self._get_module_type(module)
         module._forward_counter -= 1
         
         # Initialize norm_sample storage
@@ -370,14 +340,14 @@ class GradSampleModuleFastGradientClippingFSDPFuse(GradSampleModuleFastGradientC
                 )
 
         if self.use_ghost_clipping and (
-            module_type in self.NORM_SAMPLERS or 
-            (self.use_flash_clipping and module_type in self.FLASH_NORM_SAMPLERS)
+            type(module) in self.NORM_SAMPLERS or 
+            (self.use_flash_clipping and type(module) in self.FLASH_NORM_SAMPLERS)
         ):
             # Use Flash sampler if available and enabled
-            if self.use_flash_clipping and module_type in self.FLASH_NORM_SAMPLERS:
-                norm_sampler_fn = self.FLASH_NORM_SAMPLERS[module_type]
+            if self.use_flash_clipping and type(module) in self.FLASH_NORM_SAMPLERS:
+                norm_sampler_fn = self.FLASH_NORM_SAMPLERS[type(module)]
             else:
-                norm_sampler_fn = self.NORM_SAMPLERS[module_type]
+                norm_sampler_fn = self.NORM_SAMPLERS[type(module)]
             
             norm_samples = norm_sampler_fn(module, activations, backprops)
 
@@ -396,8 +366,8 @@ class GradSampleModuleFastGradientClippingFSDPFuse(GradSampleModuleFastGradientC
                 })
         else:
             # Use grad sampler for layers without norm sampler
-            if not self.force_functorch and module_type in self.GRAD_SAMPLERS:
-                grad_sampler_fn = self.GRAD_SAMPLERS[module_type]
+            if not self.force_functorch and type(module) in self.GRAD_SAMPLERS:
+                grad_sampler_fn = self.GRAD_SAMPLERS[type(module)]
             else:
                 grad_sampler_fn = ft_compute_per_sample_gradient
 
@@ -426,43 +396,7 @@ class GradSampleModuleFastGradientClippingFSDPFuse(GradSampleModuleFastGradientC
                 "populate_clipped_gradients() requires enable_fastdp_bookkeeping=True"
             )
         
-        # Use implicit_replication for FSDP DTensor compatibility
-        with implicit_replication():
-            self._populate_gradients_impl(clipping_coef)
-    
-    def _populate_gradients_impl(self, clipping_coef: torch.Tensor):
-        """
-        Internal implementation of gradient population.
-        
-        Handles both fused Linear layers and hooked layers.
-        """
-        # --- Part 1: Populate gradients for fused Linear layers ---
-        # For fused layers, we need to recompute gradients with clipping applied
-        # This is done by running forward again with clipped inputs (conceptually)
-        # But actually we just scale the aggregated gradients
-        
-        # The fused backward already computed unclipped gradients.
-        # We need to scale them by the clipping coefficients.
-        # Since Linear grad = sum_i(outer(g_i, x_i)), and we want sum_i(c_i * outer(g_i, x_i))
-        # We can't easily reconstruct this from the aggregated gradient.
-        
-        # Instead, for bookkeeping mode with fused Linear, we need to cache
-        # activations and backprops separately and compute gradients manually.
-        # This is handled by the fused module's backward NOT computing gradients
-        # when in bookkeeping mode, and we compute them here.
-        
-        # For simplicity in this implementation, fused Linear layers in BK mode
-        # need to have their activations/backprops cached separately.
-        # Let's add caching in the forward/backward for fused modules.
-        
-        # Actually, for fused mode with bookkeeping, we need a different approach:
-        # The FusedFlashLinear backward computes norms but we need to also get
-        # the activations and backprops to compute clipped gradients.
-        
-        # For now, handle the hooked layers only. Fused Linear with BK needs
-        # additional implementation.
-        
-        # --- Part 2: Populate gradients for hooked layers ---
+        # --- Part 1: Populate gradients for hooked layers ---
         if self._bk_cache is not None:
             for i in range(len(self._bk_cache)):
                 cache_entry = self._bk_cache[i]
@@ -475,66 +409,24 @@ class GradSampleModuleFastGradientClippingFSDPFuse(GradSampleModuleFastGradientC
                 coef_shape = [-1] + [1] * (backprops.dim() - 1)
                 clipped_backprops = backprops * clipping_coef.view(*coef_shape).to(device=backprops.device, dtype=backprops.dtype)
                 
-                module_type = self._get_module_type(module)
-                
                 # Compute gradients using clipped backprops
-                if module_type == nn.LayerNorm:
-                    if not self.force_functorch and module_type in self.GRAD_SAMPLERS:
-                        grad_sampler_fn = self.GRAD_SAMPLERS[module_type]
-                    else:
-                        grad_sampler_fn = ft_compute_per_sample_gradient
-                    
-                    grad_samples = grad_sampler_fn(module, activations, backprops)
-                    
-                    for param, gs in grad_samples.items():
-                        if param.requires_grad:
-                            coef_shape = [gs.shape[0]] + [1] * (gs.dim() - 1)
-                            clipped_gs = gs * clipping_coef.view(*coef_shape).to(device=gs.device, dtype=gs.dtype)
-                            grad = clipped_gs.sum(dim=0)
-                            
-                            if param.grad is None:
-                                param.grad = grad
-                            else:
-                                param.grad += grad
-                
-                elif module_type == nn.Embedding:
-                    if not self.force_functorch and module_type in self.GRAD_SAMPLERS:
-                        grad_sampler_fn = self.GRAD_SAMPLERS[module_type]
-                    else:
-                        grad_sampler_fn = ft_compute_per_sample_gradient
-                    
-                    grad_samples = grad_sampler_fn(module, activations, backprops)
-                    
-                    for param, gs in grad_samples.items():
-                        if param.requires_grad:
-                            coef_shape = [gs.shape[0]] + [1] * (gs.dim() - 1)
-                            clipped_gs = gs * clipping_coef.view(*coef_shape).to(device=gs.device, dtype=gs.dtype)
-                            grad = clipped_gs.sum(dim=0)
-                            
-                            if param.grad is None:
-                                param.grad = grad
-                            else:
-                                param.grad += grad
-                
+                if not self.force_functorch and type(module) in self.GRAD_SAMPLERS:
+                    grad_sampler_fn = self.GRAD_SAMPLERS[type(module)]
                 else:
-                    # Generic handling for other layer types
-                    if not self.force_functorch and module_type in self.GRAD_SAMPLERS:
-                        grad_sampler_fn = self.GRAD_SAMPLERS[module_type]
-                    else:
-                        grad_sampler_fn = ft_compute_per_sample_gradient
-                    
-                    grad_samples = grad_sampler_fn(module, activations, backprops)
-                    
-                    for param, gs in grad_samples.items():
-                        if param.requires_grad:
-                            coef_shape = [gs.shape[0]] + [1] * (gs.dim() - 1)
-                            clipped_gs = gs * clipping_coef.view(*coef_shape).to(device=gs.device, dtype=gs.dtype)
-                            grad = clipped_gs.sum(dim=0)
-                            
-                            if param.grad is None:
-                                param.grad = grad
-                            else:
-                                param.grad += grad
+                    grad_sampler_fn = ft_compute_per_sample_gradient
+                
+                grad_samples = grad_sampler_fn(module, activations, backprops)
+                
+                for param, gs in grad_samples.items():
+                    if param.requires_grad:
+                        coef_shape = [gs.shape[0]] + [1] * (gs.dim() - 1)
+                        clipped_gs = gs * clipping_coef.view(*coef_shape).to(device=gs.device, dtype=gs.dtype)
+                        grad = clipped_gs.sum(dim=0)
+                        
+                        if param.grad is None:
+                            param.grad = grad
+                        else:
+                            param.grad += grad
                 
                 # Free memory
                 self._bk_cache[i] = None
@@ -542,9 +434,8 @@ class GradSampleModuleFastGradientClippingFSDPFuse(GradSampleModuleFastGradientC
             
             self._bk_cache.clear()
         
-        # --- Part 3: Handle fused Linear layers in BK mode ---
+        # --- Part 2: Handle fused Linear layers in BK mode ---
         # Compute exact per-sample clipped gradients using cached activations/backprops
-        # Uses the mathematical property: sum_i(c_i * g_i^T @ x_i) = (c * g)^T @ x
         # When loss_reduction="mean", grad_out is divided by batch_size, so we need
         # to multiply by batch_size to get correct gradient magnitude
         grad_scale = float(self._current_batch_size) if self.loss_reduction == "mean" else 1.0
