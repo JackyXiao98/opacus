@@ -114,6 +114,8 @@ class DPOptimizerFastGradientClipping(DPOptimizer):
         Stores aggregated gradients into `p.summed_grad```
         """
         for p in self.params:
+            if p.grad is None:
+                continue  # Skip parameters without gradients
             if p.summed_grad is not None:
                 p.summed_grad.add_(p.grad.data)
             else:

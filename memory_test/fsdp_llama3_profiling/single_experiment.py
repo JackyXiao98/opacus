@@ -70,19 +70,17 @@ def create_llm_model(config, device, master_process=True):
 
 
 def create_dit_model(config, device, master_process=True):
-    """Create DiT model"""
-    from memory_test.diffusion_dit_bookkeeping.diffusion_dit_model import DiTModelWithFlashAttention
+    """Create DiT model (same as dp-train.py)"""
+    from memory_test.fsdp_llama3_profiling.dit_models import DiT_models
+    
+    model_name = config.get("model_name", "DiT-XL/2")
+    input_size = config["image_size"] // 8  # Latent space size after VAE
     
     if master_process:
-        print(f"Creating DiT model: hidden_dim={config['hidden_dim']}, num_layers={config['num_layers']}")
+        print(f"Creating DiT model: {model_name}, input_size={input_size}")
     
-    model = DiTModelWithFlashAttention(
-        img_size=config["image_size"],
-        patch_size=config["patch_size"],
-        in_channels=config["in_channels"],
-        hidden_dim=config["hidden_dim"],
-        num_layers=config["num_layers"],
-        num_heads=config["num_heads"],
+    model = DiT_models[model_name](
+        input_size=input_size,
         num_classes=config["num_classes"],
     )
     
@@ -112,18 +110,22 @@ def generate_llm_batch(config, device):
 
 
 def generate_dit_batch(config, device):
-    """Generate synthetic batch for DiT"""
+    """Generate synthetic batch for DiT (in latent space, same as dp-train.py)"""
     batch_size = config["batch_size"]
     in_channels = config["in_channels"]
     image_size = config["image_size"]
     num_classes = config["num_classes"]
     
-    images = torch.randn(batch_size, in_channels, image_size, image_size, device=device)
+    # DiT operates in latent space: latent_size = image_size // 8
+    latent_size = image_size // 8
+    
+    # Generate latent representations (as if from VAE encoder)
+    latents = torch.randn(batch_size, in_channels, latent_size, latent_size, device=device)
     timesteps = torch.randint(0, 1000, (batch_size,), device=device)
     labels = torch.randint(0, num_classes, (batch_size,), device=device)
-    target_noise = torch.randn_like(images)
+    target_noise = torch.randn_like(latents)
     
-    return {"images": images, "timesteps": timesteps, "labels": labels, "target_noise": target_noise}
+    return {"images": latents, "timesteps": timesteps, "labels": labels, "target_noise": target_noise}
 
 
 def generate_batch(model_type, config, device):
@@ -174,7 +176,14 @@ def run_experiment_worker(
     master_process = rank == 0
     torch.manual_seed(1337 + rank)
     
-    seq_length = config.get("seq_length", config.get("image_size", 0) // config.get("patch_size", 1) ** 2)
+    # For DiT: seq_length = (latent_size / patch_size)^2, where patch_size is from model name (e.g., DiT-XL/2 -> 2)
+    if model_type == "dit":
+        model_name = config.get("model_name", "DiT-XL/2")
+        patch_size = int(model_name.split("/")[-1])  # Extract patch size from model name
+        latent_size = config.get("image_size", 256) // 8
+        seq_length = (latent_size // patch_size) ** 2
+    else:
+        seq_length = config.get("seq_length", 0)
     batch_size = config["batch_size"]
     
     if master_process:
@@ -302,15 +311,16 @@ def run_experiment_worker(
                     labels=batch["labels"]
                 )
                 loss = outputs.loss
-        else:  # dit
+        else:  # dit (same interface as dp-train.py)
+            # DiT forward: (x, t, y) -> predicted_noise
+            predicted_noise = model(batch["images"], batch["timesteps"], batch["labels"])
+            # DiT outputs 2x channels if learn_sigma=True, take first half for loss
+            if predicted_noise.shape[1] > config["in_channels"]:
+                predicted_noise = predicted_noise[:, :config["in_channels"], :, :]
             if is_dp_mode:
-                predicted_noise = model(batch["images"], batch["timesteps"], batch["labels"], target_noise=None)
-                if predicted_noise.shape[1] > config["in_channels"]:
-                    predicted_noise = predicted_noise[:, :config["in_channels"], :, :]
                 loss = criterion(predicted_noise, batch["target_noise"])
             else:
-                outputs = model(batch["images"], batch["timesteps"], batch["labels"], target_noise=batch["target_noise"])
-                loss = outputs["loss"]
+                loss = torch.nn.functional.mse_loss(predicted_noise, batch["target_noise"])
         
         loss.backward()
         optimizer.step()
@@ -445,7 +455,10 @@ def run_experiment(model_type, config):
     if model_type == "llm":
         seq_length = config["seq_length"]
     else:  # dit
-        seq_length = (config["image_size"] // config["patch_size"]) ** 2
+        model_name = config.get("model_name", "DiT-XL/2")
+        patch_size = int(model_name.split("/")[-1])  # Extract patch size from model name
+        latent_size = config["image_size"] // 8
+        seq_length = (latent_size // patch_size) ** 2
     
     print(f"\n{'#'*80}")
     print(f"Configuration:")
@@ -455,11 +468,10 @@ def run_experiment(model_type, config):
         print(f"  Model: {config['model_name']}")
         print(f"  Sequence Length: {seq_length}")
     else:
-        print(f"  Image Size: {config['image_size']}")
-        print(f"  Patch Size: {config['patch_size']}")
+        print(f"  DiT Model: {config['model_name']}")
+        print(f"  Image Size: {config['image_size']} (latent: {latent_size})")
+        print(f"  Patch Size: {patch_size}")
         print(f"  Num Tokens: {seq_length}")
-        print(f"  Hidden Dim: {config['hidden_dim']}")
-        print(f"  Num Layers: {config['num_layers']}")
     print(f"  Batch Size (per GPU): {config['batch_size']}")
     print(f"  Number of GPUs: {world_size}")
     print(f"  Total Batch Size: {config['batch_size'] * world_size}")
@@ -556,19 +568,17 @@ def main():
     parser.add_argument("--seq-length", type=int, default=1024,
                        help="Sequence length (for LLM)")
     
-    # DiT-specific arguments
+    # DiT-specific arguments (uses same model as dp-train.py)
+    parser.add_argument("--dit-model-name", type=str, default="DiT-XL/2",
+                       choices=['DiT-XL/2', 'DiT-XL/4', 'DiT-XL/8',
+                                'DiT-L/2', 'DiT-L/4', 'DiT-L/8',
+                                'DiT-B/2', 'DiT-B/4', 'DiT-B/8',
+                                'DiT-S/2', 'DiT-S/4', 'DiT-S/8'],
+                       help="DiT model variant (for DiT)")
     parser.add_argument("--image-size", type=int, default=256,
-                       help="Image size (for DiT)")
-    parser.add_argument("--patch-size", type=int, default=8,
-                       help="Patch size (for DiT)")
+                       help="Image size (for DiT, latent_size = image_size // 8)")
     parser.add_argument("--in-channels", type=int, default=4,
-                       help="Input channels (for DiT)")
-    parser.add_argument("--hidden-dim", type=int, default=1152,
-                       help="Hidden dimension (for DiT)")
-    parser.add_argument("--num-layers", type=int, default=28,
-                       help="Number of layers (for DiT)")
-    parser.add_argument("--num-heads", type=int, default=16,
-                       help="Number of attention heads (for DiT)")
+                       help="Input channels (for DiT, 4 for VAE latent)")
     parser.add_argument("--num-classes", type=int, default=1000,
                        help="Number of classes (for DiT)")
     
@@ -592,14 +602,11 @@ def main():
             "vocab_size": args.vocab_size,
             "seq_length": args.seq_length,
         })
-    else:  # dit
+    else:  # dit (uses same model as dp-train.py)
         config.update({
+            "model_name": args.dit_model_name,
             "image_size": args.image_size,
-            "patch_size": args.patch_size,
             "in_channels": args.in_channels,
-            "hidden_dim": args.hidden_dim,
-            "num_layers": args.num_layers,
-            "num_heads": args.num_heads,
             "num_classes": args.num_classes,
         })
     

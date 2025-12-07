@@ -8,17 +8,15 @@ echo "Each experiment runs in a fresh Python process to avoid contamination"
 echo "========================================================================"
 echo ""
 
-# DiT Model Configuration
+# DiT Model Configuration (uses same model as dp-train.py)
+# Available models: DiT-XL/2, DiT-XL/4, DiT-XL/8, DiT-L/2, DiT-L/4, DiT-L/8, DiT-B/2, DiT-B/4, DiT-B/8, DiT-S/2, DiT-S/4, DiT-S/8
+DIT_MODEL_NAME="DiT-XL/2"
 IMAGE_SIZE=256
-PATCH_SIZE=8
-IN_CHANNELS=3
+IN_CHANNELS=4
 NUM_CLASSES=1000
-HIDDEN_DIM=1152
-NUM_LAYERS=28
-NUM_HEADS=16
 
 # Training Configuration
-BATCH_SIZE=1
+BATCH_SIZE=2
 NUM_ITER=3
 WARMUP_ITER=1
 LEARNING_RATE=1e-4
@@ -26,13 +24,17 @@ SIGMA=1.0
 MAX_GRAD_NORM=1.0
 
 # Compute number of tokens (sequence length for DiT)
-NUM_TOKENS=$(( (IMAGE_SIZE / PATCH_SIZE) * (IMAGE_SIZE / PATCH_SIZE) ))
+# Extract patch size from model name (e.g., DiT-XL/2 -> 2)
+PATCH_SIZE=$(echo "$DIT_MODEL_NAME" | grep -oE '[0-9]+$')
+LATENT_SIZE=$((IMAGE_SIZE / 8))
+NUM_TOKENS=$(( (LATENT_SIZE / PATCH_SIZE) * (LATENT_SIZE / PATCH_SIZE) ))
 
 # Modes to test
 # Available FSDP modes: no_dp, ghost_fsdp, flash_fsdp, flash_fsdp_bk, ghost_fsdp_bk, flash_fsdp_fuse, flash_fsdp_fuse_bk
 # Available Single-GPU modes: no_dp_single, ghost, flash, flash_bk, ghost_bk, flash_fuse, flash_fuse_bk
-MODES=("no_dp" "ghost_fsdp" "flash_fsdp" "flash_fsdp_bk" "flash_fsdp_fuse")
-
+# MODES=("flash_fuse_bk" "no_dp_single" "flash_bk")
+# "no_dp_single" "ghost" "flash" "flash_bk" "ghost_bk" "flash_fuse" 
+MODES=("flash_fsdp_fuse_bk" "no_dp" "flash_fsdp_fuse" "flash_fsdp_bk" "flash_fsdp_bk")
 # Output directory
 OUTPUT_DIR="results_dit"
 mkdir -p "$OUTPUT_DIR"
@@ -43,12 +45,10 @@ RUN_DIR="$OUTPUT_DIR/run_$TIMESTAMP"
 mkdir -p "$RUN_DIR"
 
 echo "Model Configuration:"
-echo "  - Image Size: ${IMAGE_SIZE}x${IMAGE_SIZE}"
+echo "  - DiT Model: ${DIT_MODEL_NAME}"
+echo "  - Image Size: ${IMAGE_SIZE}x${IMAGE_SIZE} (latent: ${LATENT_SIZE}x${LATENT_SIZE})"
 echo "  - Patch Size: ${PATCH_SIZE}x${PATCH_SIZE}"
 echo "  - Number of Tokens: ${NUM_TOKENS}"
-echo "  - Hidden Dim: ${HIDDEN_DIM}"
-echo "  - Number of Layers: ${NUM_LAYERS}"
-echo "  - Number of Heads: ${NUM_HEADS}"
 echo "  - Batch Size: ${BATCH_SIZE}"
 echo ""
 echo "Output directory: $RUN_DIR"
@@ -70,7 +70,7 @@ run_experiment() {
         source .venv/bin/activate
     fi
     
-    # Run experiment in isolated process
+    # Run experiment in isolated process (uses same model as dp-train.py)
     python single_experiment.py \
         --model-type dit \
         --mode "$mode" \
@@ -78,12 +78,9 @@ run_experiment() {
         --num-iter $NUM_ITER \
         --warmup-iter $WARMUP_ITER \
         --output "$output_file" \
+        --dit-model-name "$DIT_MODEL_NAME" \
         --image-size $IMAGE_SIZE \
-        --patch-size $PATCH_SIZE \
         --in-channels $IN_CHANNELS \
-        --hidden-dim $HIDDEN_DIM \
-        --num-layers $NUM_LAYERS \
-        --num-heads $NUM_HEADS \
         --num-classes $NUM_CLASSES \
         --learning-rate $LEARNING_RATE \
         --sigma $SIGMA \
