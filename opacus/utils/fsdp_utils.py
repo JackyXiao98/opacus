@@ -66,6 +66,7 @@ def is_transformer_block(module: nn.Module) -> bool:
         'BloomBlock',
         'OPTDecoderLayer',
         'FalconDecoderLayer',
+        'DiTBlock',  # Diffusion Transformer block
     ]
     return module_name in transformer_block_names
 
@@ -129,6 +130,7 @@ def FSDP2Wrapper(model: nn.Module, **kwargs) -> nn.Module:
     opacus_high_precision_layers = kwargs.get("opacus_high_precision_layers", [])
     reshard_after_forward = kwargs.get("reshard_after_forward", True)
     use_block_wrapping = kwargs.get("use_block_wrapping", True)  # Enable by default
+    wrap_individual_layers = kwargs.get("wrap_individual_layers", True)  # Enable by default
     
     wrapped_blocks = set()
     
@@ -186,32 +188,33 @@ def FSDP2Wrapper(model: nn.Module, **kwargs) -> nn.Module:
     # PASS 2: Wrap remaining individual layers (only those not inside wrapped blocks)
     # This handles leaf layers outside of Transformer blocks (e.g., embedding, final layer)
     layer_count = 0
-    for module in iterate_submodules(model):
-        # Skip if module is a wrapped block or is inside a wrapped block
-        if module in wrapped_blocks or _is_inside_wrapped_block(module, wrapped_blocks):
-            continue
-            
-        if (type(module) in sampler_classes) or (not has_trainable_params(module)):
-            if len(opacus_high_precision_layers) > 0 and isinstance(
-                module, opacus_high_precision_layers
-            ):
-                # For certain layers, higher precision is needed to stabilize the training of DP-SGD.
-                fully_shard(
-                    module,
-                    mesh=mesh,
-                    mp_policy=MixedPrecisionPolicy(
-                        param_dtype=torch.get_default_dtype()
-                    ),
-                    reshard_after_forward=reshard_after_forward,
-                )
-            else:
-                fully_shard(
-                    module, 
-                    mesh=mesh, 
-                    mp_policy=mp_policy,
-                    reshard_after_forward=reshard_after_forward,
-                )
-            layer_count += 1
+    if wrap_individual_layers:
+        for module in iterate_submodules(model):
+            # Skip if module is a wrapped block or is inside a wrapped block
+            if module in wrapped_blocks or _is_inside_wrapped_block(module, wrapped_blocks):
+                continue
+                
+            if (type(module) in sampler_classes) or (not has_trainable_params(module)):
+                if len(opacus_high_precision_layers) > 0 and isinstance(
+                    module, opacus_high_precision_layers
+                ):
+                    # For certain layers, higher precision is needed to stabilize the training of DP-SGD.
+                    fully_shard(
+                        module,
+                        mesh=mesh,
+                        mp_policy=MixedPrecisionPolicy(
+                            param_dtype=torch.get_default_dtype()
+                        ),
+                        reshard_after_forward=reshard_after_forward,
+                    )
+                else:
+                    fully_shard(
+                        module, 
+                        mesh=mesh, 
+                        mp_policy=mp_policy,
+                        reshard_after_forward=reshard_after_forward,
+                    )
+                layer_count += 1
     
     # Log wrapping statistics
     import os

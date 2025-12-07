@@ -10,7 +10,7 @@ echo ""
 
 # DiT Model Configuration (uses same model as dp-train.py)
 # Available models: DiT-XL/2, DiT-XL/4, DiT-XL/8, DiT-L/2, DiT-L/4, DiT-L/8, DiT-B/2, DiT-B/4, DiT-B/8, DiT-S/2, DiT-S/4, DiT-S/8
-DIT_MODEL_NAME="DiT-XL/2"
+DIT_MODEL_NAME="DiT-S/2"
 IMAGE_SIZE=256
 IN_CHANNELS=4
 NUM_CLASSES=1000
@@ -34,7 +34,8 @@ NUM_TOKENS=$(( (LATENT_SIZE / PATCH_SIZE) * (LATENT_SIZE / PATCH_SIZE) ))
 # Available Single-GPU modes: no_dp_single, ghost, flash, flash_bk, ghost_bk, flash_fuse, flash_fuse_bk
 # MODES=("flash_fuse_bk" "no_dp_single" "flash_bk")
 # "no_dp_single" "ghost" "flash" "flash_bk" "ghost_bk" "flash_fuse" 
-MODES=("flash_fsdp_fuse_bk" "no_dp" "flash_fsdp_fuse" "flash_fsdp_bk" "flash_fsdp_bk")
+MODES=("flash_fsdp_fuse_bk" "no_dp" "flash_fsdp_fuse" "flash_fsdp_bk")
+# MODES=("flash_fuse_bk" "no_dp_single" "flash_fuse" "flash_bk")
 # Output directory
 OUTPUT_DIR="results_dit"
 mkdir -p "$OUTPUT_DIR"

@@ -172,6 +172,8 @@ def run_experiment_worker(
     # Only setup distributed for FSDP modes
     if is_fsdp_mode:
         setup(rank, world_size)
+        # Synchronize all processes before proceeding
+        dist.barrier()
     
     master_process = rank == 0
     torch.manual_seed(1337 + rank)
@@ -214,7 +216,12 @@ def run_experiment_worker(
             param_dtype=torch.bfloat16, 
             reduce_dtype=torch.float32
         )
-        model = FSDP2Wrapper(model, mp_policy=mp_policy)
+        # Create DeviceMesh with named dimensions (required by FSDP2)
+        from torch.distributed.device_mesh import init_device_mesh
+        mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp",))
+        # Disable block and individual layer wrapping to avoid mesh dimension conflicts in FSDP2
+        # Only wrap the root model for simplest FSDP setup
+        model = FSDP2Wrapper(model, mp_policy=mp_policy, mesh=mesh, use_block_wrapping=False, wrap_individual_layers=False)
     else:
         if master_process:
             print("Using single-GPU mode (no FSDP)")
@@ -373,15 +380,16 @@ def run_experiment_worker(
                     labels=batch["labels"]
                 )
                 loss = outputs.loss
-        else:  # dit
+        else:  # dit (same interface as dp-train.py)
+            # DiT forward: (x, t, y) -> predicted_noise
+            predicted_noise = model(batch["images"], batch["timesteps"], batch["labels"])
+            # DiT outputs 2x channels if learn_sigma=True, take first half for loss
+            if predicted_noise.shape[1] > config["in_channels"]:
+                predicted_noise = predicted_noise[:, :config["in_channels"], :, :]
             if is_dp_mode:
-                predicted_noise = model(batch["images"], batch["timesteps"], batch["labels"], target_noise=None)
-                if predicted_noise.shape[1] > config["in_channels"]:
-                    predicted_noise = predicted_noise[:, :config["in_channels"], :, :]
                 loss = criterion(predicted_noise, batch["target_noise"])
             else:
-                outputs = model(batch["images"], batch["timesteps"], batch["labels"], target_noise=batch["target_noise"])
-                loss = outputs["loss"]
+                loss = torch.nn.functional.mse_loss(predicted_noise, batch["target_noise"])
         
         loss.backward()
         optimizer.step()
