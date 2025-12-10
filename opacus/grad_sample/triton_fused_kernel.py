@@ -300,8 +300,10 @@ if TRITON_AVAILABLE:
             # --- TMA Block Pointers for current batch ---
             # X: [B, T, Din] -> slice [T, Din] for batch b
             # Block shape: [BLOCK_K, BLOCK_M] (T, Din)
+            # Fix: Use 64-bit offset to avoid 32-bit integer overflow for large strides
+            # Use 64-bit multiplication to avoid overflow when b*stride_x_b exceeds 2^31
             x_block_ptr = tl.make_block_ptr(
-                base=X_ptr + b * stride_x_b,
+                base=X_ptr + tl.cast(b, tl.int64) * tl.cast(stride_x_b, tl.int64),
                 shape=(T, Din),
                 strides=(stride_x_t, stride_x_d),
                 offsets=(0, pid_m * BLOCK_M),
@@ -311,8 +313,10 @@ if TRITON_AVAILABLE:
             
             # G: [B, T, Dout] -> slice [T, Dout] for batch b
             # Block shape: [BLOCK_K, BLOCK_N] (T, Dout)
+            # Fix: Use 64-bit offset to avoid 32-bit integer overflow for large strides
+            # Use 64-bit multiplication to avoid overflow when b*stride_g_b exceeds 2^31
             g_block_ptr = tl.make_block_ptr(
-                base=G_ptr + b * stride_g_b,
+                base=G_ptr + tl.cast(b, tl.int64) * tl.cast(stride_g_b, tl.int64),
                 shape=(T, Dout),
                 strides=(stride_g_t, stride_g_d),
                 offsets=(0, pid_n * BLOCK_N),
@@ -355,7 +359,9 @@ if TRITON_AVAILABLE:
             norm_tile = tl.sum(valid_acc_b_sq)
             
             # Atomic add to Norms[b] buffer
-            norm_ptr = Norms_ptr + b * stride_norms_b
+            # Fix: Use 64-bit offset to avoid 32-bit integer overflow for large strides
+            # Use 64-bit multiplication to avoid overflow when b*stride_norms_b exceeds 2^31
+            norm_ptr = Norms_ptr + tl.cast(b, tl.int64) * tl.cast(stride_norms_b, tl.int64)
             tl.atomic_add(norm_ptr, norm_tile)
         
         # Store global gradient
@@ -473,8 +479,10 @@ if TRITON_AVAILABLE:
             acc_partial = tl.zeros((BLOCK_N, BLOCK_M), dtype=tl.float32)
             
             # --- TMA Block Pointers for current batch (T slice) ---
+            # Fix: Use int64 to avoid 32-bit integer overflow for large strides
+            # Use 64-bit multiplication to avoid overflow when b*stride_x_b exceeds 2^31
             x_block_ptr = tl.make_block_ptr(
-                base=X_ptr + b * stride_x_b,
+                base=X_ptr + tl.cast(b, tl.int64) * tl.cast(stride_x_b, tl.int64),
                 shape=(T, Din),
                 strides=(stride_x_t, stride_x_d),
                 offsets=(t_start, pid_m * BLOCK_M),
@@ -482,8 +490,9 @@ if TRITON_AVAILABLE:
                 order=(1, 0)
             )
             
+            # Use 64-bit multiplication to avoid overflow when b*stride_g_b exceeds 2^31
             g_block_ptr = tl.make_block_ptr(
-                base=G_ptr + b * stride_g_b,
+                base=G_ptr + tl.cast(b, tl.int64) * tl.cast(stride_g_b, tl.int64),
                 shape=(T, Dout),
                 strides=(stride_g_t, stride_g_d),
                 offsets=(t_start, pid_n * BLOCK_N),
@@ -555,7 +564,9 @@ if TRITON_AVAILABLE:
                 norm_tile = tl.sum(valid_acc_b_sq)
                 
                 # Atomic add to Norms[b] buffer
-                norm_ptr = Norms_ptr + b * stride_norms_b
+                # Fix: Use 64-bit offset to avoid 32-bit integer overflow for large strides
+                # Use 64-bit multiplication to avoid overflow when b*stride_norms_b exceeds 2^31
+                norm_ptr = Norms_ptr + tl.cast(b, tl.int64) * tl.cast(stride_norms_b, tl.int64)
                 tl.atomic_add(norm_ptr, norm_tile)
                 
                 # Reset barrier for next batch iteration

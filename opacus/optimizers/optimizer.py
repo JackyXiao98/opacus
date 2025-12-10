@@ -480,6 +480,8 @@ class DPOptimizer(Optimizer):
         """
 
         for p in self.params:
+            if p.summed_grad is None:
+                continue  # Skip parameters without accumulated gradients
             _check_processed_flag(p.summed_grad)
 
             noise = _generate_noise(
@@ -501,6 +503,8 @@ class DPOptimizer(Optimizer):
         """
         if self.loss_reduction == "mean":
             for p in self.params:
+                if p.grad is None:
+                    continue  # Skip parameters without gradients
                 p.grad /= self.expected_batch_size * self.accumulated_iterations
 
     def zero_grad(self, set_to_none: bool = False):

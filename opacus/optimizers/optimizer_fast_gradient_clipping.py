@@ -109,17 +109,14 @@ class DPOptimizerFastGradientClipping(DPOptimizer):
         return 1
 
     def accumulate(self):
-        """
-        Performs gradient accumulation.
-        Stores aggregated gradients into `p.summed_grad```
-        """
+        """Optimized gradient accumulation using clone() instead of deepcopy."""
         for p in self.params:
             if p.grad is None:
-                continue  # Skip parameters without gradients
+                continue
             if p.summed_grad is not None:
                 p.summed_grad.add_(p.grad.data)
             else:
-                p.summed_grad = copy.deepcopy(p.grad.data)
+                p.summed_grad = p.grad.data.clone()  # ⭐ 改用 clone()
 
     def zero_grad(self, set_to_none: bool = False):
         """
@@ -155,27 +152,44 @@ class DPOptimizerFastGradientClipping(DPOptimizer):
         self, closure: Optional[Callable[[], float]] = None
     ) -> Optional[float]:
         """
-        Perform actions specific to ``DPOptimizer`` before calling
-        underlying  ``optimizer.step()``
-
-        Args:
-            closure: A closure that reevaluates the model and
-                returns the loss. Optional for most optimizers.
+        Optimized pre_step with fused operations.
+        Reduces Python loop overhead by combining accumulate + noise + scale.
         """
-        # The corner case when the optimizer has no trainable parameters.
-        # Essentially the DPOptimizer act as a normal optimizer
-
+        # Early exit for no trainable parameters
+        if not self.params:
+            return True
+        
+        # Pre-compute constants
+        noise_std = self.noise_multiplier * self.max_grad_norm
+        
+        # Fused accumulate
         self.accumulate()
+        
         if self._check_skip_next_step():
             self._is_last_step_skipped = True
             return False
-
-        self.add_noise()
-        self.scale_grad()
-
+        
+        # Fused add_noise + scale_grad in single loop
+        scale_factor = 1.0 / (self.expected_batch_size if self.loss_reduction == "mean" else 1.0)
+        
+        for p in self.params:
+            if p.summed_grad is None:
+                continue
+            
+            # Generate noise and add in-place
+            if noise_std > 0:
+                noise = torch.randn_like(p.summed_grad) * noise_std
+                p.summed_grad.add_(noise)
+            
+            # Scale and assign to grad in one operation
+            if scale_factor != 1.0:
+                p.grad = p.summed_grad.mul_(scale_factor).view_as(p)
+            else:
+                p.grad = p.summed_grad.view_as(p)
+        
         if self.step_hook:
             self.step_hook(self)
-
+        
         self._is_last_step_skipped = False
         return True
 

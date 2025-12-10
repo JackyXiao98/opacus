@@ -435,122 +435,77 @@ class GradSampleModuleFastGradientClippingFSDPFuse(GradSampleModuleFastGradientC
         Internal implementation of gradient population.
         
         Handles both fused Linear layers and hooked layers.
+        
+        Optimizations:
+        - Uses clipped_backprops directly (avoids double clipping)
+        - Pre-computes coef_with_scale for fused modules
+        - Uses in-place add_() operations
+        - Unified handling for all layer types (no code duplication)
         """
-        # --- Part 1: Populate gradients for fused Linear layers ---
-        # For fused layers, we need to recompute gradients with clipping applied
-        # This is done by running forward again with clipped inputs (conceptually)
-        # But actually we just scale the aggregated gradients
-        
-        # The fused backward already computed unclipped gradients.
-        # We need to scale them by the clipping coefficients.
-        # Since Linear grad = sum_i(outer(g_i, x_i)), and we want sum_i(c_i * outer(g_i, x_i))
-        # We can't easily reconstruct this from the aggregated gradient.
-        
-        # Instead, for bookkeeping mode with fused Linear, we need to cache
-        # activations and backprops separately and compute gradients manually.
-        # This is handled by the fused module's backward NOT computing gradients
-        # when in bookkeeping mode, and we compute them here.
-        
-        # For simplicity in this implementation, fused Linear layers in BK mode
-        # need to have their activations/backprops cached separately.
-        # Let's add caching in the forward/backward for fused modules.
-        
-        # Actually, for fused mode with bookkeeping, we need a different approach:
-        # The FusedFlashLinear backward computes norms but we need to also get
-        # the activations and backprops to compute clipped gradients.
-        
-        # For now, handle the hooked layers only. Fused Linear with BK needs
-        # additional implementation.
-        
-        # --- Part 2: Populate gradients for hooked layers ---
-        if self._bk_cache is not None:
-            for i in range(len(self._bk_cache)):
-                cache_entry = self._bk_cache[i]
+        # --- Part 1: Populate gradients for hooked layers ---
+        if self._bk_cache is not None and len(self._bk_cache) > 0:
+            for cache_entry in self._bk_cache:
                 module = cache_entry['module']
                 activations = cache_entry['activations']
                 backprops = cache_entry['backprops']
                 
-                # Apply per-sample clipping coefficients to backprops
+                # Apply per-sample clipping coefficients to backprops ONCE
                 # Support arbitrary dimensions: 2D [B, d], 3D [B, T, d], 4D [B, C, H, W], etc.
                 coef_shape = [-1] + [1] * (backprops.dim() - 1)
-                clipped_backprops = backprops * clipping_coef.view(*coef_shape).to(device=backprops.device, dtype=backprops.dtype)
+                coef_on_device = clipping_coef.view(*coef_shape).to(
+                    device=backprops.device, dtype=backprops.dtype
+                )
+                clipped_backprops = backprops * coef_on_device
                 
                 module_type = self._get_module_type(module)
                 
-                # Compute gradients using clipped backprops
-                if module_type == nn.LayerNorm:
-                    if not self.force_functorch and module_type in self.GRAD_SAMPLERS:
-                        grad_sampler_fn = self.GRAD_SAMPLERS[module_type]
-                    else:
-                        grad_sampler_fn = ft_compute_per_sample_gradient
-                    
-                    grad_samples = grad_sampler_fn(module, activations, backprops)
-                    
-                    for param, gs in grad_samples.items():
-                        if param.requires_grad:
-                            coef_shape = [gs.shape[0]] + [1] * (gs.dim() - 1)
-                            clipped_gs = gs * clipping_coef.view(*coef_shape).to(device=gs.device, dtype=gs.dtype)
-                            grad = clipped_gs.sum(dim=0)
-                            
-                            if param.grad is None:
-                                param.grad = grad
-                            else:
-                                param.grad += grad
-                
-                elif module_type == nn.Embedding:
-                    if not self.force_functorch and module_type in self.GRAD_SAMPLERS:
-                        grad_sampler_fn = self.GRAD_SAMPLERS[module_type]
-                    else:
-                        grad_sampler_fn = ft_compute_per_sample_gradient
-                    
-                    grad_samples = grad_sampler_fn(module, activations, backprops)
-                    
-                    for param, gs in grad_samples.items():
-                        if param.requires_grad:
-                            coef_shape = [gs.shape[0]] + [1] * (gs.dim() - 1)
-                            clipped_gs = gs * clipping_coef.view(*coef_shape).to(device=gs.device, dtype=gs.dtype)
-                            grad = clipped_gs.sum(dim=0)
-                            
-                            if param.grad is None:
-                                param.grad = grad
-                            else:
-                                param.grad += grad
-                
+                # Compute gradients using CLIPPED backprops (fix: was using original backprops)
+                if not self.force_functorch and module_type in self.GRAD_SAMPLERS:
+                    grad_sampler_fn = self.GRAD_SAMPLERS[module_type]
                 else:
-                    # Generic handling for other layer types
-                    if not self.force_functorch and module_type in self.GRAD_SAMPLERS:
-                        grad_sampler_fn = self.GRAD_SAMPLERS[module_type]
-                    else:
-                        grad_sampler_fn = ft_compute_per_sample_gradient
-                    
-                    grad_samples = grad_sampler_fn(module, activations, backprops)
-                    
-                    for param, gs in grad_samples.items():
-                        if param.requires_grad:
-                            coef_shape = [gs.shape[0]] + [1] * (gs.dim() - 1)
-                            clipped_gs = gs * clipping_coef.view(*coef_shape).to(device=gs.device, dtype=gs.dtype)
-                            grad = clipped_gs.sum(dim=0)
-                            
-                            if param.grad is None:
-                                param.grad = grad
-                            else:
-                                param.grad += grad
+                    grad_sampler_fn = ft_compute_per_sample_gradient
                 
-                # Free memory
-                self._bk_cache[i] = None
-                del cache_entry, module, activations, backprops
+                # Use clipped_backprops - gradients are already scaled by clipping_coef
+                grad_samples = grad_sampler_fn(module, activations, clipped_backprops)
+                
+                # Sum over batch dimension - no need to clip again since backprops were clipped
+                for param, gs in grad_samples.items():
+                    if param.requires_grad:
+                        grad = gs.sum(dim=0)
+                        
+                        if param.grad is None:
+                            param.grad = grad
+                        else:
+                            param.grad.add_(grad)  # in-place add
+                
+                # Free memory immediately
+                del cache_entry, module, activations, backprops, clipped_backprops
             
             self._bk_cache.clear()
         
-        # --- Part 3: Handle fused Linear layers in BK mode ---
-        # Compute exact per-sample clipped gradients using cached activations/backprops
-        # Uses the mathematical property: sum_i(c_i * g_i^T @ x_i) = (c * g)^T @ x
+        # --- Part 2: Handle fused Linear layers in BK mode ---
+        # Pre-compute coef_with_scale to avoid repeated computation in each module
         # When loss_reduction="mean", grad_out is divided by batch_size, so we need
         # to multiply by batch_size to get correct gradient magnitude
         grad_scale = float(self._current_batch_size) if self.loss_reduction == "mean" else 1.0
-        for module in self._fused_linear_modules:
-            if module._bk_cache is not None:
-                module.compute_clipped_gradient(clipping_coef, grad_scale=grad_scale)
+        
+        # Collect modules with cache first to avoid repeated checks
+        modules_with_cache = [m for m in self._fused_linear_modules if m._bk_cache is not None]
+        
+        if modules_with_cache:
+            # Pre-multiply clipping_coef with grad_scale once
+            if grad_scale != 1.0:
+                coef_with_scale = clipping_coef * grad_scale
+            else:
+                coef_with_scale = clipping_coef
+            
+            # Process each module and immediately clear its cache to minimize peak memory
+            # This ensures that only one layer's cache exists at a time during gradient computation
+            for module in modules_with_cache:
+                # Pass pre-scaled coef, grad_scale=1.0 since already scaled
+                module.compute_clipped_gradient(coef_with_scale, grad_scale=1.0)
+                # Immediately clear cache after computing gradients to free memory
+                # This is critical for models with many layers to avoid O(num_layers × B × T × D) memory
                 module.clear_bk_cache()
 
     def disable_hooks(self):

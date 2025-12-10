@@ -270,6 +270,17 @@ def run_experiment_worker(
     # Determine if this is a fuse mode (needs special handling)
     is_fuse_mode = mode in ["flash_fsdp_fuse", "flash_fsdp_fuse_bk", "flash_fuse", "flash_fuse_bk"]
     
+    # Determine if we need to pass shape parameter to criterion
+    # All DP modes (except hooks/grad_materialize) wrap criterion with DPLossFastGradientClipping
+    # which needs shape=(B, T, V) to reduce per-token losses [B*T] to per-sample [B]
+    # Note: For transformers, even fuse modes need shape param because CrossEntropyLoss
+    # requires flattened input (unlike MSELoss which can handle 3D directly)
+    needs_shape_param = mode in [
+        "ghost", "ghost_bk", "ghost_fsdp", "ghost_fsdp_bk",
+        "flash", "flash_bk", "flash_fsdp", "flash_fsdp_bk",
+        "flash_fuse", "flash_fuse_bk", "flash_fsdp_fuse", "flash_fsdp_fuse_bk"
+    ]
+    
     # For fuse modes: Replace Linear with FusedFlashLinear BEFORE FSDP wrapping
     if is_fuse_mode:
         if master_process:
@@ -331,16 +342,31 @@ def run_experiment_worker(
                 shuffle=False,
             )
         
-        model, optimizer, criterion, _ = privacy_engine.make_private(
-            module=model,
-            optimizer=optimizer,
-            data_loader=dummy_dataloader,
-            noise_multiplier=sigma,
-            max_grad_norm=max_grad_norm,
-            grad_sample_mode=mode,
-            criterion=criterion,
-            poisson_sampling=False,
-        )
+        # Map grad_materialize to "hooks" mode (standard Opacus)
+        grad_sample_mode = "hooks" if mode == "grad_materialize" else mode
+        
+        # For hooks mode, don't pass criterion (it doesn't need wrapping)
+        if grad_sample_mode == "hooks":
+            model, optimizer, *_ = privacy_engine.make_private(
+                module=model,
+                optimizer=optimizer,
+                data_loader=dummy_dataloader,
+                noise_multiplier=sigma,
+                max_grad_norm=max_grad_norm,
+                grad_sample_mode=grad_sample_mode,
+                poisson_sampling=False,
+            )
+        else:
+            model, optimizer, criterion, *_ = privacy_engine.make_private(
+                module=model,
+                optimizer=optimizer,
+                data_loader=dummy_dataloader,
+                noise_multiplier=sigma,
+                max_grad_norm=max_grad_norm,
+                grad_sample_mode=grad_sample_mode,
+                criterion=criterion,
+                poisson_sampling=False,
+            )
         
         if master_process:
             print("DP-SGD setup complete")
@@ -358,9 +384,16 @@ def run_experiment_worker(
         optimizer.zero_grad()
         
         logits = model(input_ids=batch["input_ids"])
-        # Reshape for cross-entropy: [B*T, V] vs [B*T]
         B, T, V = logits.shape
-        loss = criterion(logits.view(-1, V), batch["labels"].view(-1))
+        
+        if needs_shape_param:
+            # Ghost/flash/fuse modes: pass shape=(B, T, V) so DPLossFastGradientClipping
+            # can reduce per-token losses [B*T] to per-sample losses [B]
+            # Note: CrossEntropyLoss requires flattened input unlike MSELoss
+            loss = criterion(logits.view(-1, V), batch["labels"].view(-1), shape=(B, T, V))
+        else:
+            # Standard modes (no_dp, no_dp_single, grad_materialize)
+            loss = criterion(logits.view(-1, V), batch["labels"].view(-1))
         
         loss.backward()
         optimizer.step()
@@ -399,7 +432,15 @@ def run_experiment_worker(
         
         logits = model(input_ids=batch["input_ids"])
         B, T, V = logits.shape
-        loss = criterion(logits.view(-1, V), batch["labels"].view(-1))
+        
+        if needs_shape_param:
+            # Ghost/flash/fuse modes: pass shape=(B, T, V) so DPLossFastGradientClipping
+            # can reduce per-token losses [B*T] to per-sample losses [B]
+            # Note: CrossEntropyLoss requires flattened input unlike MSELoss
+            loss = criterion(logits.view(-1, V), batch["labels"].view(-1), shape=(B, T, V))
+        else:
+            # Standard modes (no_dp, no_dp_single, grad_materialize)
+            loss = criterion(logits.view(-1, V), batch["labels"].view(-1))
         
         loss.backward()
         optimizer.step()
@@ -552,8 +593,8 @@ def main():
                            "no_dp", "ghost_fsdp", "flash_fsdp", "flash_fsdp_bk", 
                            "ghost_fsdp_bk", "flash_fsdp_fuse", "flash_fsdp_fuse_bk",
                            # Single-GPU modes
-                           "no_dp_single", "ghost", "ghost_bk", "flash", "flash_bk", 
-                           "flash_fuse", "flash_fuse_bk"
+                           "no_dp_single", "grad_materialize", "ghost", "ghost_bk", 
+                           "flash", "flash_bk", "flash_fuse", "flash_fuse_bk"
                        ],
                        help="Training mode")
     

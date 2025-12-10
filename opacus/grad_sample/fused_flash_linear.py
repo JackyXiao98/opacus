@@ -230,13 +230,22 @@ class FusedFlashLinearFn(torch.autograd.Function):
             
             if ctx.has_bias:
                 # Sum over all dims except last
-                grad_b = grad_out.sum(dim=tuple(range(original_dim - 1)))
+                # Use g_c (not g_3d) to ensure contiguous memory access
+                # g_c is guaranteed to be contiguous and was used in the Triton kernel
+                if original_dim == 2:
+                    grad_b = grad_out.sum(dim=0)
+                else:
+                    # For 3D+ inputs, use g_c which is contiguous [B, T, Dout]
+                    # Sum over batch and sequence dimensions: [B, T, Dout] -> [Dout]
+                    grad_b = g_c.sum(dim=(0, 1))
+                
                 # Bias norm: sum over sequence dims first, then compute per-sample norm
                 if original_dim == 2:
                     bias_norm_sq = grad_out.pow(2).sum(dim=1)
                 else:
-                    bias_sums = grad_out.sum(dim=tuple(range(1, original_dim - 1)))
-                    bias_norm_sq = bias_sums.pow(2).sum(dim=1)
+                    # Use g_c for consistency and to avoid memory access issues
+                    bias_sums = g_c.sum(dim=1)  # [B, Dout]
+                    bias_norm_sq = bias_sums.pow(2).sum(dim=1)  # [B]
                 norm_buf.add_(bias_norm_sq)
             else:
                 grad_b = None
@@ -248,7 +257,15 @@ class FusedFlashLinearFn(torch.autograd.Function):
                 x_3d.view(-1, x_3d.shape[-1])
             )
             
-            grad_b = grad_out.sum(dim=tuple(range(original_dim - 1))) if ctx.has_bias else None
+            # Use g_3d for consistency and to avoid memory access issues with 4D+ inputs
+            if ctx.has_bias:
+                if original_dim == 2:
+                    grad_b = grad_out.sum(dim=0)
+                else:
+                    # For 3D+ inputs, use g_3d which is already reshaped to [B, T, Dout]
+                    grad_b = g_3d.sum(dim=(0, 1))
+            else:
+                grad_b = None
             
             # Compute norms if needed
             if compute_norms and norm_buf is not None:
@@ -401,34 +418,40 @@ class FusedFlashLinear(nn.Module):
         original_dim = x.dim()
         
         # Scale grad_out by per-sample clipping coefficients and grad_scale
+        # Use in-place operations to reduce memory allocation
+        # Safe to modify grad_out since cache will be cleared after this computation
         coef_with_scale = clipping_coef * grad_scale
         
         if original_dim == 2:
             # 2D case: [B, Din], [B, Dout]
-            scaled_g = grad_out * coef_with_scale.view(-1, 1).to(device=grad_out.device, dtype=grad_out.dtype)
-            grad_w = scaled_g.t().matmul(x)
-            grad_b = scaled_g.sum(dim=0) if self.bias is not None else None
+            # Use in-place multiplication to avoid creating a new tensor
+            coef_view = coef_with_scale.view(-1, 1).to(device=grad_out.device, dtype=grad_out.dtype)
+            grad_out.mul_(coef_view)
+            grad_w = grad_out.t().matmul(x)
+            grad_b = grad_out.sum(dim=0) if self.bias is not None else None
         else:
             # 3D+ case: reshape to [B, T, D] format
             B = x.shape[0]
             Din = x.shape[-1]
             Dout = grad_out.shape[-1]
             
-            # Reshape to 3D
+            # Reshape to 3D (views don't allocate new memory)
             x_3d = x.view(B, -1, Din)
             g_3d = grad_out.view(B, -1, Dout)
             
-            # Apply per-sample scaling
-            scaled_g = g_3d * coef_with_scale.view(-1, 1, 1).to(device=g_3d.device, dtype=g_3d.dtype)
+            # Apply per-sample scaling using in-place operation
+            coef_view = coef_with_scale.view(-1, 1, 1).to(device=g_3d.device, dtype=g_3d.dtype)
+            g_3d.mul_(coef_view)
             
-            # grad_w = scaled_g^T @ x (flattened)
+            # grad_w = g_3d^T @ x_3d (flattened)
+            # g_3d has been modified in-place with clipping coefficients
             grad_w = torch.matmul(
-                scaled_g.view(-1, Dout).t(),
+                g_3d.view(-1, Dout).t(),
                 x_3d.view(-1, Din)
             )
             
             # grad_b = sum over all dims except last
-            grad_b = scaled_g.sum(dim=(0, 1)) if self.bias is not None else None
+            grad_b = g_3d.sum(dim=(0, 1)) if self.bias is not None else None
         
         # Set gradients on parameters (ensure dtype matches parameter dtype)
         grad_w = grad_w.to(dtype=self.weight.dtype)
@@ -470,6 +493,10 @@ class FusedFlashLinear(nn.Module):
             self._bk_cache = None
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        # Cast input to weight's dtype for mixed precision compatibility (e.g., FSDP with bfloat16)
+        if input.dtype != self.weight.dtype:
+            input = input.to(self.weight.dtype)
+        
         # If no norm buffer or norm computation disabled, use standard F.linear
         if self._norm_buf is None or not self._compute_norms_container['value']:
             return F.linear(input, self.weight, self.bias)

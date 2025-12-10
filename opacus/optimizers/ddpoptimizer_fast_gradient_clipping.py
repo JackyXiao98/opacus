@@ -59,12 +59,16 @@ class DistributedDPOptimizerFastGradientClipping(DPOptimizerFastGradientClipping
             super().add_noise()
         else:
             for p in self.params:
+                if p.summed_grad is None:
+                    continue  # Skip parameters without accumulated gradients
                 p.grad = p.summed_grad.view_as(p)
 
     def reduce_gradients(self):
         for p in self.params:
             if not p.requires_grad:
                 continue
+            if p.grad is None:
+                continue  # Skip parameters without gradients
             torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.SUM)
             if self.loss_reduction == "mean":
                 p.grad /= self.world_size

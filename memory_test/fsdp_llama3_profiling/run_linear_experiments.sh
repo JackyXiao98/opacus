@@ -1,21 +1,21 @@
 #!/bin/bash
-# Run all custom Transformer model profiling experiments in isolated Python processes
+# Run all Linear layer memory profiling experiments in isolated Python processes
 # This prevents memory pool contamination between experiments
 
 echo "========================================================================"
-echo "Custom Transformer Memory Profiling Experiment Suite"
+echo "Linear Layer Memory Profiling Experiment Suite"
 echo "Each experiment runs in a fresh Python process to avoid contamination"
 echo "========================================================================"
 echo ""
 
 # Configuration - Model Architecture
-VOCAB_SIZE=50257        # GPT-2 的词表大小
-HIDDEN_DIM=1280         # GPT-2 Large 的 hidden size
-NUM_LAYERS=36           # 36 层 transformer block
-NUM_HEADS=20            # 20 个 attention heads
+D=4096        # Input dimension
+P=11008         # Output dimension
+NUM_LAYERS=1    # Number of stacked Linear layers
 
 # Configuration - Training
-BATCH_SIZE=4
+# Batch sizes to test (can be array for multiple values)
+BATCH_SIZES=(8)
 NUM_ITER=3
 WARMUP_ITER=2
 LEARNING_RATE=1e-5
@@ -23,17 +23,15 @@ SIGMA=1.0
 MAX_GRAD_NORM=1.0
 
 # Sequence lengths to test
-SEQ_LENGTHS=(512 1024 2048 4096 8192)
+SEQ_LENGTHS=(16384 32768)
 
 # Modes to test
 # Available Single-GPU modes: no_dp_single, grad_materialize, ghost, ghost_bk, flash, flash_bk, flash_fuse, flash_fuse_bk
-# Available FSDP modes: no_dp, ghost_fsdp, flash_fsdp, flash_fsdp_bk, ghost_fsdp_bk, flash_fsdp_fuse, flash_fsdp_fuse_bk
-# MODES=("flash_fuse_bk" "flash_bk" "no_dp_single")
-# MODES=("no_dp_single" "grad_materialize" "ghost_bk" "flash_fuse_bk")
-MODES=("grad_materialize" "ghost" "ghost_bk" "flash_fuse" "flash_fuse_bk" "no_dp_single")
-
+# MODES=("no_dp_single" "grad_materialize" "ghost" "ghost_bk" "flash_fuse_bk")
+# MODES=("grad_materialize" "ghost" "ghost_bk" "flash_fuse" "flash_fuse_bk" "no_dp_single")
+MODES=("grad_materialize"  "flash_fuse" "no_dp_single") 
 # Output directory
-OUTPUT_DIR="results_transformer"
+OUTPUT_DIR="results_linear"
 mkdir -p "$OUTPUT_DIR"
 
 # Timestamp for this run
@@ -43,13 +41,12 @@ mkdir -p "$RUN_DIR"
 
 echo "Output directory: $RUN_DIR"
 echo "Model Architecture:"
-echo "  - Vocab Size: $VOCAB_SIZE"
-echo "  - Hidden Dim: $HIDDEN_DIM"
-echo "  - Num Layers: $NUM_LAYERS"
-echo "  - Num Heads: $NUM_HEADS"
+echo "  - d (input dim): $D"
+echo "  - p (output dim): $P"
+echo "  - num_layers: $NUM_LAYERS"
 echo ""
 echo "Training Config:"
-echo "  - Batch Size per GPU: $BATCH_SIZE"
+echo "  - Batch Sizes: ${BATCH_SIZES[@]}"
 echo "  - Sequence Lengths: ${SEQ_LENGTHS[@]}"
 echo "  - Modes: ${MODES[@]}"
 echo ""
@@ -58,10 +55,11 @@ echo ""
 run_experiment() {
     local mode=$1
     local seq_len=$2
-    local output_file="$RUN_DIR/${mode}_seq${seq_len}_result.json"
+    local batch_size=$3
+    local output_file="$RUN_DIR/${mode}_seq${seq_len}_bs${batch_size}_result.json"
     
     echo "========================================================================"
-    echo "Running: mode=$mode, seq_length=$seq_len"
+    echo "Running: mode=$mode, seq_length=$seq_len, batch_size=$batch_size"
     echo "Output: $output_file"
     echo "========================================================================"
     
@@ -71,16 +69,15 @@ run_experiment() {
     fi
     
     # Run experiment in isolated process
-    python transformer_experiment.py \
+    python linear_experiment.py \
         --mode "$mode" \
         --seq-length $seq_len \
-        --batch-size $BATCH_SIZE \
+        --batch-size $batch_size \
         --num-iter $NUM_ITER \
         --warmup-iter $WARMUP_ITER \
-        --vocab-size $VOCAB_SIZE \
-        --hidden-dim $HIDDEN_DIM \
+        --d $D \
+        --p $P \
         --num-layers $NUM_LAYERS \
-        --num-heads $NUM_HEADS \
         --learning-rate $LEARNING_RATE \
         --sigma $SIGMA \
         --max-grad-norm $MAX_GRAD_NORM \
@@ -92,7 +89,7 @@ run_experiment() {
         echo "❌ Experiment failed with exit code $exit_code"
         echo "Continuing with remaining experiments..."
     else
-        echo "✓ Completed: mode=$mode, seq_length=$seq_len"
+        echo "✓ Completed: mode=$mode, seq_length=$seq_len, batch_size=$batch_size"
     fi
     
     # Wait between experiments to ensure full cleanup
@@ -106,17 +103,19 @@ run_experiment() {
 echo "Starting experiment sequence..."
 echo ""
 
-total_experiments=$((${#MODES[@]} * ${#SEQ_LENGTHS[@]}))
+total_experiments=$((${#MODES[@]} * ${#SEQ_LENGTHS[@]} * ${#BATCH_SIZES[@]}))
 current_experiment=0
 
-for seq_len in "${SEQ_LENGTHS[@]}"; do
-    for mode in "${MODES[@]}"; do
-        current_experiment=$((current_experiment + 1))
-        echo ""
-        echo "════════════════════════════════════════════════════════════════════"
-        echo "Progress: Experiment $current_experiment / $total_experiments"
-        echo "════════════════════════════════════════════════════════════════════"
-        run_experiment "$mode" "$seq_len"
+for batch_size in "${BATCH_SIZES[@]}"; do
+    for seq_len in "${SEQ_LENGTHS[@]}"; do
+        for mode in "${MODES[@]}"; do
+            current_experiment=$((current_experiment + 1))
+            echo ""
+            echo "════════════════════════════════════════════════════════════════════"
+            echo "Progress: Experiment $current_experiment / $total_experiments"
+            echo "════════════════════════════════════════════════════════════════════"
+            run_experiment "$mode" "$seq_len" "$batch_size"
+        done
     done
 done
 
@@ -130,7 +129,8 @@ echo "Generating visualizations..."
 if [ -f "visualize_results.py" ]; then
     python visualize_results.py \
         --input-dir "$RUN_DIR" \
-        --output-dir "$RUN_DIR/visualizations"
+        --output-dir "$RUN_DIR/visualizations" \
+        --baseline "no_dp_single"
     
     if [ $? -eq 0 ]; then
         echo ""
@@ -149,22 +149,24 @@ echo "SUMMARY"
 echo "========================================================================"
 
 # Print summary table header
-printf "%-20s %-12s %15s %15s\n" "Mode" "Seq Length" "Peak Mem (GB)" "Avg Time (ms)"
-echo "------------------------------------------------------------------------"
+printf "%-20s %-12s %-12s %15s %15s\n" "Mode" "Seq Length" "Batch Size" "Peak Mem (GB)" "Avg Time (ms)"
+echo "------------------------------------------------------------------------------------"
 
 # Print results for each experiment
-for seq_len in "${SEQ_LENGTHS[@]}"; do
-    for mode in "${MODES[@]}"; do
-        result_file="$RUN_DIR/${mode}_seq${seq_len}_result.json"
-        if [ -f "$result_file" ]; then
-            peak_mem=$(python -c "import json; data=json.load(open('$result_file')); print(f\"{data['peak_memory_gb']:.2f}\")" 2>/dev/null || echo "N/A")
-            avg_time=$(python -c "import json; data=json.load(open('$result_file')); print(f\"{data['avg_time_ms']:.2f}\")" 2>/dev/null || echo "N/A")
-            printf "%-20s %-12s %15s %15s\n" "$mode" "$seq_len" "$peak_mem" "$avg_time"
-        else
-            printf "%-20s %-12s %15s %15s\n" "$mode" "$seq_len" "FAILED" "FAILED"
-        fi
+for batch_size in "${BATCH_SIZES[@]}"; do
+    for seq_len in "${SEQ_LENGTHS[@]}"; do
+        for mode in "${MODES[@]}"; do
+            result_file="$RUN_DIR/${mode}_seq${seq_len}_bs${batch_size}_result.json"
+            if [ -f "$result_file" ]; then
+                peak_mem=$(python -c "import json; data=json.load(open('$result_file')); print(f\"{data['peak_memory_gb']:.2f}\")" 2>/dev/null || echo "N/A")
+                avg_time=$(python -c "import json; data=json.load(open('$result_file')); print(f\"{data['avg_time_ms']:.2f}\")" 2>/dev/null || echo "N/A")
+                printf "%-20s %-12s %-12s %15s %15s\n" "$mode" "$seq_len" "$batch_size" "$peak_mem" "$avg_time"
+            else
+                printf "%-20s %-12s %-12s %15s %15s\n" "$mode" "$seq_len" "$batch_size" "FAILED" "FAILED"
+            fi
+        done
     done
-    echo "------------------------------------------------------------------------"
+    echo "------------------------------------------------------------------------------------"
 done
 
 echo ""
