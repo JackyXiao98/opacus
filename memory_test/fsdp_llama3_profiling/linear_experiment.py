@@ -12,6 +12,7 @@ import os
 
 import torch
 import torch.nn as nn
+import torch.amp as torch_amp
 from opacus import PrivacyEngine
 
 
@@ -97,7 +98,7 @@ def aggressive_cleanup():
     gc.collect(generation=2)
 
 
-def create_model(config, master_process=True):
+def create_model(config, master_process=True, param_dtype=None):
     """Create Linear model"""
     d = config["d"]
     p = config["p"]
@@ -107,6 +108,8 @@ def create_model(config, master_process=True):
         print(f"Creating Linear model: d={d}, p={p}, num_layers={num_layers}")
     
     model = LinearModel(d=d, p=p, num_layers=num_layers)
+    if param_dtype is not None:
+        model = model.to(dtype=param_dtype)
     
     if master_process:
         print(f"Model parameters: {model.count_parameters():,}")
@@ -145,6 +148,13 @@ def run_experiment_worker(
     mode = config["mode"]
     seq_length = config["seq_length"]
     batch_size = config["batch_size"]
+    use_amp = config.get("use_amp", False)
+    amp_dtype_str = config.get("amp_dtype", "bf16" if use_amp else None)
+    if use_amp:
+        amp_dtype = torch.bfloat16 if amp_dtype_str == "bf16" else torch.float16
+    else:
+        amp_dtype = None
+    mp_label = f"{'bf16' if amp_dtype == torch.bfloat16 else 'fp16'}" if use_amp else "off"
     
     print(f"\n{'='*80}")
     print(f"EXPERIMENT: mode={mode}, seq_length={seq_length}, batch_size={batch_size}")
@@ -153,11 +163,12 @@ def run_experiment_worker(
     device = torch.device("cuda:0")
     torch.manual_seed(1337)
     
-    # Create model
-    model = create_model(config)
-    
     # Determine if this is a fuse mode (needs special handling)
     is_fuse_mode = mode in ["flash_fuse", "flash_fuse_bk"]
+    
+    # Create model (optionally initialize parameters in AMP dtype for fused path)
+    init_dtype = amp_dtype if is_fuse_mode and use_amp and amp_dtype is not None else None
+    model = create_model(config, param_dtype=init_dtype)
     
     # For fuse modes: Replace Linear with FusedFlashLinear
     if is_fuse_mode:
@@ -166,10 +177,16 @@ def run_experiment_worker(
         model = replace_linear_with_fused(model)
     
     model = model.to(device)
+    # Fused Flash kernel expects parameters to match activation dtype; keep weights
+    # in AMP dtype when running fused modes to avoid dtype mismatch in backward.
+    if is_fuse_mode and use_amp and amp_dtype is not None:
+        model = model.to(dtype=amp_dtype)
     model.train()
     
     # Create optimizer
     optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
+    # GradScaler does not support BF16 unscale; enable only for FP16 autocast
+    scaler = torch_amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
     
     # Create criterion (MSE loss)
     # For ghost/ghost_bk and flash/flash_bk modes, use MSELossPerSample which returns
@@ -233,29 +250,37 @@ def run_experiment_worker(
         print("Running in non-DP mode")
     
     # Warmup iterations
-    print(f"\nRunning {warmup_iter} warmup iterations...")
+    print(f"\nRunning {warmup_iter} warmup iterations... (AMP={mp_label})")
     
     for i in range(warmup_iter):
         batch = generate_batch(config, device)
+        if use_amp and amp_dtype is not None:
+            batch["inputs"] = batch["inputs"].to(dtype=amp_dtype)
+            batch["targets"] = batch["targets"].to(dtype=amp_dtype)
         
         optimizer.zero_grad()
+        with torch_amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+            outputs = model(batch["inputs"])
+            B, T, P = outputs.shape
+            
+            if needs_per_sample_loss:
+                # Ghost/flash modes: criterion is wrapped with DPLossFastGradientClipping
+                # Pass shape=(B, T, P) so it can reduce per-token losses [B*T] to per-sample [B]
+                loss = criterion(outputs.view(B * T, P), batch["targets"].view(B * T, P), shape=(B, T, P))
+            elif is_fuse_mode:
+                # Fuse modes: keep 3D shape for proper FusedFlashLinear backward
+                loss = criterion(outputs, batch["targets"])
+            else:
+                # Standard modes (no_dp_single, grad_materialize): standard loss computation
+                loss = criterion(outputs.view(B * T, P), batch["targets"].view(B * T, P))
         
-        outputs = model(batch["inputs"])
-        B, T, P = outputs.shape
-        
-        if needs_per_sample_loss:
-            # Ghost/flash modes: criterion is wrapped with DPLossFastGradientClipping
-            # Pass shape=(B, T, P) so it can reduce per-token losses [B*T] to per-sample [B]
-            loss = criterion(outputs.view(B * T, P), batch["targets"].view(B * T, P), shape=(B, T, P))
-        elif is_fuse_mode:
-            # Fuse modes: keep 3D shape for proper FusedFlashLinear backward
-            loss = criterion(outputs, batch["targets"])
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
         else:
-            # Standard modes (no_dp_single, grad_materialize): standard loss computation
-            loss = criterion(outputs.view(B * T, P), batch["targets"].view(B * T, P))
-        
-        loss.backward()
-        optimizer.step()
+            loss.backward()
+            optimizer.step()
         
         del batch, loss, outputs
         torch.cuda.empty_cache()
@@ -264,12 +289,15 @@ def run_experiment_worker(
     torch.cuda.reset_peak_memory_stats(device)
     
     # Profiling iterations
-    print(f"\nRunning {num_iter} profiling iterations...")
+    print(f"\nRunning {num_iter} profiling iterations... (AMP={mp_label})")
     
     total_time = 0.0
     
     for i in range(num_iter):
         batch = generate_batch(config, device)
+        if use_amp and amp_dtype is not None:
+            batch["inputs"] = batch["inputs"].to(dtype=amp_dtype)
+            batch["targets"] = batch["targets"].to(dtype=amp_dtype)
         
         # Time the iteration
         torch.cuda.synchronize()
@@ -279,22 +307,28 @@ def run_experiment_worker(
         
         optimizer.zero_grad()
         
-        outputs = model(batch["inputs"])
-        B, T, P = outputs.shape
+        with torch_amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+            outputs = model(batch["inputs"])
+            B, T, P = outputs.shape
+            
+            if needs_per_sample_loss:
+                # Ghost/flash modes: criterion is wrapped with DPLossFastGradientClipping
+                # Pass shape=(B, T, P) so it can reduce per-token losses [B*T] to per-sample [B]
+                loss = criterion(outputs.view(B * T, P), batch["targets"].view(B * T, P), shape=(B, T, P))
+            elif is_fuse_mode:
+                # Fuse modes: keep 3D shape for proper FusedFlashLinear backward
+                loss = criterion(outputs, batch["targets"])
+            else:
+                # Standard modes (no_dp_single, grad_materialize): standard loss computation
+                loss = criterion(outputs.view(B * T, P), batch["targets"].view(B * T, P))
         
-        if needs_per_sample_loss:
-            # Ghost/flash modes: criterion is wrapped with DPLossFastGradientClipping
-            # Pass shape=(B, T, P) so it can reduce per-token losses [B*T] to per-sample [B]
-            loss = criterion(outputs.view(B * T, P), batch["targets"].view(B * T, P), shape=(B, T, P))
-        elif is_fuse_mode:
-            # Fuse modes: keep 3D shape for proper FusedFlashLinear backward
-            loss = criterion(outputs, batch["targets"])
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
         else:
-            # Standard modes (no_dp_single, grad_materialize): standard loss computation
-            loss = criterion(outputs.view(B * T, P), batch["targets"].view(B * T, P))
-        
-        loss.backward()
-        optimizer.step()
+            loss.backward()
+            optimizer.step()
         
         end_event.record()
         torch.cuda.synchronize()
@@ -337,6 +371,9 @@ def run_experiment(config):
     print(f"  Number of GPUs: 1 (single-GPU mode)")
     print(f"  Profiling Iterations: {config['num_iter']}")
     print(f"  Warmup Iterations: {config['warmup_iter']}")
+    mp_cfg = config.get("amp_dtype") if config.get("use_amp") else None
+    mp_desc = f"AMP {mp_cfg}" if mp_cfg else "None"
+    print(f"  Mixed Precision: {mp_desc}")
     print(f"{'#'*80}\n")
     
     # Run experiment
@@ -405,6 +442,9 @@ def main():
                        help="Noise multiplier for DP")
     parser.add_argument("--max-grad-norm", type=float, default=1.0,
                        help="Max gradient norm for DP")
+    parser.add_argument("--mixed-precision", type=str, default="bf16",
+                       choices=["none", "fp16", "bf16"],
+                       help="Use CUDA AMP mixed precision (fp16/bf16)")
     
     # Output arguments
     parser.add_argument("--output", type=str, required=True,
@@ -425,6 +465,8 @@ def main():
         "learning_rate": args.learning_rate,
         "sigma": args.sigma,
         "max_grad_norm": args.max_grad_norm,
+        "use_amp": args.mixed_precision != "none",
+        "amp_dtype": args.mixed_precision if args.mixed_precision != "none" else None,
     }
     
     # Run experiment

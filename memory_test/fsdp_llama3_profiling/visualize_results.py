@@ -277,13 +277,14 @@ def plot_time_comparison(results, output_dir):
     print(f"✓ Saved: {output_path}")
 
 
-def plot_time_vs_seq_length(results, output_dir, baseline_mode="no_dp_single"):
-    """Plot time difference vs sequence length as a line chart (one line per mode)
+def plot_time_vs_seq_length(results, output_dir, baseline_mode="no_dp_single", metric="difference"):
+    """Plot time difference/ratio vs sequence length as a line chart (one line per mode)
     
     Args:
         results: Dictionary of experiment results
         output_dir: Directory to save the plot
         baseline_mode: Mode to use as baseline for difference calculation (default: no_dp_single)
+        metric: "ratio" (default) plots mode/baseline, "difference" plots mode-baseline
     """
     # Get all sequence lengths across all modes
     seq_lengths = get_seq_lengths(results)
@@ -298,12 +299,24 @@ def plot_time_vs_seq_length(results, output_dir, baseline_mode="no_dp_single"):
         print(f"⚠️  Baseline mode '{baseline_mode}' not found in results, skipping time difference plot")
         return
     
-    # Sort modes by defined order, only include modes present in results
-    # Exclude baseline mode from the plot (it would always be 0)
+    # Normalize and validate metric
+    metric = metric.lower()
+    if metric not in {"ratio", "difference"}:
+        print(f"⚠️  Unknown metric '{metric}', defaulting to ratio")
+        metric = "ratio"
+    
+    # Sort modes by defined order, only include modes present in results (exclude baseline)
     modes = [m for m in MODE_ORDER if m in results and m != baseline_mode]
     
     # Create mapping from seq_len to index for equal spacing
     seq_len_to_idx = {seq_len: idx for idx, seq_len in enumerate(seq_lengths)}
+
+    def _compute_metric(mode_val, base_val):
+        if metric == "ratio":
+            if base_val == 0:
+                return None
+            return mode_val / base_val
+        return mode_val - base_val
     
     fig, ax = plt.subplots(figsize=(12, 8))
     
@@ -316,9 +329,10 @@ def plot_time_vs_seq_length(results, output_dir, baseline_mode="no_dp_single"):
             baseline_data = get_result(results, baseline_mode, seq_len)
             if mode_data and baseline_data:
                 baseline_time = baseline_data["avg_time_ms"]
-                mode_indices.append(seq_len_to_idx[seq_len])
-                time_diff = mode_data["avg_time_ms"] - baseline_time
-                mode_time_diffs.append(time_diff)
+                metric_val = _compute_metric(mode_data["avg_time_ms"], baseline_time)
+                if metric_val is not None:
+                    mode_indices.append(seq_len_to_idx[seq_len])
+                    mode_time_diffs.append(metric_val)
         
         if mode_indices:
             marker = MODE_MARKERS.get(mode, 'o')
@@ -330,12 +344,19 @@ def plot_time_vs_seq_length(results, output_dir, baseline_mode="no_dp_single"):
                    label=MODE_NAMES[mode].replace('\n', ' '),
                    alpha=0.8)
     
-    # Add baseline reference line at y=0
-    ax.axhline(y=0, color='gray', linestyle='--', linewidth=2, alpha=0.7, label=f'Baseline ({MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")})')
+    # Add baseline reference line
+    baseline_ref = 1 if metric == "ratio" else 0
+    ax.axhline(y=baseline_ref, color='gray', linestyle='--', linewidth=2, alpha=0.7, label=f'Baseline ({MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")})')
     
     ax.set_xlabel('Sequence Length', fontsize=16, fontweight='bold')
-    ax.set_ylabel(f'Time Difference vs {MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")} (ms)', fontsize=16, fontweight='bold')
-    ax.set_title('Time Difference vs Sequence Length', fontsize=18, fontweight='bold')
+    ylabel = (
+        f'Time Ratio vs {MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")}'
+        if metric == "ratio"
+        else f'Time Difference vs {MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")} (ms)'
+    )
+    title = 'Time Ratio vs Sequence Length' if metric == "ratio" else 'Time Difference vs Sequence Length'
+    ax.set_ylabel(ylabel, fontsize=16, fontweight='bold')
+    ax.set_title(title, fontsize=18, fontweight='bold')
     ax.legend(fontsize=11, loc='best', framealpha=0.9)
     ax.grid(True, alpha=0.4, linestyle='--')
     
@@ -350,13 +371,14 @@ def plot_time_vs_seq_length(results, output_dir, baseline_mode="no_dp_single"):
     print(f"✓ Saved: {output_path}")
 
 
-def plot_memory_vs_seq_length(results, output_dir, baseline_mode="no_dp_single"):
-    """Plot memory difference vs sequence length as a line chart (one line per mode)
+def plot_memory_vs_seq_length(results, output_dir, baseline_mode="no_dp_single", metric="difference"):
+    """Plot memory difference/ratio vs sequence length as a line chart (one line per mode)
     
     Args:
         results: Dictionary of experiment results
         output_dir: Directory to save the plot
         baseline_mode: Mode to use as baseline for difference calculation (default: no_dp_single)
+        metric: "ratio" (default) plots mode/baseline, "difference" plots mode-baseline
     """
     # Get all sequence lengths across all modes
     seq_lengths = get_seq_lengths(results)
@@ -371,12 +393,24 @@ def plot_memory_vs_seq_length(results, output_dir, baseline_mode="no_dp_single")
         print(f"⚠️  Baseline mode '{baseline_mode}' not found in results, skipping memory difference plot")
         return
     
-    # Sort modes by defined order, only include modes present in results
-    # Exclude baseline mode from the plot (it would always be 0)
+    # Normalize and validate metric
+    metric = metric.lower()
+    if metric not in {"ratio", "difference"}:
+        print(f"⚠️  Unknown metric '{metric}', defaulting to ratio")
+        metric = "ratio"
+    
+    # Sort modes by defined order, only include modes present in results (exclude baseline)
     modes = [m for m in MODE_ORDER if m in results and m != baseline_mode]
     
     # Create mapping from seq_len to index for equal spacing
     seq_len_to_idx = {seq_len: idx for idx, seq_len in enumerate(seq_lengths)}
+
+    def _compute_metric(mode_val, base_val):
+        if metric == "ratio":
+            if base_val == 0:
+                return None
+            return mode_val / base_val
+        return mode_val - base_val
     
     fig, ax = plt.subplots(figsize=(12, 8))
     
@@ -389,9 +423,10 @@ def plot_memory_vs_seq_length(results, output_dir, baseline_mode="no_dp_single")
             baseline_data = get_result(results, baseline_mode, seq_len)
             if mode_data and baseline_data:
                 baseline_memory = baseline_data["peak_memory_gb"]
-                mode_indices.append(seq_len_to_idx[seq_len])
-                memory_diff = mode_data["peak_memory_gb"] - baseline_memory
-                mode_memory_diffs.append(memory_diff)
+                metric_val = _compute_metric(mode_data["peak_memory_gb"], baseline_memory)
+                if metric_val is not None:
+                    mode_indices.append(seq_len_to_idx[seq_len])
+                    mode_memory_diffs.append(metric_val)
         
         if mode_indices:
             marker = MODE_MARKERS.get(mode, 'o')
@@ -403,12 +438,19 @@ def plot_memory_vs_seq_length(results, output_dir, baseline_mode="no_dp_single")
                    label=MODE_NAMES[mode].replace('\n', ' '),
                    alpha=0.8)
     
-    # Add baseline reference line at y=0
-    ax.axhline(y=0, color='gray', linestyle='--', linewidth=2, alpha=0.7, label=f'Baseline ({MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")})')
+    # Add baseline reference line
+    baseline_ref = 1 if metric == "ratio" else 0
+    ax.axhline(y=baseline_ref, color='gray', linestyle='--', linewidth=2, alpha=0.7, label=f'Baseline ({MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")})')
     
     ax.set_xlabel('Sequence Length', fontsize=16, fontweight='bold')
-    ax.set_ylabel(f'Memory Difference vs {MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")} (GB)', fontsize=16, fontweight='bold')
-    ax.set_title('Memory Difference vs Sequence Length', fontsize=18, fontweight='bold')
+    ylabel = (
+        f'Memory Ratio vs {MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")}'
+        if metric == "ratio"
+        else f'Memory Difference vs {MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")} (GB)'
+    )
+    title = 'Memory Ratio vs Sequence Length' if metric == "ratio" else 'Memory Difference vs Sequence Length'
+    ax.set_ylabel(ylabel, fontsize=16, fontweight='bold')
+    ax.set_title(title, fontsize=18, fontweight='bold')
     ax.legend(fontsize=11, loc='best', framealpha=0.9)
     ax.grid(True, alpha=0.4, linestyle='--')
     
@@ -423,13 +465,14 @@ def plot_memory_vs_seq_length(results, output_dir, baseline_mode="no_dp_single")
     print(f"✓ Saved: {output_path}")
 
 
-def plot_batch_size_vs_memory(results, output_dir, baseline_mode="no_dp_single"):
-    """Plot memory difference vs batch size as a line chart (one line per mode)
+def plot_batch_size_vs_memory(results, output_dir, baseline_mode="no_dp_single", metric="difference"):
+    """Plot memory difference/ratio vs batch size as a line chart (one line per mode)
     
     Args:
         results: Dictionary of experiment results
         output_dir: Directory to save the plot
         baseline_mode: Mode to use as baseline for difference calculation (default: no_dp_single)
+        metric: "ratio" (default) plots mode/baseline, "difference" plots mode-baseline
     """
     # Get all batch sizes across all modes (use categorical positions for even spacing)
     batch_sizes = get_batch_sizes(results)
@@ -446,14 +489,26 @@ def plot_batch_size_vs_memory(results, output_dir, baseline_mode="no_dp_single")
         print(f"⚠️  Baseline mode '{baseline_mode}' not found in results, skipping batch size vs memory plot")
         return
     
-    # Sort modes by defined order, only include modes present in results
-    # Exclude baseline mode from the plot (it would always be 0)
+    # Normalize and validate metric
+    metric = metric.lower()
+    if metric not in {"ratio", "difference"}:
+        print(f"⚠️  Unknown metric '{metric}', defaulting to ratio")
+        metric = "ratio"
+    
+    # Sort modes by defined order, only include modes present in results (exclude baseline)
     modes = [m for m in MODE_ORDER if m in results and m != baseline_mode]
     
     fig, ax = plt.subplots(figsize=(12, 8))
     
     # Get seq_lengths for averaging
     seq_lengths = get_seq_lengths(results)
+
+    def _compute_metric(mode_val, base_val):
+        if metric == "ratio":
+            if base_val == 0:
+                return None
+            return mode_val / base_val
+        return mode_val - base_val
     
     for mode in modes:
         mode_batch_sizes = []
@@ -468,7 +523,9 @@ def plot_batch_size_vs_memory(results, output_dir, baseline_mode="no_dp_single")
                     if baseline_mode in results and key in results[baseline_mode]:
                         baseline_mem = results[baseline_mode][key]["peak_memory_gb"]
                         mode_mem = results[mode][key]["peak_memory_gb"]
-                        memory_diffs.append(mode_mem - baseline_mem)
+                        metric_val = _compute_metric(mode_mem, baseline_mem)
+                        if metric_val is not None:
+                            memory_diffs.append(metric_val)
             
             if memory_diffs:
                 mode_batch_sizes.append(batch_size_positions[batch_size])
@@ -484,13 +541,20 @@ def plot_batch_size_vs_memory(results, output_dir, baseline_mode="no_dp_single")
                    label=MODE_NAMES[mode].replace('\n', ' '),
                    alpha=0.8)
     
-    # Add baseline reference line at y=0
-    ax.axhline(y=0, color='gray', linestyle='--', linewidth=2, alpha=0.7, 
+    # Add baseline reference line
+    baseline_ref = 1 if metric == "ratio" else 0
+    ax.axhline(y=baseline_ref, color='gray', linestyle='--', linewidth=2, alpha=0.7, 
                label=f'Baseline ({MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")})')
     
     ax.set_xlabel('Batch Size', fontsize=16, fontweight='bold')
-    ax.set_ylabel(f'Memory Difference vs {MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")} (GB)', fontsize=16, fontweight='bold')
-    ax.set_title('Memory Difference vs Batch Size', fontsize=18, fontweight='bold')
+    ylabel = (
+        f'Memory Ratio vs {MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")}'
+        if metric == "ratio"
+        else f'Memory Difference vs {MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")} (GB)'
+    )
+    title = 'Memory Ratio vs Batch Size' if metric == "ratio" else 'Memory Difference vs Batch Size'
+    ax.set_ylabel(ylabel, fontsize=16, fontweight='bold')
+    ax.set_title(title, fontsize=18, fontweight='bold')
     ax.legend(fontsize=11, loc='best', framealpha=0.9)
     ax.grid(True, alpha=0.4, linestyle='--')
     
@@ -505,13 +569,14 @@ def plot_batch_size_vs_memory(results, output_dir, baseline_mode="no_dp_single")
     print(f"✓ Saved: {output_path}")
 
 
-def plot_batch_size_vs_time(results, output_dir, baseline_mode="no_dp_single"):
-    """Plot time difference vs batch size as a line chart (one line per mode)
+def plot_batch_size_vs_time(results, output_dir, baseline_mode="no_dp_single", metric="difference"):
+    """Plot time difference/ratio vs batch size as a line chart (one line per mode)
     
     Args:
         results: Dictionary of experiment results
         output_dir: Directory to save the plot
         baseline_mode: Mode to use as baseline for difference calculation (default: no_dp_single)
+        metric: "ratio" (default) plots mode/baseline, "difference" plots mode-baseline
     """
     # Get all batch sizes across all modes (use categorical positions for even spacing)
     batch_sizes = get_batch_sizes(results)
@@ -528,14 +593,26 @@ def plot_batch_size_vs_time(results, output_dir, baseline_mode="no_dp_single"):
         print(f"⚠️  Baseline mode '{baseline_mode}' not found in results, skipping batch size vs time plot")
         return
     
-    # Sort modes by defined order, only include modes present in results
-    # Exclude baseline mode from the plot (it would always be 0)
+    # Normalize and validate metric
+    metric = metric.lower()
+    if metric not in {"ratio", "difference"}:
+        print(f"⚠️  Unknown metric '{metric}', defaulting to ratio")
+        metric = "ratio"
+    
+    # Sort modes by defined order, only include modes present in results (exclude baseline)
     modes = [m for m in MODE_ORDER if m in results and m != baseline_mode]
     
     fig, ax = plt.subplots(figsize=(12, 8))
     
     # Get seq_lengths for averaging
     seq_lengths = get_seq_lengths(results)
+
+    def _compute_metric(mode_val, base_val):
+        if metric == "ratio":
+            if base_val == 0:
+                return None
+            return mode_val / base_val
+        return mode_val - base_val
     
     for mode in modes:
         mode_batch_sizes = []
@@ -550,7 +627,9 @@ def plot_batch_size_vs_time(results, output_dir, baseline_mode="no_dp_single"):
                     if baseline_mode in results and key in results[baseline_mode]:
                         baseline_time = results[baseline_mode][key]["avg_time_ms"]
                         mode_time = results[mode][key]["avg_time_ms"]
-                        time_diffs.append(mode_time - baseline_time)
+                        metric_val = _compute_metric(mode_time, baseline_time)
+                        if metric_val is not None:
+                            time_diffs.append(metric_val)
             
             if time_diffs:
                 mode_batch_sizes.append(batch_size_positions[batch_size])
@@ -566,13 +645,20 @@ def plot_batch_size_vs_time(results, output_dir, baseline_mode="no_dp_single"):
                    label=MODE_NAMES[mode].replace('\n', ' '),
                    alpha=0.8)
     
-    # Add baseline reference line at y=0
-    ax.axhline(y=0, color='gray', linestyle='--', linewidth=2, alpha=0.7, 
+    # Add baseline reference line
+    baseline_ref = 1 if metric == "ratio" else 0
+    ax.axhline(y=baseline_ref, color='gray', linestyle='--', linewidth=2, alpha=0.7, 
                label=f'Baseline ({MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")})')
     
     ax.set_xlabel('Batch Size', fontsize=16, fontweight='bold')
-    ax.set_ylabel(f'Time Difference vs {MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")} (ms)', fontsize=16, fontweight='bold')
-    ax.set_title('Time Difference vs Batch Size', fontsize=18, fontweight='bold')
+    ylabel = (
+        f'Time Ratio vs {MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")}'
+        if metric == "ratio"
+        else f'Time Difference vs {MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")} (ms)'
+    )
+    title = 'Time Ratio vs Batch Size' if metric == "ratio" else 'Time Difference vs Batch Size'
+    ax.set_ylabel(ylabel, fontsize=16, fontweight='bold')
+    ax.set_title(title, fontsize=18, fontweight='bold')
     ax.legend(fontsize=11, loc='best', framealpha=0.9)
     ax.grid(True, alpha=0.4, linestyle='--')
     
