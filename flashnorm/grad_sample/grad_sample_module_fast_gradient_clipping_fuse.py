@@ -36,13 +36,13 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 
-from opacus.grad_sample.functorch import ft_compute_per_sample_gradient
-from opacus.grad_sample.fused_flash_linear import (
+from flashnorm.grad_sample.functorch import ft_compute_per_sample_gradient
+from flashnorm.grad_sample.fused_flash_linear import (
     FusedFlashLinear,
     get_fused_linear_modules,
     replace_linear_with_fused,
 )
-from opacus.grad_sample.grad_sample_module_fast_gradient_clipping import (
+from flashnorm.grad_sample.grad_sample_module_fast_gradient_clipping import (
     GradSampleModuleFastGradientClipping,
 )
 from opacus.utils.module_utils import requires_grad, trainable_parameters

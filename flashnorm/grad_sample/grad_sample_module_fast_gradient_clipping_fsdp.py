@@ -22,8 +22,8 @@ from typing import List
 import torch
 import torch.nn as nn
 from torch.distributed._tensor.experimental import implicit_replication
-from opacus.grad_sample.functorch import ft_compute_per_sample_gradient
-from opacus.grad_sample.grad_sample_module_fast_gradient_clipping import (
+from flashnorm.grad_sample.functorch import ft_compute_per_sample_gradient
+from flashnorm.grad_sample.grad_sample_module_fast_gradient_clipping import (
     GradSampleModuleFastGradientClipping,
 )
 from opacus.utils.module_utils import requires_grad, trainable_parameters

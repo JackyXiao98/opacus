@@ -14,10 +14,11 @@
 # limitations under the License.
 
 import torch
-from opacus.grad_sample.grad_sample_module_fast_gradient_clipping import (
+
+from flashnorm.grad_sample.grad_sample_module_fast_gradient_clipping import (
     GradSampleModuleFastGradientClipping,
 )
-from opacus.optimizers import DPOptimizerFastGradientClipping
+from flashnorm.optimizers import DPOptimizerFastGradientClipping
 
 
 def _is_fsdp_model(module) -> bool:
@@ -35,13 +36,13 @@ def _is_fsdp_model(module) -> bool:
             if isinstance(m, FullyShardedDataParallel):
                 return True
         # Also check for FSDP2 via GradSampleModuleFastGradientClippingFSDP
-        from opacus.grad_sample.grad_sample_module_fast_gradient_clipping_fsdp import (
+        from flashnorm.grad_sample.grad_sample_module_fast_gradient_clipping_fsdp import (
             GradSampleModuleFastGradientClippingFSDP,
         )
         if isinstance(module, GradSampleModuleFastGradientClippingFSDP):
             return True
         # Also check for FSDPFuse variant
-        from opacus.grad_sample.grad_sample_module_fast_gradient_clipping_fsdp_fuse import (
+        from flashnorm.grad_sample.grad_sample_module_fast_gradient_clipping_fsdp_fuse import (
             GradSampleModuleFastGradientClippingFSDPFuse,
         )
         return isinstance(module, GradSampleModuleFastGradientClippingFSDPFuse)
@@ -67,10 +68,10 @@ def _get_fsdp_root_module(module):
                       'fsdp1' if no_sync available, None otherwise
     """
     try:
-        from opacus.grad_sample.grad_sample_module_fast_gradient_clipping_fsdp import (
+        from flashnorm.grad_sample.grad_sample_module_fast_gradient_clipping_fsdp import (
             GradSampleModuleFastGradientClippingFSDP,
         )
-        from opacus.grad_sample.grad_sample_module_fast_gradient_clipping_fsdp_fuse import (
+        from flashnorm.grad_sample.grad_sample_module_fast_gradient_clipping_fsdp_fuse import (
             GradSampleModuleFastGradientClippingFSDPFuse,
         )
         

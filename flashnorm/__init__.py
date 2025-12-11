@@ -15,11 +15,12 @@
 
 from . import utils
 from .grad_sample import GradSampleModule, GradSampleModuleFastGradientClipping
-from .privacy_engine import PrivacyEngine
+from .privacy_engine import FlashNormPrivacyEngine, PrivacyEngine
 from .version import __version__
 
 
 __all__ = [
+    "FlashNormPrivacyEngine",
     "PrivacyEngine",
     "GradSampleModule",
     "GradSampleModuleFastGradientClipping",

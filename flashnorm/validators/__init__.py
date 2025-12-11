@@ -18,13 +18,13 @@
 # we call register_module_validator and register_module_fixer
 # on respective methods
 
-from .batch_norm import fix, validate  # noqa
-from .gru import fix, validate  # noqa
-from .instance_norm import fix, validate  # noqa
-from .lstm import fix, validate  # noqa
-from .module_validator import ModuleValidator
-from .multihead_attention import fix, validate  # noqa
-from .utils import register_module_fixer, register_module_validator
+from opacus.validators.batch_norm import fix, validate  # noqa
+from opacus.validators.gru import fix, validate  # noqa
+from opacus.validators.instance_norm import fix, validate  # noqa
+from opacus.validators.lstm import fix, validate  # noqa
+from opacus.validators.module_validator import ModuleValidator
+from flashnorm.validators.multihead_attention import fix, validate  # noqa
+from opacus.validators.utils import register_module_fixer, register_module_validator
 
 
 __all__ = [

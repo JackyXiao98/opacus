@@ -13,13 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .dp_multihead_attention import (
+from flashnorm.layers.dp_multihead_attention import (
     DPMultiheadAttention,
     DPMultiheadAttentionWithFlashAttention,
     SequenceBias,
 )
-from .dp_rnn import DPGRU, DPLSTM, DPRNN
-from .param_rename import RenameParamsMixin
+from opacus.layers.dp_rnn import DPGRU, DPLSTM, DPRNN
+from opacus.layers.param_rename import RenameParamsMixin
 
 
 __all__ = [

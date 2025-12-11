@@ -12,16 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .adaclipoptimizer import AdaClipDPOptimizer
-from .ddp_perlayeroptimizer import SimpleDistributedPerLayerOptimizer
-from .ddpoptimizer import DistributedDPOptimizer
-from .ddpoptimizer_fast_gradient_clipping import (
+from opacus.optimizers.adaclipoptimizer import AdaClipDPOptimizer
+from opacus.optimizers.ddp_perlayeroptimizer import SimpleDistributedPerLayerOptimizer
+from flashnorm.optimizers.ddpoptimizer import DistributedDPOptimizer
+from flashnorm.optimizers.ddpoptimizer_fast_gradient_clipping import (
     DistributedDPOptimizerFastGradientClipping,
 )
-from .fsdpoptimizer_fast_gradient_clipping import FSDPOptimizerFastGradientClipping
-from .optimizer import DPOptimizer
-from .optimizer_fast_gradient_clipping import DPOptimizerFastGradientClipping
-from .perlayeroptimizer import DPPerLayerOptimizer
+from opacus.optimizers.fsdpoptimizer_fast_gradient_clipping import (
+    FSDPOptimizerFastGradientClipping,
+)
+from flashnorm.optimizers.optimizer import DPOptimizer
+from flashnorm.optimizers.optimizer_fast_gradient_clipping import (
+    DPOptimizerFastGradientClipping,
+)
+from opacus.optimizers.perlayeroptimizer import DPPerLayerOptimizer
 
 
 __all__ = [

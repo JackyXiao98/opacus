@@ -13,45 +13,48 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .conv import compute_conv_grad_sample, compute_conv_norm_sample, compute_conv_norm_sample_flash_wrapper  # noqa
-from .dp_multihead_attention import compute_sequence_bias_grad_sample  # noqa
-from .dp_rnn import compute_rnn_linear_grad_sample  # noqa
-from .embedding import compute_embedding_grad_sample  # noqa
-from .embedding_norm_sample import compute_embedding_norm_sample  # noqa
-from .grad_sample_module import GradSampleModule, create_or_accumulate_grad_sample
-from .grad_sample_module_fast_gradient_clipping import (  # noqa
+from flashnorm.grad_sample.conv import compute_conv_grad_sample, compute_conv_norm_sample, compute_conv_norm_sample_flash_wrapper  # noqa
+from flashnorm.grad_sample.opacus_wrappers import (  # noqa
+    compute_embedding_grad_sample,
+    compute_embedding_norm_sample,
+    compute_instance_norm_grad_sample,
+    compute_layer_norm_grad_sample,
+    compute_group_norm_grad_sample,
+    compute_rnn_linear_grad_sample,
+    compute_sequence_bias_grad_sample,
+)
+from flashnorm.grad_sample.embedding_norm_sample import compute_embedding_norm_sample as compute_embedding_norm_sample_flashnorm  # noqa
+from flashnorm.grad_sample.grad_sample_module import GradSampleModule, create_or_accumulate_grad_sample
+from flashnorm.grad_sample.grad_sample_module_fast_gradient_clipping import (  # noqa
     GradSampleModuleFastGradientClipping,
 )
-from .grad_sample_module_fast_gradient_clipping_fsdp import (  # noqa
+from flashnorm.grad_sample.grad_sample_module_fast_gradient_clipping_fsdp import (  # noqa
     GradSampleModuleFastGradientClippingFSDP,
 )
-from .grad_sample_module_fast_gradient_clipping_fsdp_fuse import (  # noqa
+from flashnorm.grad_sample.grad_sample_module_fast_gradient_clipping_fsdp_fuse import (  # noqa
     GradSampleModuleFastGradientClippingFSDPFuse,
 )
-from .grad_sample_module_fast_gradient_clipping_fuse import (  # noqa
+from flashnorm.grad_sample.grad_sample_module_fast_gradient_clipping_fuse import (  # noqa
     GradSampleModuleFastGradientClippingFuse,
 )
-from .fused_flash_linear import (  # noqa
+from flashnorm.grad_sample.fused_flash_linear import (  # noqa
     TRITON_AVAILABLE,
     FusedFlashLinear,
     replace_linear_with_fused,
     get_fused_linear_modules,
 )
-from .triton_fused_kernel import (  # noqa
+from flashnorm.grad_sample.triton_fused_kernel import (  # noqa
     TRITON_AVAILABLE as TRITON_KERNEL_AVAILABLE,
 )
-from .grad_sample_module_fast_gradient_clipping_tp import (  # noqa
+from opacus.grad_sample.grad_sample_module_fast_gradient_clipping_tp import (  # noqa
     GradSampleModuleFastGradientClippingTP,
 )
-from .group_norm import compute_group_norm_grad_sample  # noqa
-from .gsm_base import AbstractGradSampleModule
-from .gsm_exp_weights import GradSampleModuleExpandedWeights
-from .gsm_no_op import GradSampleModuleNoOp
-from .instance_norm import compute_instance_norm_grad_sample  # noqa
-from .layer_norm import compute_layer_norm_grad_sample  # noqa
-from .linear import compute_linear_grad_sample  # noqa
-from .rms_norm import compute_rms_norm_grad_sample  # noqa
-from .utils import (
+from opacus.grad_sample.gsm_base import AbstractGradSampleModule
+from opacus.grad_sample.gsm_exp_weights import GradSampleModuleExpandedWeights
+from opacus.grad_sample.gsm_no_op import GradSampleModuleNoOp
+from flashnorm.grad_sample.linear import compute_linear_grad_sample  # noqa
+from flashnorm.grad_sample.rms_norm import compute_rms_norm_grad_sample  # noqa
+from flashnorm.grad_sample.utils import (
     get_gsm_class,
     register_grad_sampler,
     register_norm_sampler,
@@ -74,6 +77,14 @@ __all__ = [
     "create_or_accumulate_grad_sample",
     "wrap_model",
     "get_gsm_class",
+    # opacus-registered samplers re-exposed for flashnorm registries
+    "compute_embedding_grad_sample",
+    "compute_embedding_norm_sample",
+    "compute_instance_norm_grad_sample",
+    "compute_layer_norm_grad_sample",
+    "compute_group_norm_grad_sample",
+    "compute_rnn_linear_grad_sample",
+    "compute_sequence_bias_grad_sample",
     # Fused Flash Linear exports
     "TRITON_AVAILABLE",
     "FusedFlashLinear",

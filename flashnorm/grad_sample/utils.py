@@ -30,9 +30,9 @@ from .grad_sample_module_fast_gradient_clipping_fsdp_fuse import (
 from .grad_sample_module_fast_gradient_clipping_fuse import (
     GradSampleModuleFastGradientClippingFuse,
 )
-from .gsm_base import AbstractGradSampleModule
-from .gsm_exp_weights import GradSampleModuleExpandedWeights
-from .gsm_no_op import GradSampleModuleNoOp
+from opacus.grad_sample.gsm_base import AbstractGradSampleModule
+from opacus.grad_sample.gsm_exp_weights import GradSampleModuleExpandedWeights
+from opacus.grad_sample.gsm_no_op import GradSampleModuleNoOp
 
 
 def register_grad_sampler(

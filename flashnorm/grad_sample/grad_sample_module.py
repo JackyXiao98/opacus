@@ -22,7 +22,10 @@ from typing import Iterable, List, Tuple
 
 import torch
 import torch.nn as nn
-from opacus.grad_sample.functorch import ft_compute_per_sample_gradient, prepare_layer
+from flashnorm.grad_sample.functorch import (
+    ft_compute_per_sample_gradient,
+    prepare_layer,
+)
 from opacus.grad_sample.gsm_base import AbstractGradSampleModule
 from opacus.layers.dp_rnn import DPGRU, DPLSTM, DPRNN, RNNLinear
 from opacus.utils.module_utils import (

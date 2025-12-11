@@ -16,10 +16,13 @@
 from typing import List, Union
 
 import torch.nn as nn
-from opacus.layers import DPMultiheadAttention, DPMultiheadAttentionWithFlashAttention
+from flashnorm.layers import (
+    DPMultiheadAttention,
+    DPMultiheadAttentionWithFlashAttention,
+)
 
-from .errors import ShouldReplaceModuleError, UnsupportedModuleError
-from .utils import register_module_fixer, register_module_validator
+from opacus.validators.errors import ShouldReplaceModuleError, UnsupportedModuleError
+from opacus.validators.utils import register_module_fixer, register_module_validator
 
 
 @register_module_validator(nn.MultiheadAttention)

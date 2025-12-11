@@ -17,7 +17,8 @@ from typing import Iterable
 
 import torch
 import torch.nn as nn
-from opacus.grad_sample.grad_sample_module_fast_gradient_clipping_fsdp import (
+
+from flashnorm.grad_sample.grad_sample_module_fast_gradient_clipping_fsdp import (
     GradSampleModuleFastGradientClippingFSDP,
 )
 from opacus.utils.module_utils import has_trainable_params

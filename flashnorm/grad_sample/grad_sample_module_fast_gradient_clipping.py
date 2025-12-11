@@ -20,8 +20,8 @@ from typing import List
 
 import torch
 import torch.nn as nn
-from opacus.grad_sample.functorch import ft_compute_per_sample_gradient
-from opacus.grad_sample.grad_sample_module import (
+from flashnorm.grad_sample.functorch import ft_compute_per_sample_gradient
+from flashnorm.grad_sample.grad_sample_module import (
     GradSampleModule,
     create_or_accumulate_grad_sample,
     promote_current_grad_sample,
@@ -428,7 +428,6 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
                 if not self.force_functorch and type(module) in self.GRAD_SAMPLERS:
                     grad_sampler_fn = self.GRAD_SAMPLERS[type(module)]
                 else:
-                    from opacus.grad_sample.functorch import ft_compute_per_sample_gradient
                     grad_sampler_fn = ft_compute_per_sample_gradient
                 
                 # Compute per-sample gradients
@@ -455,7 +454,6 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
                 if not self.force_functorch and type(module) in self.GRAD_SAMPLERS:
                     grad_sampler_fn = self.GRAD_SAMPLERS[type(module)]
                 else:
-                    from opacus.grad_sample.functorch import ft_compute_per_sample_gradient
                     grad_sampler_fn = ft_compute_per_sample_gradient
                 
                 grad_samples = grad_sampler_fn(module, activations, backprops)
@@ -477,7 +475,6 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
                 if not self.force_functorch and type(module) in self.GRAD_SAMPLERS:
                     grad_sampler_fn = self.GRAD_SAMPLERS[type(module)]
                 else:
-                    from opacus.grad_sample.functorch import ft_compute_per_sample_gradient
                     grad_sampler_fn = ft_compute_per_sample_gradient
                 
                 # Compute per-sample gradients using raw activations and backprops
@@ -504,7 +501,6 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
                 if not self.force_functorch and type(module) in self.GRAD_SAMPLERS:
                     grad_sampler_fn = self.GRAD_SAMPLERS[type(module)]
                 else:
-                    from opacus.grad_sample.functorch import ft_compute_per_sample_gradient
                     grad_sampler_fn = ft_compute_per_sample_gradient
                 
                 grad_samples = grad_sampler_fn(module, activations, backprops)

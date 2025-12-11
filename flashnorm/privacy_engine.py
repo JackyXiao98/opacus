@@ -18,19 +18,20 @@ from itertools import chain
 from typing import IO, Any, BinaryIO, Dict, List, Optional, Tuple, Union
 
 import torch
+from opacus.privacy_engine import PrivacyEngine as _BasePrivacyEngine
 from opacus.accountants import create_accountant
 from opacus.accountants.utils import get_noise_multiplier
-from opacus.data_loader import DPDataLoader, switch_generator
-from opacus.distributed import DifferentiallyPrivateDistributedDataParallel as DPDDP
-from opacus.grad_sample import (
+from flashnorm.data_loader import DPDataLoader, switch_generator
+from flashnorm.distributed import DifferentiallyPrivateDistributedDataParallel as DPDDP
+from flashnorm.grad_sample import (
     AbstractGradSampleModule,
     GradSampleModule,
     get_gsm_class,
     wrap_model,
 )
-from opacus.optimizers import DPOptimizer, get_optimizer_class
+from flashnorm.optimizers import DPOptimizer, get_optimizer_class
 from opacus.schedulers import _GradClipScheduler, _NoiseScheduler
-from opacus.utils.fast_gradient_clipping_utils import DPLossFastGradientClipping
+from flashnorm.utils.fast_gradient_clipping_utils import DPLossFastGradientClipping
 from opacus.validators.module_validator import ModuleValidator
 from torch import nn, optim
 from torch.distributed._composable.fsdp import FSDPModule
@@ -38,20 +39,21 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 
-class PrivacyEngine:
+class FlashNormPrivacyEngine(_BasePrivacyEngine):
     """
-    Main entry point to the Opacus API - use ``PrivacyEngine``  to enable differential
-    privacy for your model training.
+    FlashNorm variant of the Opacus ``PrivacyEngine`` that prefers FlashNorm
+    implementations when available while remaining API-compatible.
 
-    ``PrivacyEngine`` object encapsulates current privacy state (privacy budget +
+    ``FlashNormPrivacyEngine`` encapsulates current privacy state (privacy budget +
     method it's been calculated) and exposes ``make_private`` method to wrap your
-    PyTorch training objects with their private counterparts.
+    PyTorch training objects with their private counterparts, mirroring the
+    behaviour of Opacus' ``PrivacyEngine``.
 
     Example:
         >>> dataloader = demo_dataloader
         >>> model = MyCustomModel()
         >>> optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
-        >>> privacy_engine = PrivacyEngine()
+        >>> privacy_engine = FlashNormPrivacyEngine()
         >>>
         >>> model, optimizer, dataloader = privacy_engine.make_private(
         ...    module=model,
@@ -84,7 +86,7 @@ class PrivacyEngine:
         self.dataset = None  # only used to detect switching to a different dataset
         if self.secure_mode:
             try:
-                import torchcsprng as csprng
+                import torchcsprng as csprng  # type: ignore[import-not-found]
             except ImportError as e:
                 msg = (
                     "To use secure RNG, you must install the torchcsprng package! "
@@ -642,3 +644,7 @@ class PrivacyEngine:
             grad_clip_scheduler.load_state_dict(grad_clip_scheduler_state_dict)
 
         return checkpoint
+
+
+# Backwards compatibility alias
+PrivacyEngine = FlashNormPrivacyEngine

@@ -35,7 +35,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Import Triton fused kernel (optional dependency)
-from opacus.grad_sample.triton_fused_kernel import (
+from flashnorm.grad_sample.triton_fused_kernel import (
     TRITON_AVAILABLE,
     fused_backward_weight,
     fused_backward_weight_2d,
