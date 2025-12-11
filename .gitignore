@@ -6,6 +6,7 @@ __pycache__/
 *.zip
 *.json
 *.log
+*.pyc
 
 # Downloaded data
 data/
