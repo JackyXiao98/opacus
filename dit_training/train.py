@@ -208,6 +208,7 @@ def main(args):
             opt.zero_grad()
             loss.backward()
             opt.step()
+            
             update_ema(ema, model.module)
 
             # Log loss values:

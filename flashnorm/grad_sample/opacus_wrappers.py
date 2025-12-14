@@ -23,7 +23,9 @@ from opacus.grad_sample.dp_rnn import (
 )
 from opacus.grad_sample.embedding import (
     compute_embedding_grad_sample as _opacus_compute_embedding_grad_sample,
-    compute_embedding_norm_sample as _opacus_compute_embedding_norm_sample,
+)
+from flashnorm.grad_sample.embedding_norm_sample import (
+    compute_embedding_norm_sample as _flash_compute_embedding_norm_sample,
 )
 from opacus.grad_sample.group_norm import (
     compute_group_norm_grad_sample as _opacus_compute_group_norm_grad_sample,
@@ -55,7 +57,8 @@ def compute_embedding_grad_sample(module, activations, backprops):
 
 @register_norm_sampler(nn.Embedding)
 def compute_embedding_norm_sample(module, activations, backprops):
-    return _opacus_compute_embedding_norm_sample(module, activations, backprops)
+    # Use flashnorm implementation to avoid view() on non-contiguous tensors
+    return _flash_compute_embedding_norm_sample(module, activations, backprops)
 
 
 @register_grad_sampler(nn.GroupNorm)

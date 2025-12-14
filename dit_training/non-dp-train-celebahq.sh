@@ -24,13 +24,12 @@ echo "ARNOLD_WORKER_0_HOST:"$ARNOLD_WORKER_0_HOST
 echo "ARNOLD_WORKER_0_PORT:"$ARNOLD_WORKER_0_PORT
 echo "MY_HOST_IP:":$MY_HOST_IP
 
-MODEL=DiT-S
+MODEL=DiT-XL
 PATCH=2
-IMAGE_SIZE=1024
-EPOCH=450
+IMAGE_SIZE=512
+EPOCH=950
 NUM_CLASS=1
-GLOBAL_BATCH_SIZE=64
-NOISE_MULTIPLIER=0.9131
+GLOBAL_BATCH_SIZE=128
 DATA_PATH=/mnt/bn/watermark/split_volume/zhaoyuchen/Dataset/celeba-hq/celeba_hq_onedir
 RESULT_PATH=/mnt/bn/watermark/split_volume/zhaoyuchen/Dataset/dit-results/celebahq-non-dp-$MODEL-$PATCH-img$IMAGE_SIZE-cls$NUM_CLASS-bs$GLOBAL_BATCH_SIZE-epo$EPOCH
 echo $RESULT_PATH
@@ -42,7 +41,7 @@ export NCCL_NET_PLUGIN=none
 nohup torchrun --nnodes=$ARNOLD_WORKER_NUM \
         --node_rank=$ARNOLD_ID \
         --master_addr=127.0.0.1 \
-        --master_port=34534 \
+        --master_port=45232 \
         --nproc_per_node=8 \
         non-dp-train.py \
         --model $MODEL/$PATCH \

@@ -30,6 +30,47 @@ logger = logging.getLogger(__name__)
 logging.disabled = False
 
 
+def _get_fsdp_wrapper_types() -> tuple:
+    """
+    Safely collect available FSDP wrapper classes.
+
+    Some torch builds do not expose torch.distributed.fsdp.FSDPModule, so we
+    guard the lookup to avoid AttributeError when running on those versions.
+    """
+    wrappers = []
+
+    fsdp_mod = getattr(torch.distributed, "fsdp", None)
+    if fsdp_mod is not None:
+        fsdp_wrapper = getattr(fsdp_mod, "FSDPModule", None)
+        if isinstance(fsdp_wrapper, type):
+            wrappers.append(fsdp_wrapper)
+
+    try:
+        from torch.distributed._composable.fsdp import FSDPModule as ComposableFSDPModule  # type: ignore
+    except Exception:
+        ComposableFSDPModule = None
+
+    if isinstance(ComposableFSDPModule, type):
+        wrappers.append(ComposableFSDPModule)
+
+    return tuple(wrappers)
+
+
+_FSDP_WRAPPER_TYPES = _get_fsdp_wrapper_types()
+
+
+def _unwrap_conv_layer_type(layer: nn.Module) -> type:
+    """
+    Return the underlying Conv layer type, handling optional FSDP wrappers.
+    """
+    for wrapper_cls in _FSDP_WRAPPER_TYPES:
+        if isinstance(layer, wrapper_cls):
+            bases = layer.__class__.__bases__
+            if len(bases) > 1:
+                return bases[1]
+    return type(layer)
+
+
 @register_grad_sampler([nn.Conv1d, nn.Conv2d, nn.Conv3d])
 def compute_conv_grad_sample(
     layer: Union[nn.Conv1d, nn.Conv2d, nn.Conv3d],
@@ -59,11 +100,7 @@ def compute_conv_grad_sample(
 
     # FSDPWrapper adds a prefix 'FSDP' to layer type, e.g. FSDPConv2d.
     # Therefore the layer type can not be directly determined by type(layer).
-    layer_type = (
-        layer.__class__.__bases__[1]
-        if isinstance(layer, torch.distributed.fsdp.FSDPModule)
-        else type(layer)
-    )
+    layer_type = _unwrap_conv_layer_type(layer)
     # get activations and backprops in shape depending on the Conv layer
     if layer_type is nn.Conv2d:
         activations = unfold2d(
@@ -232,11 +269,7 @@ def compute_conv_norm_sample(
         return ret
     
     # Determine layer type (handle FSDP wrapper case)
-    layer_type = (
-        layer.__class__.__bases__[1]
-        if isinstance(layer, torch.distributed.fsdp.FSDPModule)
-        else type(layer)
-    )
+    layer_type = _unwrap_conv_layer_type(layer)
     
     # Unfold activations depending on the Conv layer type
     # This transforms spatial convolution into matrix multiplication
@@ -385,11 +418,7 @@ def compute_conv_norm_sample_flash(
         return ret
     
     # Determine layer type (handle FSDP wrapper case)
-    layer_type = (
-        layer.__class__.__bases__[1]
-        if isinstance(layer, torch.distributed.fsdp.FSDPModule)
-        else type(layer)
-    )
+    layer_type = _unwrap_conv_layer_type(layer)
     
     # Unfold activations depending on the Conv layer type
     # This transforms spatial convolution into matrix multiplication

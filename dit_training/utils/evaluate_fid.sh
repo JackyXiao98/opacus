@@ -22,44 +22,29 @@ export PYTHONPATH="/mnt/bn/watermark/split_volume/zhaoyuchen/Project/opacus":$PY
 
 # source /mnt/bn/watermark/split_volume/zhaoyuchen/Project/diffusion-model-dp-training/opacus/.venv/bin/activate
 
-echo "training start"
 echo "ARNOLD_ID:"$ARNOLD_ID
 echo "ARNOLD_WORKER_0_HOST:"$ARNOLD_WORKER_0_HOST
 echo "ARNOLD_WORKER_0_PORT:"$ARNOLD_WORKER_0_PORT
 echo "MY_HOST_IP:":$MY_HOST_IP
+echo "master_addr":$METIS_WORKER_0_HOST
+echo "master_port":$METIS_WORKER_0_PORT
 
-# export CUDA_VISIBLE_DEVICES="4,5"
-MODEL=DiT-S
-PATCH=2
+MODEL=DiT-B
+PATCH=4
 IMAGE_SIZE=512
-EPOCH=950
 NUM_CLASS=1
-GLOBAL_BATCH_SIZE=128
-NOISE_MULTIPLIER=0
-GRAD_SAMPLE_MODE=flash_bk
-DATA_PATH=/mnt/bn/watermark/split_volume/zhaoyuchen/Dataset/celeba-hq/celeba_hq_onedir
-RESULT_PATH=/mnt/bn/watermark/split_volume/zhaoyuchen/Dataset/dit-results/celebahq-dp-$MODEL-$PATCH-img$IMAGE_SIZE-cls$NUM_CLASS-bs$GLOBAL_BATCH_SIZE-noise$NOISE_MULTIPLIER-$GRAD_SAMPLE_MODE-epo$EPOCH
-echo $RESULT_PATH
+GLOBAL_BATCH_SIZE=32
+NUM_SAMPLE=10000
+DATA_PATH=/mnt/bn/watermark/split_volume/zhaoyuchen/Dataset/celeba-hq/celeba_hq_onedir/one-cls
+CKPT=/mnt/bn/watermark/split_volume/zhaoyuchen/Dataset/dit-results/non-dp-DiT-B-4-img512-cls1-bs256-ffhq/001-DiT-B-4/checkpoints/0200000.pt
+RESULT_PATH=/mnt/bn/watermark/split_volume/zhaoyuchen/Dataset/dit-results/non-dp-DiT-B-4-img512-cls1-bs256-ffhq/001-DiT-B-4/checkpoints
 
-# export NCCL_NET_PLUGIN=none
-nohup torchrun --nnodes=$ARNOLD_WORKER_NUM \
-        --node_rank=$ARNOLD_ID \
-        --master_addr=127.0.0.1 \
-        --master_port=53463 \
-        --nproc_per_node=8 \
-        dp-train.py \
-        --model $MODEL/$PATCH \
-        --data_path $DATA_PATH \
-        --epochs $EPOCH \
-        --image_size $IMAGE_SIZE \
-        --num_classes $NUM_CLASS \
-        --results_dir $RESULT_PATH \
-        --global_batch_size $GLOBAL_BATCH_SIZE \
-        --dp_training True \
-        --noise_multiplier $NOISE_MULTIPLIER \
-        --grad_sample_mode $GRAD_SAMPLE_MODE \
-        --log_every 100 \
-        > ./output-dp-$GRAD_SAMPLE_MODE-celeba-training.log 2>&1 &
+echo "training start"
+export CUDA_VISIBLE_DEVICES="2"
+
+export NCCL_NET_PLUGIN=none
+python /mnt/bn/watermark/split_volume/zhaoyuchen/Project/diffusion-model-dp-training/utils/evaluate_fid.py
+
 
 
 # export CUDA_LAUNCH_BLOCKING=1

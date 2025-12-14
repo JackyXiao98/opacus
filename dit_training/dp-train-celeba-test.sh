@@ -34,9 +34,9 @@ PATCH=2
 IMAGE_SIZE=1024
 EPOCH=400
 NUM_CLASS=1
-GLOBAL_BATCH_SIZE=2
-NOISE_MULTIPLIER=0
-GRAD_SAMPLE_MODE=flash
+GLOBAL_BATCH_SIZE=1
+NOISE_MULTIPLIER=0.87
+GRAD_SAMPLE_MODE=flash_fuse_bk
 DATA_PATH=/mnt/bn/watermark/split_volume/zhaoyuchen/Dataset/celeba-hq/celeba_hq_onedir
 RESULT_PATH=/mnt/bn/watermark/split_volume/zhaoyuchen/Dataset/dit-results/Test-onecard-celebahq-dp-$MODEL-$PATCH-img$IMAGE_SIZE-cls$NUM_CLASS-bs$GLOBAL_BATCH_SIZE-noise$NOISE_MULTIPLIER-$GRAD_SAMPLE_MODE-epo$EPOCH
 echo $RESULT_PATH

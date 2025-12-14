@@ -30,40 +30,32 @@ echo "master_addr":$METIS_WORKER_0_HOST
 echo "master_port":$METIS_WORKER_0_PORT
 
 MODEL=DiT-B
-PATCH=4
+PATCH=2
 IMAGE_SIZE=512
 NUM_CLASS=1
-GLOBAL_BATCH_SIZE=32
+GLOBAL_BATCH_SIZE=64
 NUM_SAMPLE=10000
-DATA_PATH=/mnt/bn/watermark/split_volume/zhaoyuchen/Project/ffhq-dataset/images1024x1024-onedic
-CKPT=/mnt/bn/watermark/split_volume/zhaoyuchen/Dataset/dit-results/dp-DiT-B-4-img512-cls1-bs256-noise0-flash_bk-ffhq/000-DiT-B-4/checkpoints/0050000.pt
-RESULT_PATH=/mnt/bn/watermark/split_volume/zhaoyuchen/Dataset/dit-results/dp-DiT-B-4-img512-cls1-bs256-noise0-flash_bk-ffhq/000-DiT-B-4/checkpoints
+RESULT_PATH=/mnt/bn/watermark/split_volume/zhaoyuchen/Dataset/dit-results/celebahq-non-dp-DiT-B-2-img512-cls1-bs128-epo950/000-DiT-B-2/checkpoints
 
 echo "training start"
 # export CUDA_VISIBLE_DEVICES="0,1"
 
-export NCCL_NET_PLUGIN=none
-nohup torchrun --nnodes=$ARNOLD_WORKER_NUM \
-        --node_rank=$ARNOLD_ID \
-        --master_addr=127.0.0.1 \
-        --master_port=34531 \
-        --nproc_per_node=4 \
-        sample_ddp.py \
-        --num_fid_samples $NUM_SAMPLE \
-        --model $MODEL/$PATCH \
-        --image_size $IMAGE_SIZE \
-        --num_classes $NUM_CLASS \
-        --sample_dir $RESULT_PATH \
-        --per_proc_batch_size $GLOBAL_BATCH_SIZE \
-        --ckpt $CKPT \
-        > ./output-sample-ddp.log 2>&1 &
+for num in 050000; do
+    CKPT=$RESULT_PATH/0$num.pt
+    echo=CKPT
 
-
-# export CUDA_LAUNCH_BLOCKING=1
-
-# --nproc_per_node=$ARNOLD_WORKER_GPU \  # 每节点进程数（GPU 数量）
-
-# PATH="/mnt/bn/watermark/split_volume/zhaoyuchen/Project/diffusion-model-dp-training":"/mnt/bn/watermark/split_volume/zhaoyuchen/Project/diffusion-model-dp-training/opacus":$PATH
-
-# export CUDA_VISIBLE_DEVICES="0,1,2,3"
-
+    export NCCL_NET_PLUGIN=none
+    torchrun --nnodes=$ARNOLD_WORKER_NUM \
+            --node_rank=$ARNOLD_ID \
+            --master_addr=127.0.0.1 \
+            --master_port=34531 \
+            --nproc_per_node=8 \
+            sample_ddp.py \
+            --num_fid_samples $NUM_SAMPLE \
+            --model $MODEL/$PATCH \
+            --image_size $IMAGE_SIZE \
+            --num_classes $NUM_CLASS \
+            --sample_dir $RESULT_PATH \
+            --per_proc_batch_size $GLOBAL_BATCH_SIZE \
+            --ckpt $CKPT 
+done

@@ -6,8 +6,8 @@ import math
 epsilon_target = 8.0
 N = 30000
 delta = 1 / (N * math.log(N))
-batch_size = 56
-epochs = 400
+batch_size = 256
+epochs = 950
 q = batch_size / N  # 采样率
 print(f"迭代数：{N/batch_size*epochs}")
 

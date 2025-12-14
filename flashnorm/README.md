@@ -1,4 +1,4 @@
-# Opacus
+# FlashNorm
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)](https://www.python.org/downloads/)
@@ -6,7 +6,7 @@
 
 ## Introduction
 
-**Opacus** is an advanced differentially private deep learning library built on PyTorch. It enables training machine learning models with formal privacy guarantees while maintaining high performance and usability. This fork introduces significant optimizations to accelerate private training and reduce memory overhead through novel algorithmic innovations and hardware-aware kernel optimizations.
+**FlashNorm** is an advanced differentially private deep learning library built on PyTorch. It enables training machine learning models with formal privacy guarantees while maintaining high performance and usability. This fork introduces significant optimizations to accelerate private training and reduce memory overhead through novel algorithmic innovations and hardware-aware kernel optimizations.
 
 ### Key Features
 
@@ -32,8 +32,8 @@ To set up the environment, execute the following commands:
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-organization/opacus.git
-cd opacus
+git clone https://github.com/your-organization/flashnorm.git
+cd flashnorm
 
 # Set up the environment (installs uv, creates venv, and installs dependencies)
 source setup_env.sh
@@ -70,12 +70,12 @@ uv pip install -e .
 
 ## Getting Started
 
-Training a model with differential privacy requires minimal code changes:
+Training a model with differential privacy via FlashNorm:
 
 ```python
 import torch
 from torch.optim import SGD
-from opacus import PrivacyEngine
+from flashnorm.privacy_engine import FlashNormPrivacyEngine
 
 # Define your model, optimizer, and data loader as usual
 model = YourModel()
@@ -83,13 +83,14 @@ optimizer = SGD(model.parameters(), lr=0.05)
 data_loader = torch.utils.data.DataLoader(dataset, batch_size=1024)
 
 # Initialize PrivacyEngine and wrap your components
-privacy_engine = PrivacyEngine()
-model, optimizer, data_loader = privacy_engine.make_private(
+privacy_engine = FlashNormPrivacyEngine()
+model, optimizer, criterion, data_loader = privacy_engine.make_private(
     module=model,
     optimizer=optimizer,
     data_loader=data_loader,
     noise_multiplier=1.1,
     max_grad_norm=1.0,
+    grad_sample_mode="flash",  # or "ghost", "flash_fuse", etc.
 )
 
 # Training proceeds as usual
@@ -100,14 +101,14 @@ for batch in data_loader:
     optimizer.step()
 ```
 
-### Advanced Usage: Flash Norm Clipping
+### Advanced Usage: Flash / Ghost / Fuse modes
 
-For maximum performance with Flash Norm Clipping:
+For maximum performance with Flash Norm clipping (non-FSDP):
 
 ```python
-from opacus.grad_sample import GradSampleModuleFastGradientClippingFuse
-from opacus.optimizers import DPOptimizerFastGradientClipping
-from opacus.utils.fast_gradient_clipping_utils import DPLossFastGradientClipping
+from flashnorm.grad_sample import GradSampleModuleFastGradientClippingFuse
+from flashnorm.optimizers import DPOptimizerFastGradientClipping
+from flashnorm.utils.fast_gradient_clipping_utils import DPLossFastGradientClipping
 
 # Wrap model with fused gradient clipping module
 model = GradSampleModuleFastGradientClippingFuse(
@@ -169,27 +170,13 @@ Please check [Code of Conduct](CODE_OF_CONDUCT.md) for more details.
 
 This project is licensed under the Apache-2.0 License.
 
-## Citing Opacus
-
-If you use **Opacus** in your research, please cite it using the following BibTeX entries:
-
-### Original Opacus Paper
-
-```bibtex
-@article{opacus,
-  title={Opacus: {U}ser-Friendly Differential Privacy Library in {PyTorch}},
-  author={Ashkan Yousefpour and Igor Shilov and Alexandre Sablayrolles and Davide Testuggine and Karthik Prasad and Mani Malek and John Nguyen and Sayan Ghosh and Akash Bharadwaj and Jessica Zhao and Graham Cormode and Ilya Mironov},
-  journal={arXiv preprint arXiv:2109.12298},
-  year={2021}
-}
-```
 
 ### Flash Norm Clipping Optimizations
 
 ```bibtex
-@misc{opacus_flash_clipping2025,
+@misc{flashnorm2025,
   author = {Your Name and Collaborators},
-  title = {Flash Norm Clipping: Accelerating Differentially Private Training with Kernel Fusion},
+  title = {FlashNorm: Fast Differentially Private Training with Ghost and Flash Clipping},
   year = {2025},
   howpublished = {\url{https://github.com/your-organization/opacus}},
 }

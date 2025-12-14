@@ -5,9 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-A minimal training script for DiT using PyTorch DDP.
+A minimal training script for DiT using PyTorch DDP with mixed precision training.
 """
 import torch
+# 导入混合精度相关模块（关键添加）
+from torch.amp import autocast, GradScaler
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -73,15 +75,13 @@ def get_unwrapped_model(model):
     
     This function unwraps all these layers to get the original model.
     """
-    unwrapped = model
-    while True:
-        if hasattr(unwrapped, '_module'):  # Opacus GradSampleModule
-            unwrapped = unwrapped._module
-        elif hasattr(unwrapped, 'module'):  # DDP/DPDDP
-            unwrapped = unwrapped.module
-        else:
-            break  # 已解包到原始模型
-    return unwrapped
+    # Unwrap GradSampleModule (uses _module attribute)
+    if hasattr(model, '_module'):
+        model = model._module
+    # Unwrap DDP/DPDDP (uses module attribute)
+    if hasattr(model, 'module'):
+        model = model.module
+    return model
 
 
 def cleanup():
@@ -147,7 +147,7 @@ def center_crop_arr(pil_image, image_size):
 
 def main(args):
     """
-    Trains a new DiT model.
+    Trains a new DiT model with mixed precision support.
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
@@ -161,6 +161,9 @@ def main(args):
     torch.cuda.set_device(device)
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
 
+    # 初始化混合精度缩放器（关键添加）
+    scaler = GradScaler('cuda', enabled=args.mixed_precision)  # 根据参数控制是否启用
+
     # Setup an experiment folder:
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
@@ -171,6 +174,7 @@ def main(args):
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
+        logger.info(f"Mixed precision training: {'Enabled' if args.mixed_precision else 'Disabled'}")
     else:
         logger = create_logger(None)
 
@@ -246,7 +250,27 @@ def main(args):
         )
         logger.info(f"Dataset contains={len(dataset):,}, images=({args.data_path}), batch_size={str(int(args.global_batch_size // dist.get_world_size()))}, total_gpus={str(dist.get_world_size())}")
 
-    def criterion(model, x, t, model_kwargs):
+
+    # def dit_criterion(predicted, target):
+    #     """
+    #     Custom criterion for DiT that computes per-sample MSE loss.
+    #     Matches the loss computation in diffusion.training_losses():
+    #         terms["mse"] = mean_flat((target - model_output) ** 2)
+        
+    #     Args:
+    #         predicted: (B, C, H, W) - model output (predicted noise/x_start/etc.)
+    #         target: (B, C, H, W) - target (noise/x_start/etc. based on model_mean_type)
+    #     Returns:
+    #         loss_per_sample: (B,) - per-sample MSE loss
+    #     """
+    #     # Compute squared error and flatten all dims except batch, then take mean
+    #     # This is equivalent to mean_flat((target - predicted) ** 2) in diffusion code
+    #     return ((target - predicted) ** 2).flatten(start_dim=1).mean(dim=1)
+    
+    # # Set reduction attribute (required by DPLossFastGradientClipping)
+    # dit_criterion.reduction = "mean"
+
+    def dit_criterion(model, x, t, model_kwargs):
         return diffusion.training_losses(model, x, t, model_kwargs)['loss']
     
     # Set Privacy Training 
@@ -257,10 +281,10 @@ def main(args):
             module=model,
             optimizer=opt,
             data_loader=loader,
-            criterion=criterion,
+            criterion=dit_criterion,
             noise_multiplier=args.noise_multiplier,
             max_grad_norm=args.max_grad_norm,
-            grad_sample_mode=args.grad_sample_mode, 
+            grad_sample_mode=args.grad_sample_mode,  # Flash Clipping + Bookkeeping
             poisson_sampling=True,
         )
     else:
@@ -284,23 +308,50 @@ def main(args):
             sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
         for x, y in loader:
-            x = x.to(device, non_blocking=True)
+            x = x.to(device, non_blocking=True)  # 添加non_blocking加速数据传输
             y = y.to(device, non_blocking=True)
-            # print(x.shape, y.shape)
+            
+            # VAE编码也使用混合精度（关键修改）
             with torch.no_grad():
-                # Map input images to latent space + normalize latents:
-                x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+                with autocast('cuda', enabled=args.mixed_precision):  # VAE编码用FP16加速
+                    # Map input images to latent space + normalize latents:
+                    x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+            
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y)
-            loss = criterion(model, x, t, model_kwargs)
-            # print(loss.item())
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+            
+            # 前向传播使用混合精度（关键修改）
+            # with autocast('cuda', enabled=args.mixed_precision):
+            #     noise = torch.randn_like(x)
+            #     noisy_x = diffusion.q_sample(x, t, noise=noise)  # x_t = sqrt(alpha_bar) * x + sqrt(1-alpha_bar) * noise
+            #     B, C = noisy_x.shape[:2]
+            #     # Forward pass: model predicts the noise
+            #     predicted_noise = model(noisy_x, t, **model_kwargs)
+            #     predicted_noise, _ = torch.split(predicted_noise, C, dim=1)
+            #     print(predicted_noise.shape, noise.shape)
+            #     # Compute loss using dp_loss wrapper (handles flash clipping internally)
+            #     loss = criterion(predicted_noise, noise)
 
-            update_ema(ema, model.module)
+            loss = criterion(model, x, t, model_kwargs)
+            print(loss)
+            # 梯度缩放（关键修改）
+            opt.zero_grad()
+            scaler.scale(loss).backward()  # 缩放loss并反向传播
+            
+            # 梯度裁剪（如果需要，注意顺序：先clip再step）
+            if args.max_grad_norm > 0 and not args.dp_training:  # DP已自带梯度裁剪
+                scaler.unscale_(opt)  # 先unscale梯度
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            
+            scaler.step(opt)  # 用缩放后的梯度更新参数
+            scaler.update()  # 根据梯度更新缩放因子
+
+            # EMA更新（保持原有逻辑，不需要混合精度）
+            with torch.no_grad():
+                update_ema(ema, get_unwrapped_model(model))
 
             # Log loss values:
+            # 注意：loss是缩放后的，需要用item()获取原始值（scaler会自动处理数值一致性）
             running_loss += loss.item()
             log_steps += 1
             train_steps += 1
@@ -315,6 +366,9 @@ def main(args):
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                # 可选：记录缩放因子（用于调试）
+                if rank == 0 and args.mixed_precision:
+                    logger.info(f"Current gradient scale factor: {scaler.get_scale():.2f}")
                 # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
@@ -323,11 +377,15 @@ def main(args):
             # Save DiT checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
+                    # 保存时需要unscale模型参数（关键修改）
                     checkpoint = {
-                        "model": model.module.state_dict(),
+                        "model": get_unwrapped_model(model).state_dict(),
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
-                        "args": args
+                        "scaler": scaler.state_dict(),  # 保存scaler状态
+                        "args": args,
+                        "epoch": epoch,
+                        "train_steps": train_steps
                     }
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
@@ -363,7 +421,23 @@ if __name__ == "__main__":
     parser.add_argument("--noise_multiplier", type=float, default=0.3701)
     parser.add_argument("--grad_sample_mode", type=str, default="flash_bk")
 
+    # 混合精度训练参数（关键添加）
+    parser.add_argument("--mixed_precision", action="store_true", help="Enable mixed precision training (FP16)")
+    parser.add_argument("--precision_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16"], 
+                        help="Data type for mixed precision training (bfloat16 requires Ampere+ GPUs)")
 
     args = parser.parse_args()
+    
+    # 配置混合精度数据类型（关键添加）
+    if args.mixed_precision:
+        if args.precision_dtype == "bfloat16":
+            torch.set_default_dtype(torch.bfloat16)
+            # 对于bfloat16，自动混合精度不需要梯度缩放（可选）
+            # 这里保持GradScaler兼容，bfloat16也可以使用scaler
+            # logger.info(f"Using bfloat16 mixed precision training")
+        else:
+            torch.set_default_dtype(torch.float32)  # 保持默认，autocast会自动切换
+            # logger.info(f"Using float16 mixed precision training")
+    
     print(args)
     main(args)

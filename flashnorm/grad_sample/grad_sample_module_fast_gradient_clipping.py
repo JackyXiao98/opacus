@@ -392,6 +392,10 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
             # This is equivalent to the second backward pass but done manually
             if type(module) == nn.Linear:
                 A = activations[0]
+                # Align dtypes to avoid bf16/fp32 mismatches when running under autocast
+                compute_dtype = torch.promote_types(clipped_backprops.dtype, A.dtype)
+                clipped_backprops = clipped_backprops.to(dtype=compute_dtype)
+                A = A.to(dtype=compute_dtype)
                 
                 if module.weight.requires_grad:
                     # Gradient: sum over batch of outer products
@@ -403,6 +407,7 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
                     else:
                         # Sequence case: [B, T, d_out] x [B, T, d_in] -> sum over B and T
                         grad_weight = torch.einsum("bti,btj->ij", clipped_backprops, A)
+                    grad_weight = grad_weight.to(dtype=module.weight.dtype)
                     
                     # Accumulate into .grad (in case there are multiple batches)
                     if module.weight.grad is None:
@@ -416,6 +421,7 @@ class GradSampleModuleFastGradientClipping(GradSampleModule):
                         grad_bias = torch.einsum("bi->i", clipped_backprops)
                     else:
                         grad_bias = torch.einsum("bti->i", clipped_backprops)
+                    grad_bias = grad_bias.to(dtype=module.bias.dtype)
                     
                     if module.bias.grad is None:
                         module.bias.grad = grad_bias

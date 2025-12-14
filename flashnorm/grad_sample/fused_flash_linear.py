@@ -145,25 +145,31 @@ class FusedFlashLinearFn(torch.autograd.Function):
         # Read current states from containers (may have changed since forward)
         compute_norms = ctx.compute_norms_container['value']
         enable_bookkeeping = ctx.enable_bookkeeping_container['value']
+        # Align dtypes between grad_out, weight, and x for matmul operations
+        grad_dtype = grad_out.dtype
+        weight_for_matmul = weight if weight.dtype == grad_dtype else weight.to(grad_dtype)
+        x_for_matmul = x if x.dtype == grad_dtype else x.to(grad_dtype)
         
         # --- 1. Compute grad_x (always needed for gradient flow) ---
-        grad_x = grad_out.matmul(weight)
+        grad_x = grad_out.matmul(weight_for_matmul)
+        if grad_x.dtype != x.dtype:
+            grad_x = grad_x.to(x.dtype)
         
         # --- 2. Reshape to 3D for Triton kernel ---
         # Handle 2D, 3D, and 4D+ cases uniformly
         original_dim = x.dim()
         if original_dim == 2:
-            x_3d = x.unsqueeze(1)  # [B, D] -> [B, 1, D]
+            x_3d = x_for_matmul.unsqueeze(1)  # [B, D] -> [B, 1, D]
             g_3d = grad_out.unsqueeze(1)  # [B, D] -> [B, 1, D]
         elif original_dim == 3:
-            x_3d = x
+            x_3d = x_for_matmul
             g_3d = grad_out
         else:
             # 4D+ case: [B, d1, d2, ..., D] -> [B, T, D] where T = d1*d2*...
-            B = x.shape[0]
-            Din = x.shape[-1]
+            B = x_for_matmul.shape[0]
+            Din = x_for_matmul.shape[-1]
             Dout = grad_out.shape[-1]
-            x_3d = x.view(B, -1, Din)
+            x_3d = x_for_matmul.view(B, -1, Din)
             g_3d = grad_out.view(B, -1, Dout)
         
         # --- 3. Bookkeeping mode: cache and compute norms only ---
@@ -227,6 +233,8 @@ class FusedFlashLinearFn(torch.autograd.Function):
             g_c = g_3d if g_3d.is_contiguous() else g_3d.contiguous()
             
             grad_w = fused_backward_weight(x_c, g_c, norm_buf)
+            if grad_w.dtype != weight.dtype:
+                grad_w = grad_w.to(weight.dtype)
             
             if ctx.has_bias:
                 # Sum over all dims except last
@@ -238,6 +246,8 @@ class FusedFlashLinearFn(torch.autograd.Function):
                     # For 3D+ inputs, use g_c which is contiguous [B, T, Dout]
                     # Sum over batch and sequence dimensions: [B, T, Dout] -> [Dout]
                     grad_b = g_c.sum(dim=(0, 1))
+                if grad_b.dtype != weight.dtype:
+                    grad_b = grad_b.to(weight.dtype)
                 
                 # Bias norm: sum over sequence dims first, then compute per-sample norm
                 if original_dim == 2:
@@ -256,6 +266,8 @@ class FusedFlashLinearFn(torch.autograd.Function):
                 g_3d.view(-1, g_3d.shape[-1]).t(),
                 x_3d.view(-1, x_3d.shape[-1])
             )
+            if grad_w.dtype != weight.dtype:
+                grad_w = grad_w.to(weight.dtype)
             
             # Use g_3d for consistency and to avoid memory access issues with 4D+ inputs
             if ctx.has_bias:
@@ -266,6 +278,9 @@ class FusedFlashLinearFn(torch.autograd.Function):
                     grad_b = g_3d.sum(dim=(0, 1))
             else:
                 grad_b = None
+            if grad_b is not None and weight.dtype != grad_b.dtype:
+                # bias has same dtype as weight factory kwargs
+                grad_b = grad_b.to(weight.dtype)
             
             # Compute norms if needed
             if compute_norms and norm_buf is not None:
@@ -416,6 +431,10 @@ class FusedFlashLinear(nn.Module):
         x = self._bk_cache['x']
         grad_out = self._bk_cache['grad_out']
         original_dim = x.dim()
+        grad_dtype = grad_out.dtype
+        # Align dtypes for matmul; keep parameter dtype unchanged
+        x_for_matmul = x if x.dtype == grad_dtype else x.to(grad_dtype)
+        grad_out_for_matmul = grad_out if grad_out.dtype == grad_dtype else grad_out.to(grad_dtype)
         
         # Scale grad_out by per-sample clipping coefficients and grad_scale
         # Use in-place operations to reduce memory allocation
@@ -425,19 +444,19 @@ class FusedFlashLinear(nn.Module):
         if original_dim == 2:
             # 2D case: [B, Din], [B, Dout]
             # Use in-place multiplication to avoid creating a new tensor
-            coef_view = coef_with_scale.view(-1, 1).to(device=grad_out.device, dtype=grad_out.dtype)
-            grad_out.mul_(coef_view)
-            grad_w = grad_out.t().matmul(x)
-            grad_b = grad_out.sum(dim=0) if self.bias is not None else None
+            coef_view = coef_with_scale.view(-1, 1).to(device=grad_out_for_matmul.device, dtype=grad_out_for_matmul.dtype)
+            grad_out_for_matmul = grad_out_for_matmul.mul_(coef_view)
+            grad_w = grad_out_for_matmul.t().matmul(x_for_matmul)
+            grad_b = grad_out_for_matmul.sum(dim=0) if self.bias is not None else None
         else:
             # 3D+ case: reshape to [B, T, D] format
-            B = x.shape[0]
-            Din = x.shape[-1]
-            Dout = grad_out.shape[-1]
+            B = x_for_matmul.shape[0]
+            Din = x_for_matmul.shape[-1]
+            Dout = grad_out_for_matmul.shape[-1]
             
             # Reshape to 3D (views don't allocate new memory)
-            x_3d = x.view(B, -1, Din)
-            g_3d = grad_out.view(B, -1, Dout)
+            x_3d = x_for_matmul.view(B, -1, Din)
+            g_3d = grad_out_for_matmul.view(B, -1, Dout)
             
             # Apply per-sample scaling using in-place operation
             coef_view = coef_with_scale.view(-1, 1, 1).to(device=g_3d.device, dtype=g_3d.dtype)
