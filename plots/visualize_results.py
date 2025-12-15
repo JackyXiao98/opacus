@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 TikTok Pte. Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
 """
 Visualize FSDP profiling results with detailed comparison plots.
 Supports both LLM and DiT models.
@@ -26,10 +41,10 @@ MODE_NAMES = {
     "no_dp_single": "Non-DP\nSingle",
     "grad_materialize": "Opacus\nExplicit",
     "ghost": "Standard\nGhost",
-    "flash": "Flash\nGhost",
-    "flash_bk": "Flash\nBK",
+    "flash": "Flash\nHook",
+    "flash_bk": "Flash\nHookBK",
     "ghost_bk": "Standard\nBK",
-    "flash_fuse": "Flash\nGhost",
+    "flash_fuse": "Flash",
     "flash_fuse_bk": "Flash\nBK",
 }
 
@@ -277,7 +292,7 @@ def plot_time_comparison(results, output_dir):
     print(f"✓ Saved: {output_path}")
 
 
-def plot_time_vs_seq_length(results, output_dir, baseline_mode="no_dp_single", metric="difference"):
+def plot_time_vs_seq_length(results, output_dir, baseline_mode="no_dp_single", metric="ratio"):
     """Plot time difference/ratio vs sequence length as a line chart (one line per mode)
     
     Args:
@@ -315,7 +330,7 @@ def plot_time_vs_seq_length(results, output_dir, baseline_mode="no_dp_single", m
         if metric == "ratio":
             if base_val == 0:
                 return None
-            return mode_val / base_val
+            return max(mode_val - base_val, 1)
         # Clamp differences at zero to avoid negative values
         return max(mode_val - base_val, 0)
     
@@ -372,7 +387,7 @@ def plot_time_vs_seq_length(results, output_dir, baseline_mode="no_dp_single", m
     print(f"✓ Saved: {output_path}")
 
 
-def plot_memory_vs_seq_length(results, output_dir, baseline_mode="no_dp_single", metric="difference"):
+def plot_memory_vs_seq_length(results, output_dir, baseline_mode="no_dp_single", metric="ratio"):
     """Plot memory difference/ratio vs sequence length as a line chart (one line per mode)
     
     Args:
@@ -410,7 +425,7 @@ def plot_memory_vs_seq_length(results, output_dir, baseline_mode="no_dp_single",
         if metric == "ratio":
             if base_val == 0:
                 return None
-            return mode_val / base_val
+            return max(mode_val - base_val, 0)
         # Clamp differences at zero to avoid negative values
         return max(mode_val - base_val, 0)
     

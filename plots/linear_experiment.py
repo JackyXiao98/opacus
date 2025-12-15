@@ -9,6 +9,7 @@ import argparse
 import gc
 import json
 import os
+import statistics
 
 import torch
 import torch.nn as nn
@@ -146,6 +147,7 @@ def run_experiment_worker(
 ):
     """Run experiment on a single GPU"""
     mode = config["mode"]
+    time_stat = config.get("time_stat", "median")
     seq_length = config["seq_length"]
     batch_size = config["batch_size"]
     use_amp = config.get("use_amp", False)
@@ -293,7 +295,7 @@ def run_experiment_worker(
     # Profiling iterations
     print(f"\nRunning {num_iter} profiling iterations... (AMP={mp_label})")
     
-    total_time = 0.0
+    iter_times = []
     
     for i in range(num_iter):
         batch = generate_batch(config, device)
@@ -336,25 +338,31 @@ def run_experiment_worker(
         torch.cuda.synchronize()
         
         iter_time = start_event.elapsed_time(end_event)
-        total_time += iter_time
+        iter_times.append(iter_time)
         
         print(f"  Iteration {i+1}/{num_iter}: {iter_time:.2f} ms")
         
         del batch, loss, outputs
         torch.cuda.empty_cache()
     
-    avg_time_ms = total_time / num_iter
+    if time_stat == "mean":
+        time_value_ms = sum(iter_times) / len(iter_times)
+    elif time_stat == "median":
+        time_value_ms = statistics.median(iter_times)
+    else:
+        raise ValueError(f"Unknown time_stat: {time_stat}")
     peak_memory_bytes = torch.cuda.max_memory_allocated(device)
     peak_memory_mb = peak_memory_bytes / (1024 ** 2)
     peak_memory_gb = peak_memory_bytes / (1024 ** 3)
     
-    print(f"\n⏱️  Average iteration time: {avg_time_ms:.2f} ms")
+    print(f"\n⏱️  Iteration time ({time_stat}): {time_value_ms:.2f} ms")
     print(f"💾 Peak memory usage: {peak_memory_gb:.2f} GB ({peak_memory_mb:.2f} MB)")
     
     return {
         "peak_memory_mb": peak_memory_mb,
         "peak_memory_gb": peak_memory_gb,
-        "avg_time_ms": avg_time_ms,
+        "avg_time_ms": time_value_ms,
+        "time_stat": time_stat,
     }
 
 
@@ -401,6 +409,7 @@ def run_experiment(config):
         "peak_memory_mb": metrics["peak_memory_mb"],
         "peak_memory_gb": metrics["peak_memory_gb"],
         "avg_time_ms": metrics["avg_time_ms"],
+        "time_stat": metrics["time_stat"],
         "config": config,
     }
     
@@ -447,6 +456,9 @@ def main():
     parser.add_argument("--mixed-precision", type=str, default="bf16",
                        choices=["none", "fp16", "bf16"],
                        help="Use CUDA AMP mixed precision (fp16/bf16)")
+    parser.add_argument("--time-stat", type=str, default="median",
+                       choices=["mean", "median"],
+                       help="Statistic for iteration time reporting")
     
     # Output arguments
     parser.add_argument("--output", type=str, required=True,
@@ -469,6 +481,7 @@ def main():
         "max_grad_norm": args.max_grad_norm,
         "use_amp": args.mixed_precision != "none",
         "amp_dtype": args.mixed_precision if args.mixed_precision != "none" else None,
+        "time_stat": args.time_stat,
     }
     
     # Run experiment
@@ -486,7 +499,7 @@ def main():
     print(f"✅ Mode: {results['mode']}")
     print(f"✅ Seq Length: {results['seq_length']}")
     print(f"✅ Peak Memory: {results['peak_memory_gb']:.2f} GB")
-    print(f"✅ Avg Time: {results['avg_time_ms']:.2f} ms")
+    print(f"✅ Time ({results['time_stat']}): {results['avg_time_ms']:.2f} ms")
     print(f"✅ Results saved to: {args.output}")
     print(f"{'='*80}\n")
 

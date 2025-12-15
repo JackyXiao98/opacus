@@ -9,6 +9,7 @@ import argparse
 import gc
 import json
 import os
+import statistics
 import sys
 
 import torch
@@ -241,6 +242,7 @@ def run_experiment_worker(
 ):
     """Run experiment on a single GPU worker"""
     torch.cuda.set_device(rank)
+    time_stat = config.get("time_stat", "median")
     
     # Determine if this is an FSDP mode
     is_fsdp_mode = mode in [
@@ -428,7 +430,7 @@ def run_experiment_worker(
     if master_process:
         print(f"\nRunning {num_iter} profiling iterations...")
     
-    total_time = 0.0
+    iter_times = []
     
     for i in range(num_iter):
         batch = generate_batch(config, device)
@@ -464,7 +466,7 @@ def run_experiment_worker(
             dist.barrier()
         
         iter_time = start_event.elapsed_time(end_event)
-        total_time += iter_time
+        iter_times.append(iter_time)
         
         if master_process:
             print(f"  Iteration {i+1}/{num_iter}: {iter_time:.2f} ms")
@@ -472,7 +474,12 @@ def run_experiment_worker(
         del batch, loss, logits
         torch.cuda.empty_cache()
     
-    avg_time_ms = total_time / num_iter
+    if time_stat == "mean":
+        time_value_ms = sum(iter_times) / len(iter_times)
+    elif time_stat == "median":
+        time_value_ms = statistics.median(iter_times)
+    else:
+        raise ValueError(f"Unknown time_stat: {time_stat}")
     peak_memory_bytes = torch.cuda.max_memory_allocated(device)
     peak_memory_mb = peak_memory_bytes / (1024 ** 2)
     peak_memory_gb = peak_memory_bytes / (1024 ** 3)
@@ -482,7 +489,7 @@ def run_experiment_worker(
         dist.barrier()
     
     if master_process:
-        print(f"\n⏱️  Average iteration time: {avg_time_ms:.2f} ms")
+        print(f"\n⏱️  Iteration time ({time_stat}): {time_value_ms:.2f} ms")
         print(f"💾 Peak memory usage: {peak_memory_gb:.2f} GB ({peak_memory_mb:.2f} MB)")
     
     # Synchronize before storing results
@@ -493,7 +500,8 @@ def run_experiment_worker(
     if master_process:
         results_dict["peak_memory_mb"] = peak_memory_mb
         results_dict["peak_memory_gb"] = peak_memory_gb
-        results_dict["avg_time_ms"] = avg_time_ms
+        results_dict["avg_time_ms"] = time_value_ms
+        results_dict["time_stat"] = time_stat
     
     # Final synchronization before cleanup
     if is_fsdp_mode and dist.is_initialized():
@@ -590,6 +598,7 @@ def run_experiment(config):
         "peak_memory_mb": results_dict.get("peak_memory_mb", 0),
         "peak_memory_gb": results_dict.get("peak_memory_gb", 0),
         "avg_time_ms": results_dict.get("avg_time_ms", 0),
+        "time_stat": results_dict.get("time_stat", config.get("time_stat", "median")),
         "config": config,
     }
     
@@ -636,6 +645,9 @@ def main():
                        help="Noise multiplier for DP")
     parser.add_argument("--max-grad-norm", type=float, default=1.0,
                        help="Max gradient norm for DP")
+    parser.add_argument("--time-stat", type=str, default="median",
+                       choices=["mean", "median"],
+                       help="Statistic for iteration time reporting")
     
     # Precision arguments
     parser.add_argument("--bf16", dest="bf16", action="store_true", default=True,
@@ -664,6 +676,7 @@ def main():
         "sigma": args.sigma,
         "max_grad_norm": args.max_grad_norm,
         "bf16": args.bf16,
+        "time_stat": args.time_stat,
     }
     
     # Run experiment
@@ -681,7 +694,7 @@ def main():
     print(f"✅ Mode: {results['mode']}")
     print(f"✅ Seq Length: {results['seq_length']}")
     print(f"✅ Peak Memory: {results['peak_memory_gb']:.2f} GB")
-    print(f"✅ Avg Time: {results['avg_time_ms']:.2f} ms")
+    print(f"✅ Time ({results['time_stat']}): {results['avg_time_ms']:.2f} ms")
     print(f"✅ Results saved to: {args.output}")
     print(f"{'='*80}\n")
 
