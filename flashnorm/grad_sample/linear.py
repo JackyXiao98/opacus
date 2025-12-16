@@ -80,18 +80,18 @@ def compute_linear_norm_sample(
             )
     elif backprops.dim() == 3:
         if layer.weight.requires_grad:
-
-            ggT = torch.einsum("nik,njk->nij", backprops, backprops)  # batchwise g g^T
-            aaT = torch.einsum(
-                "nik,njk->nij", activations, activations
-            )  # batchwise a a^T
-            ga = torch.einsum("n...i,n...i->n", ggT, aaT).clamp(min=0)
-            # print("linear shapes: ", ggT.shape, aaT.shape, ga.shape)
-
+            # Optimized computation: ||A^T @ G||_F^2 = <G@G^T, A@A^T>_F
+            # This avoids creating large [n, T, T] intermediate tensors
+            # A: activations [n, T, d_in], G: backprops [n, T, d_out]
+            A_t = activations.transpose(1, 2)  # [n, d_in, T]
+            S = torch.bmm(A_t, backprops)  # [n, d_in, d_out]
+            ga = torch.sum(S * S, dim=(1, 2)).clamp(min=0)  # [n]
             ret[layer.weight] = torch.sqrt(ga)
         if layer.bias is not None and layer.bias.requires_grad:
-            ggT = torch.einsum("nik,njk->nij", backprops, backprops)  # batchwise g g^T
-            ret[layer.bias] = torch.sqrt(torch.einsum("n...i->n", ggT).clamp(min=0))
+            # For bias: ||G||_F^2 = sum(G * G) over all dimensions except batch
+            ret[layer.bias] = torch.sqrt(
+                torch.sum(backprops * backprops, dim=(1, 2)).clamp(min=0)
+            )
     return ret
 
 

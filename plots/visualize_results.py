@@ -38,16 +38,16 @@ MODE_NAMES = {
     "flash_fsdp_fuse": "Flash\nFSDP\n(Fuse)",
     "flash_fsdp_fuse_bk": "Flash\nFSDP\n(Fuse+BK)",
     # Single-GPU modes
-    "no_dp_single": "Non-DP\nSingle",
+    "no_dp_single": "Non-DP",
     "grad_materialize": "Opacus\nExplicit",
     "ghost": "Standard\nGhost",
     "flash": "Flash\nHook",
     "flash_bk": "Flash\nHookBK",
     "ghost_bk": "Standard\nBK",
-    "flash_fuse": "Flash",
+    "flash_fuse": "Flash\n(Ours)",
     "flash_fuse_bk": "Flash\nBK",
 }
-
+    
 # Colors for modes
 MODE_COLORS = {
     # Multi-GPU FSDP modes (darker shades)
@@ -330,11 +330,16 @@ def plot_time_vs_seq_length(results, output_dir, baseline_mode="no_dp_single", m
         if metric == "ratio":
             if base_val == 0:
                 return None
-            return max(mode_val - base_val, 1)
+            return max(mode_val / base_val, 1)
         # Clamp differences at zero to avoid negative values
         return max(mode_val - base_val, 0)
     
     fig, ax = plt.subplots(figsize=(12, 8))
+    
+    # Identify overlapping modes that need distinct styling
+    # "ghost" and "ghost_bk" are known to overlap
+    # "flash_fuse" and "flash_fuse_bk" are also known to overlap
+    overlapping_modes = {"ghost", "ghost_bk", "flash_fuse", "flash_fuse_bk"}
     
     for mode in modes:
         mode_indices = []
@@ -352,17 +357,71 @@ def plot_time_vs_seq_length(results, output_dir, baseline_mode="no_dp_single", m
         
         if mode_indices:
             marker = MODE_MARKERS.get(mode, 'o')
+            color = MODE_COLORS[mode]
+            
+            # Apply distinct styling for overlapping modes
+            if mode in overlapping_modes:
+                if mode == "ghost":
+                    # Solid thick line for "ghost"
+                    linewidth = 2
+                    linestyle = '-'
+                    # Use a slightly brighter red
+                    color = "#e74c3c"  # Brighter red
+                elif mode == "ghost_bk":
+                    # Thinner dashed line for "ghost_bk"
+                    linewidth = 2
+                    linestyle = '--'
+                    # Use a darker, more distinct red
+                    color = "#8b0000"  # Dark red
+                elif mode == "flash_fuse":
+                    # Solid thick line for "flash_fuse"
+                    linewidth = 2
+                    linestyle = '-'
+                    # Use a brighter blue
+                    color = "#3498db"  # Brighter blue
+                elif mode == "flash_fuse_bk":
+                    # Thinner dashed line for "flash_fuse_bk"
+                    linewidth = 2
+                    linestyle = '--'
+                    # Use a darker, more distinct blue
+                    color = "#1a5490"  # Dark blue
+            else:
+                # Default styling for other modes
+                linewidth = 2
+                linestyle = '-'
+            
             ax.plot(mode_indices, mode_time_diffs,
                    marker=marker,
-                   color=MODE_COLORS[mode],
-                   linewidth=2.5,
+                   color=color,
+                   linewidth=linewidth,
+                   linestyle=linestyle,
                    markersize=10,
                    label=MODE_NAMES[mode].replace('\n', ' '),
                    alpha=0.8)
     
-    # Add baseline reference line
+    # Add baseline as a data series with markers at each sequence length
     baseline_ref = 1 if metric == "ratio" else 0
-    ax.axhline(y=baseline_ref, color='gray', linestyle='--', linewidth=2, alpha=0.7, label=f'Baseline ({MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")})')
+    baseline_indices = []
+    baseline_values = []
+    
+    for seq_len in seq_lengths:
+        baseline_data = get_result(results, baseline_mode, seq_len)
+        if baseline_data:
+            baseline_indices.append(seq_len_to_idx[seq_len])
+            baseline_values.append(baseline_ref)
+    
+    if baseline_indices:
+        # Plot baseline as a data series with markers
+        ax.plot(baseline_indices, baseline_values,
+               marker='D',  # Diamond marker
+               color='gray',
+               linestyle='--',
+               linewidth=2,
+               markersize=8,
+               label=f'Baseline ({MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")})',
+               alpha=0.7,
+               markeredgecolor='darkgray',
+               markeredgewidth=1)
     
     ax.set_xlabel('Sequence Length', fontsize=16, fontweight='bold')
     ylabel = (
@@ -425,11 +484,16 @@ def plot_memory_vs_seq_length(results, output_dir, baseline_mode="no_dp_single",
         if metric == "ratio":
             if base_val == 0:
                 return None
-            return max(mode_val - base_val, 0)
+            return max(mode_val / base_val, 1)
         # Clamp differences at zero to avoid negative values
         return max(mode_val - base_val, 0)
     
     fig, ax = plt.subplots(figsize=(12, 8))
+    
+    # Identify overlapping modes that need distinct styling
+    # "ghost" and "ghost_bk" are known to overlap
+    # "flash_fuse" and "flash_fuse_bk" are also known to overlap
+    overlapping_modes = {"ghost", "ghost_bk", "flash_fuse", "flash_fuse_bk"}
     
     for mode in modes:
         mode_indices = []
@@ -447,17 +511,71 @@ def plot_memory_vs_seq_length(results, output_dir, baseline_mode="no_dp_single",
         
         if mode_indices:
             marker = MODE_MARKERS.get(mode, 'o')
+            color = MODE_COLORS[mode]
+            
+            # Apply distinct styling for overlapping modes
+            if mode in overlapping_modes:
+                if mode == "ghost":
+                    # Solid thick line for "ghost"
+                    linewidth = 2
+                    linestyle = '-'
+                    # Use a slightly brighter red
+                    color = "#e74c3c"  # Brighter red
+                elif mode == "ghost_bk":
+                    # Thinner dashed line for "ghost_bk"
+                    linewidth = 2
+                    linestyle = '--'
+                    # Use a darker, more distinct red
+                    color = "#8b0000"  # Dark red
+                elif mode == "flash_fuse":
+                    # Solid thick line for "flash_fuse"
+                    linewidth = 2
+                    linestyle = '-'
+                    # Use a brighter blue
+                    color = "#3498db"  # Brighter blue
+                elif mode == "flash_fuse_bk":
+                    # Thinner dashed line for "flash_fuse_bk"
+                    linewidth = 2
+                    linestyle = '--'
+                    # Use a darker, more distinct blue
+                    color = "#1a5490"  # Dark blue
+            else:
+                # Default styling for other modes
+                linewidth = 2
+                linestyle = '-'
+            
             ax.plot(mode_indices, mode_memory_diffs,
                    marker=marker,
-                   color=MODE_COLORS[mode],
-                   linewidth=2.5,
+                   color=color,
+                   linewidth=linewidth,
+                   linestyle=linestyle,
                    markersize=10,
                    label=MODE_NAMES[mode].replace('\n', ' '),
                    alpha=0.8)
     
-    # Add baseline reference line
+    # Add baseline as a data series with markers at each sequence length
     baseline_ref = 1 if metric == "ratio" else 0
-    ax.axhline(y=baseline_ref, color='gray', linestyle='--', linewidth=2, alpha=0.7, label=f'Baseline ({MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")})')
+    baseline_indices = []
+    baseline_values = []
+    
+    for seq_len in seq_lengths:
+        baseline_data = get_result(results, baseline_mode, seq_len)
+        if baseline_data:
+            baseline_indices.append(seq_len_to_idx[seq_len])
+            baseline_values.append(baseline_ref)
+    
+    if baseline_indices:
+        # Plot baseline as a data series with markers
+        ax.plot(baseline_indices, baseline_values,
+               marker='D',  # Diamond marker
+               color='gray',
+               linestyle='--',
+               linewidth=2,
+               markersize=8,
+               label=f'Baseline ({MODE_NAMES.get(baseline_mode, baseline_mode).replace(chr(10), " ")})',
+               alpha=0.7,
+               markeredgecolor='darkgray',
+               markeredgewidth=1)
     
     ax.set_xlabel('Sequence Length', fontsize=16, fontweight='bold')
     ylabel = (
