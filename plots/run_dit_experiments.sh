@@ -11,13 +11,13 @@ echo ""
 # DiT Model Configuration (uses same model as dp-train.py)
 # Available models: DiT-XL/2, DiT-XL/4, DiT-XL/8, DiT-L/2, DiT-L/4, DiT-L/8, DiT-B/2, DiT-B/4, DiT-B/8, DiT-S/2, DiT-S/4, DiT-S/8
 DIT_MODEL_NAME="DiT-S/2"
-IMAGE_SIZES=(128 256 512)
-IN_CHANNELS=2
+IMAGE_SIZES=(256 512 1024)
+IN_CHANNELS=4
 NUM_CLASSES=1000
 
 # Training Configuration
-BATCH_SIZE=2
-NUM_ITER=3
+BATCH_SIZE=1
+NUM_ITER=10
 WARMUP_ITER=2
 LEARNING_RATE=1e-4
 SIGMA=1.0
@@ -29,7 +29,7 @@ MAX_GRAD_NORM=1.0
 # MODES=("flash_fuse_bk" "no_dp_single" "flash_bk")
 # "no_dp_single" "ghost" "flash" "flash_bk" "ghost_bk" "flash_fuse" 
 MODES=("flash_fsdp_fuse_bk" "no_dp" "flash_fsdp_fuse" "flash_fsdp_bk")
-# MODES=("flash_fuse_bk" "no_dp_single" "flash_fuse" "flash_bk")
+# MODES=("flash_fuse_bk" "no_dp_single" "flash_fuse" "ghost" "ghost_bk") 
 # Output directory
 OUTPUT_DIR="results_dit"
 mkdir -p "$OUTPUT_DIR"

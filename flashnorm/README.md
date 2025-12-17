@@ -24,15 +24,13 @@ These features collectively deliver **significant acceleration in training throu
 
 ## Installation
 
-**Opacus** utilizes `uv`, an extremely fast Python package and project manager written in Rust. `uv` provides 10-100x faster performance compared to `pip` and offers comprehensive project management with a universal lockfile.
-
 ### Quick Start
 
 To set up the environment, execute the following commands:
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-organization/flashnorm.git
+git clone --recursive https://github.com/tiktok-privacy-innovation/PrivacyGo/flashnorm.git
 cd flashnorm
 
 # Set up the environment (installs uv, creates venv, and installs dependencies)
@@ -64,97 +62,38 @@ uv pip install -e .
 ### Requirements
 
 - Python 3.8+
-- PyTorch 2.0+
-- CUDA 11.0+ (for GPU acceleration)
+- PyTorch 2.8+
+- CUDA 12.0+ (for GPU acceleration)
 - NVIDIA Hopper architecture (H100) recommended for TMA optimizations
 
 ## Getting Started
 
-Training a model with differential privacy via FlashNorm:
+Training a model with differential privacy via FlashNorm is straightforward. 
+You can find a complete, runnable example in [`/opt/tiger/flashnorm/examples/quick_start.py`](/opt/tiger/flashnorm/examples/quick_start.py).
 
-```python
-import torch
-from torch.optim import SGD
-from flashnorm.privacy_engine import FlashNormPrivacyEngine
 
-# Define your model, optimizer, and data loader as usual
-model = YourModel()
-optimizer = SGD(model.parameters(), lr=0.05)
-data_loader = torch.utils.data.DataLoader(dataset, batch_size=1024)
-
-# Initialize PrivacyEngine and wrap your components
-privacy_engine = FlashNormPrivacyEngine()
-model, optimizer, criterion, data_loader = privacy_engine.make_private(
-    module=model,
-    optimizer=optimizer,
-    data_loader=data_loader,
-    noise_multiplier=1.1,
-    max_grad_norm=1.0,
-    grad_sample_mode="flash",  # or "ghost", "flash_fuse", etc.
-)
-
-# Training proceeds as usual
-for batch in data_loader:
-    optimizer.zero_grad()
-    loss = compute_loss(model, batch)
-    loss.backward()
-    optimizer.step()
-```
-
-### Advanced Usage: Flash / Ghost / Fuse modes
-
-For maximum performance with Flash Norm clipping (non-FSDP):
-
-```python
-from flashnorm.grad_sample import GradSampleModuleFastGradientClippingFuse
-from flashnorm.optimizers import DPOptimizerFastGradientClipping
-from flashnorm.utils.fast_gradient_clipping_utils import DPLossFastGradientClipping
-
-# Wrap model with fused gradient clipping module
-model = GradSampleModuleFastGradientClippingFuse(
-    model,
-    max_grad_norm=1.0,
-    use_flash_clipping=True,
-    use_ghost_clipping=True,
-)
-
-# Use specialized optimizer
-optimizer = DPOptimizerFastGradientClipping(
-    optimizer=base_optimizer,
-    noise_multiplier=1.1,
-    max_grad_norm=1.0,
-    expected_batch_size=batch_size,
-)
-
-# Wrap loss function for proper gradient handling
-criterion = DPLossFastGradientClipping(
-    module=model,
-    optimizer=optimizer,
-    criterion=base_criterion,
-    loss_reduction="mean",
-)
-```
-
-## Documentation
-
-For detailed documentation, tutorials, and API references, please visit our [documentation site](https://opacus.ai).
-
-### Tutorials
-
-- [Building an Image Classifier with Differential Privacy](tutorials/building_image_classifier.ipynb)
-- [Training a Text Classifier with DP on BERT](tutorials/building_text_classifier.ipynb)
-- [Introduction to Advanced Features](tutorials/intro_to_advanced_features.ipynb)
 
 ## Benchmarks
 
-Performance benchmarks comparing standard DP-SGD with Flash Norm Clipping optimizations are available in the `benchmarks/` directory.
+Performance benchmarks comparing standard DP-SGD with Flash Norm Clipping optimizations are available in the `plots/` directory.
 
-| Method | Memory Reduction | Speedup |
-|--------|-----------------|---------|
-| Standard DP-SGD | 1x (baseline) | 1x (baseline) |
-| Ghost Clipping | ~5-10x | ~1.5-2x |
-| Flash Norm Clipping | ~8-15x | ~2-3x |
-| Flash + TMA Fusion | ~10-20x | ~3-5x |
+**Linear Layer**
+
+| Memory | Time |
+|:------:|:----:|
+| <img src="plots/results_linear/d1024_n8/visualizations/memory_vs_seq_length.png" width="420"/> | <img src="plots/results_linear/d1024_n8/visualizations/time_vs_seq_length.png" width="420"/> |
+
+
+We benchmark FlashNorm against standard differentially private (DP) normalization methods, including Standard Ghost Clipping and Ghost Clipping with Bookkeeping, using an eight-layer linear model (D = 1024, P = 1024), batch size B = 1, and sequence lengths from 4k to 262k tokens, reporting memory and runtime as ratios relative to a non-DP single-pass baseline. FlashNorm exhibits consistently low and stable overhead across all sequence lengths, with memory usage remaining close to 1.1–1.3× and runtime around 1.5×, even at 262k tokens. In contrast, Standard Ghost Clipping scales poorly: memory overhead grows rapidly (≈2.3× at 8k, ≈3.8× at 16k, and >7× at 32k), and runtime overhead increases sharply (≈5× at 8k, ≈16× at 16k, and ≈37× at 32k), making longer sequences impractical. These results show that FlashNorm avoids the activation materialization and sequence-length–dependent costs of standard DP approaches, enabling practical and predictable DP training for long-context models.
+
+**Transformer**
+
+
+| Memory | Time |
+|:------:|:----:|
+| <img src="plots/results_transformer/gpt_2k/visualizations/memory_vs_seq_length.png" width="420"/> | <img src="plots/results_transformer/gpt_2k/visualizations/time_vs_seq_length.png" width="420"/> |
+
+We further evaluate FlashNorm on a GPT-2–style transformer (VOCAB_SIZE = 50,257, hidden size = 768, 12 layers, 12 attention heads) with batch size 1 and sequence lengths from 4k to 32k tokens, reporting memory and runtime as ratios relative to a non-DP single-pass baseline. As shown in the figures, FlashNorm and FlashNorm with bookkeeping (FlashNorm BK) consistently exhibit low and decreasing overhead as sequence length increases: memory usage stays close to the baseline (≈1.02–1.12×), while runtime overhead drops from about 2.1× to 1.7× for FlashNorm and from about 1.4× to nearly 1.05× for FlashNorm BK. In contrast, standard ghost clipping methods scale significantly worse, with memory overhead rising to ~1.23× and runtime overhead exceeding 4× at 32k tokens. These results demonstrate that FlashNorm generalizes beyond linear benchmarks to full transformer models, delivering near–non-DP efficiency for long-context GPT-2 training while substantially outperforming standard DP normalization approaches in both memory and runtime.
 
 *Results may vary based on model architecture and hardware configuration.*
 
@@ -185,4 +124,3 @@ This project is licensed under the Apache-2.0 License.
 ## Acknowledgments
 
 This project builds upon the foundational work of the [Opacus](https://github.com/pytorch/opacus) library by Meta Platforms, Inc. We extend our gratitude to the original authors and the open-source community for their contributions to privacy-preserving machine learning.
-
